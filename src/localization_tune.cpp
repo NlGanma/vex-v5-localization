@@ -1,0 +1,1605 @@
+#include "localization_tune.hpp"
+
+#include "main.h"
+#include "lemlib/logger/stdout.hpp"
+#include "pros/apix.h"
+#include "robot_control.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdint>
+#include <fcntl.h>
+#include <string>
+#include <string_view>
+#include <unistd.h>
+#include <vector>
+
+namespace localization_tune {
+namespace {
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kPiOver2 = 1.5707963267948966f;
+constexpr std::uint32_t kTuneSettleMs = 5;
+constexpr std::uint32_t kTuneInitialSettleMs = 15;
+constexpr std::uint32_t kTuneMotionPollMs = 5;
+constexpr std::uint32_t kTuneMotionCancelSettleMs = 5;
+constexpr int kTuneMotionStableCycles = 1;
+constexpr float kTuneMoveCompletionDistIn = 3.0f;
+constexpr float kTuneMoveCompletionHeadingDeg = 8.0f;
+constexpr float kTuneTurnCompletionHeadingDeg = 3.0f;
+constexpr std::uint32_t kTunePostMoveCorrectionWindowMs = 120;
+constexpr float kTunePostMoveGoodNis = 2.0f;
+constexpr int kTuneCheckpointCapacity = 16;
+constexpr const char* kTuneLogPath = "/usd/localization_tune_latest.txt";
+constexpr const char* kTuneInternalLogPath = "localization_tune_latest_internal.txt";
+constexpr std::uint32_t kRelocalizeTimeoutMs = 3500;
+constexpr float kRelocalizeMinConfidence = 0.22f;
+constexpr float kRelocalizeWeakConfidence = 0.06f;
+constexpr float kRelocalizeWeakConfidenceTwoSensors = 0.09f;
+constexpr float kRelocalizeWeakMaxVarXY = 64.0f;
+constexpr float kRelocalizeWeakMaxVarTheta = 0.05f;
+constexpr int kRelocalizeMinSensors = 2;
+constexpr float kRelocalizeStartupMaxRange = 96.0f;
+constexpr int kRelocalizeStartupMinConfidence = 12;
+constexpr int kRelocalizeSnapshotCount = 3;
+constexpr std::uint32_t kRelocalizeSnapshotSpacingMs = 20;
+constexpr int kRelocalizeCoarseHeadingHypotheses = 16;
+constexpr int kRelocalizeRefineHeadingHypotheses = 5;
+constexpr int kRelocalizeIterationsPerHypothesis = 6;
+constexpr int kTuneExportTapMinX = 200;
+constexpr int kTuneExportTapMinY = 120;
+constexpr std::uint32_t kTuneExportFeedbackMs = 2000;
+constexpr std::uintptr_t kStdoutStreamId = 0x74756f73u; // little-endian "sout"
+
+struct TuneCheckpoint {
+    const char* name = "Not recorded";
+    lemlib::Pose expected {0, 0, 0};
+    lemlib::Pose reported {0, 0, 0};
+    lemlib::localization::DebugInfo debug {};
+    DistanceSnapshot distances {};
+    std::uint32_t odomSeq = 0;
+    bool recorded = false;
+};
+
+enum class TuneMotionKind { Move, Turn };
+
+struct AutonomousRouteStep {
+    TuneMotionKind kind = TuneMotionKind::Move;
+    const char* name = "Unnamed";
+    float localRight = 0.0f;
+    float localForward = 0.0f;
+    float headingOffsetDeg = 0.0f;
+    int timeoutMs = 2000;
+    bool forwards = true;
+    float lead = 0.6f;
+    float maxSpeed = 100.0f;
+    float minSpeed = 0.0f;
+    float earlyExitRange = 0.0f;
+};
+
+enum class TuneRunMode { Idle, AutonomousRelocalized };
+enum class TuneTestCase { TurnCenter = 1, StraightScale = 2, SquareCross = 3 };
+enum class TuneLogOutputMode { Lean, DeepDive };
+enum class WallAxisDirection { PosX, NegX, PosY, NegY, Unknown };
+
+struct TuneTestDefinition {
+    TuneTestCase id = TuneTestCase::TurnCenter;
+    const char* name = "Turn center";
+    const char* objective = "Angular PID and rotational center";
+    const AutonomousRouteStep* steps = nullptr;
+    size_t stepCount = 0;
+};
+
+constexpr TuneLogOutputMode kTuneLogOutputMode = TuneLogOutputMode::DeepDive;
+constexpr TuneTestCase kDefaultTuneTestCase = TuneTestCase::TurnCenter;
+constexpr std::array<AutonomousRouteStep, 7> kTurnCenterRoute {{
+    {TuneMotionKind::Turn, "Turn 90", 0.0f, 0.0f, 90.0f, 1400, true, 0.0f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Turn 180", 0.0f, 0.0f, 180.0f, 1600, true, 0.0f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Turn -90", 0.0f, 0.0f, -90.0f, 1600, true, 0.0f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Turn 0", 0.0f, 0.0f, 0.0f, 1400, true, 0.0f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Turn 45", 0.0f, 0.0f, 45.0f, 1200, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Turn -45", 0.0f, 0.0f, -45.0f, 1400, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Return 0", 0.0f, 0.0f, 0.0f, 1200, true, 0.0f, 85.0f, 0.0f, 0.0f},
+}};
+constexpr std::array<AutonomousRouteStep, 4> kStraightScaleRoute {{
+    {TuneMotionKind::Move, "Forward 24", 0.0f, 24.0f, 0.0f, 2200, true, 0.35f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Forward 48", 0.0f, 48.0f, 0.0f, 2800, true, 0.35f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Reverse 24", 0.0f, 24.0f, 0.0f, 2600, false, 0.35f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Reverse 0", 0.0f, 0.0f, 0.0f, 2600, false, 0.35f, 80.0f, 0.0f, 0.0f},
+}};
+constexpr std::array<AutonomousRouteStep, 15> kSquareCrossRoute {{
+    {TuneMotionKind::Move, "Square north", 0.0f, 24.0f, 0.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face east", 0.0f, 24.0f, 90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square east", 24.0f, 24.0f, 90.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face south", 24.0f, 24.0f, 180.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square south", 24.0f, 0.0f, 180.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face west", 24.0f, 0.0f, -90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square west", 0.0f, 0.0f, -90.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face diag NE", 0.0f, 0.0f, 45.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Cross NE", 24.0f, 24.0f, 45.0f, 3000, true, 0.50f, 86.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face south", 24.0f, 24.0f, 180.0f, 1400, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Cross south", 24.0f, 0.0f, 180.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face diag NW", 24.0f, 0.0f, -45.0f, 1400, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Cross NW", 0.0f, 24.0f, -45.0f, 3000, true, 0.50f, 86.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face home", 0.0f, 24.0f, 180.0f, 1400, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Return home", 0.0f, 0.0f, 180.0f, 2600, true, 0.42f, 82.0f, 0.0f, 0.0f},
+}};
+
+struct DirectWallSolveCandidate {
+    bool valid = false;
+    lemlib::Pose pose {0, 0, 0};
+    float meanAbsResidual = 0.0f;
+    int usedSensors = 0;
+    int xSensors = 0;
+    int ySensors = 0;
+};
+
+struct RelocalizationCandidate {
+    lemlib::localization::MCLMeasurement measurement {};
+    float seedHeading = 0.0f;
+    int iterations = 0;
+    bool hasMeasurement = false;
+};
+
+pros::Mutex tuneMutex;
+std::array<TuneCheckpoint, kTuneCheckpointCapacity> tuneCheckpoints {};
+int tuneCheckpointCount = 0;
+int tuneSelectedCheckpoint = 0;
+int tuneDisplayPage = 0;
+lemlib::Pose tuneStartPose {0, 0, 0};
+const char* tuneStatus = "Idle";
+const char* tuneStepName = "Autonomous runs relocalized route";
+bool tuneTestRunning = false;
+TuneRunMode tuneRunMode = TuneRunMode::Idle;
+TuneTestCase tuneTestCase = kDefaultTuneTestCase;
+RelocalizationSummary relocalizationSummary {};
+bool tuneOverlayActive = false;
+pros::Task* screenTask = nullptr;
+pros::Task* overlayControlTask = nullptr;
+pros::Task* terminalReplayTask = nullptr;
+pros::Task* manualDriveFallbackTask = nullptr;
+pros::Mutex pendingTuneLogMutex;
+std::string pendingTuneTerminalLog;
+bool pendingTuneTerminalReplay = false;
+bool pendingTuneTerminalStreaming = false;
+bool pendingTuneTerminalDumpRequested = false;
+volatile bool driverControlLoopActive = false;
+volatile bool driverDriveLoopTicking = false;
+volatile bool manualDriveFallbackActive = false;
+const char* tuneExportFeedback = nullptr;
+std::uint32_t tuneExportFeedbackUntilMs = 0;
+volatile std::uint32_t tuneExportTapSequence = 0;
+volatile std::uint32_t tuneExportTapLastMs = 0;
+
+void overlayControlTaskFn();
+void manualDriveFallbackTaskFn();
+void screenTaskFn();
+void terminalReplayTaskFn();
+void cachePendingTuneTerminalLog(const std::string& fullLog);
+
+void setTuneExportFeedback(const char* message, std::uint32_t durationMs = kTuneExportFeedbackMs) {
+    tuneMutex.take();
+    tuneExportFeedback = message;
+    tuneExportFeedbackUntilMs = durationMs == 0 ? 0 : pros::millis() + durationMs;
+    tuneMutex.give();
+}
+
+const char* currentTuneExportFeedback() {
+    const char* message = nullptr;
+    tuneMutex.take();
+    if (tuneExportFeedback != nullptr) {
+        const bool expired = tuneExportFeedbackUntilMs != 0 && pros::millis() >= tuneExportFeedbackUntilMs;
+        if (expired) {
+            tuneExportFeedback = nullptr;
+            tuneExportFeedbackUntilMs = 0;
+        } else {
+            message = tuneExportFeedback;
+        }
+    }
+    tuneMutex.give();
+    return message;
+}
+
+void handleTuneExportTap() {
+    const auto touch = pros::screen::touch_status();
+    if (touch.x < kTuneExportTapMinX || touch.y < kTuneExportTapMinY) return;
+
+    const std::uint32_t now = pros::millis();
+    if (now - tuneExportTapLastMs < 200) return;
+
+    tuneExportTapLastMs = now;
+    ++tuneExportTapSequence;
+}
+
+void appendFormat(std::string& out, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    const int written = std::vsnprintf(nullptr, 0, format, copy);
+    va_end(copy);
+    if (written <= 0) {
+        va_end(args);
+        return;
+    }
+
+    std::vector<char> buffer(static_cast<size_t>(written) + 1);
+    std::vsnprintf(buffer.data(), buffer.size(), format, args);
+    va_end(args);
+    out.append(buffer.data(), static_cast<size_t>(written));
+}
+
+SensorSnapshot captureSensor(pros::Distance& sensor) {
+    SensorSnapshot snapshot {};
+    const std::int32_t distanceMm = sensor.get_distance();
+    if (distanceMm <= 0 || distanceMm >= 9000) return snapshot;
+
+    snapshot.distance = static_cast<float>(distanceMm) / 25.4f;
+    if (distanceMm >= 200) snapshot.confidence = sensor.get_confidence();
+    return snapshot;
+}
+
+DistanceSnapshot captureDistances() {
+    return DistanceSnapshot {
+        captureSensor(distFront),
+        captureSensor(distRight),
+        captureSensor(distBack),
+        captureSensor(distLeft),
+    };
+}
+
+template <size_t N>
+SensorSnapshot combineSensorSnapshots(const std::array<SensorSnapshot, N>& samples) {
+    SensorSnapshot combined {};
+    std::array<float, N> distances {};
+    size_t distanceCount = 0;
+
+    for (const auto& sample : samples) {
+        if (sample.distance > 0.0f) distances[distanceCount++] = sample.distance;
+        if (sample.confidence > combined.confidence) combined.confidence = sample.confidence;
+    }
+
+    if (distanceCount == 0) return combined;
+
+    std::sort(distances.begin(), distances.begin() + static_cast<std::ptrdiff_t>(distanceCount));
+    if (distanceCount % 2 == 1) combined.distance = distances[distanceCount / 2];
+    else combined.distance = 0.5f * (distances[distanceCount / 2 - 1] + distances[distanceCount / 2]);
+
+    return combined;
+}
+
+DistanceSnapshot captureStableDistances() {
+    std::array<DistanceSnapshot, kRelocalizeSnapshotCount> snapshots {};
+    for (int i = 0; i < kRelocalizeSnapshotCount; ++i) {
+        snapshots[static_cast<size_t>(i)] = captureDistances();
+        if (i + 1 < kRelocalizeSnapshotCount) pros::delay(kRelocalizeSnapshotSpacingMs);
+    }
+
+    std::array<SensorSnapshot, kRelocalizeSnapshotCount> front {};
+    std::array<SensorSnapshot, kRelocalizeSnapshotCount> right {};
+    std::array<SensorSnapshot, kRelocalizeSnapshotCount> back {};
+    std::array<SensorSnapshot, kRelocalizeSnapshotCount> left {};
+    for (int i = 0; i < kRelocalizeSnapshotCount; ++i) {
+        front[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].front;
+        right[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].right;
+        back[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].back;
+        left[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].left;
+    }
+
+    return DistanceSnapshot {
+        combineSensorSnapshots(front),
+        combineSensorSnapshots(right),
+        combineSensorSnapshots(back),
+        combineSensorSnapshots(left),
+    };
+}
+
+DistanceSnapshot captureDistances(const lemlib::localization::TraceSample& sample) {
+    auto convert = [](const lemlib::localization::TraceSensorInfo& sensor) {
+        SensorSnapshot snapshot {};
+        snapshot.distance = sensor.distance;
+        snapshot.confidence = sensor.confidence;
+        return snapshot;
+    };
+    return DistanceSnapshot {
+        convert(sample.sensors[0]),
+        convert(sample.sensors[1]),
+        convert(sample.sensors[2]),
+        convert(sample.sensors[3]),
+    };
+}
+
+std::array<lemlib::localization::SensorObservation, 4> makeSensorObservations(const DistanceSnapshot& snapshot) {
+    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
+    std::array<lemlib::localization::SensorObservation, 4> observations {};
+    for (size_t i = 0; i < samples.size(); ++i) {
+        if (samples[i].distance <= 0.0f) continue;
+        observations[i].available = true;
+        observations[i].distance = samples[i].distance;
+        observations[i].confidence = samples[i].confidence;
+    }
+    return observations;
+}
+
+float wrapDegrees(float degrees) {
+    while (degrees > 180.0f) degrees -= 360.0f;
+    while (degrees <= -180.0f) degrees += 360.0f;
+    return degrees;
+}
+
+float wrapRadians(float radians) {
+    while (radians > kPi) radians -= 2.0f * kPi;
+    while (radians <= -kPi) radians += 2.0f * kPi;
+    return radians;
+}
+
+float internalRadiansToMoveHeadingDeg(float thetaRadians) {
+    return lemlib::radToDeg(kPiOver2 - thetaRadians);
+}
+
+lemlib::Pose offsetPose(const lemlib::Pose& start, float localRight, float localForward, float deltaTheta) {
+    const float sinTheta = std::sin(start.theta);
+    const float cosTheta = std::cos(start.theta);
+    return lemlib::Pose(start.x + localRight * cosTheta + localForward * sinTheta,
+                        start.y - localRight * sinTheta + localForward * cosTheta,
+                        wrapRadians(start.theta + deltaTheta));
+}
+
+lemlib::Pose autonomousRouteTarget(const lemlib::Pose& start, const AutonomousRouteStep& step) {
+    return offsetPose(start, step.localRight, step.localForward, lemlib::degToRad(step.headingOffsetDeg));
+}
+
+void clearTuneResults() {
+    tuneMutex.take();
+    tuneCheckpoints = {};
+    tuneCheckpointCount = 0;
+    tuneSelectedCheckpoint = 0;
+    tuneDisplayPage = 0;
+    tuneMutex.give();
+}
+
+void clearRelocalizationSummary() {
+    tuneMutex.take();
+    relocalizationSummary = {};
+    tuneMutex.give();
+}
+
+const char* tuneRunModeName(TuneRunMode mode) {
+    switch (mode) {
+        case TuneRunMode::AutonomousRelocalized: return "autonomous_relocalized";
+        case TuneRunMode::Idle:
+        default: return "idle";
+    }
+}
+
+TuneTestCase tuneTestCaseFromNumber(int testNumber) {
+    switch (testNumber) {
+        case 2: return TuneTestCase::StraightScale;
+        case 3: return TuneTestCase::SquareCross;
+        case 1:
+        default: return TuneTestCase::TurnCenter;
+    }
+}
+
+int tuneTestCaseNumber(TuneTestCase testCase) {
+    switch (testCase) {
+        case TuneTestCase::StraightScale: return 2;
+        case TuneTestCase::SquareCross: return 3;
+        case TuneTestCase::TurnCenter:
+        default: return 1;
+    }
+}
+
+TuneTestDefinition tuneTestDefinition(TuneTestCase testCase) {
+    switch (testCase) {
+        case TuneTestCase::StraightScale:
+            return {testCase, "Straight scale", "Forward/reverse distance scale and lateral drift",
+                    kStraightScaleRoute.data(), kStraightScaleRoute.size()};
+        case TuneTestCase::SquareCross:
+            return {testCase, "Square cross", "Combined lateral PID, angular PID, tracking, and sensor fusion",
+                    kSquareCrossRoute.data(), kSquareCrossRoute.size()};
+        case TuneTestCase::TurnCenter:
+        default:
+            return {TuneTestCase::TurnCenter, "Turn center", "Angular PID and rotational center drift",
+                    kTurnCenterRoute.data(), kTurnCenterRoute.size()};
+    }
+}
+
+const char* tuneLogOutputModeName(TuneLogOutputMode mode) {
+    switch (mode) {
+        case TuneLogOutputMode::DeepDive: return "deep_dive";
+        case TuneLogOutputMode::Lean:
+        default: return "lean";
+    }
+}
+
+void appendLocalizationConfig(std::string& out) {
+    const auto config = lemlib::localization::getConfig();
+    appendFormat(out, "field_min=%.2f %.2f\n", config.field.minX, config.field.minY);
+    appendFormat(out, "field_max=%.2f %.2f\n", config.field.maxX, config.field.maxY);
+    appendFormat(out, "field_margin=%.2f obstacle_margin=%.2f obstacle_count=%lu\n", config.field.fieldMargin,
+                 config.field.obstacleMargin, static_cast<unsigned long>(config.field.obstacles.size()));
+    appendFormat(out, "fusion ekf_ms=%lu mcl_ms=%lu nis=%.2f min_sensors=%d min_conf=%.2f stale_ms=%lu blend=%.2f\n",
+                 static_cast<unsigned long>(config.fusion.ekfPeriodMs),
+                 static_cast<unsigned long>(config.fusion.mclPeriodMs), config.fusion.nisGate,
+                 config.fusion.minCorrectionSensors, config.fusion.minConfidence,
+                 static_cast<unsigned long>(config.fusion.sensorStaleMs), config.fusion.blend);
+    appendFormat(out, "fusion max_var_xy=%.3f max_var_th=%.5f max_meas_xy=%.3f max_meas_th=%.3f max_corr_xy=%.3f max_corr_th=%.5f\n",
+                 config.fusion.maxVarXY, config.fusion.maxVarTheta, config.fusion.maxMeasurementDeltaXY,
+                 lemlib::radToDeg(config.fusion.maxMeasurementDeltaTheta), config.fusion.maxCorrectionXY,
+                 config.fusion.maxCorrectionTheta);
+    appendFormat(out, "mcl particles=%d sensor_std=%.3f outlier_th=%.3f outlier_weight=%.3f min_active=%d\n",
+                 config.mcl.numParticles, config.mcl.sensorStd, config.mcl.outlierThreshold,
+                 config.mcl.outlierWeight, config.mcl.minActiveSensors);
+    appendFormat(out, "mcl motion_xy=%.4f motion_xy_per_in=%.4f motion_th=%.5f motion_th_per_rad=%.5f\n",
+                 config.mcl.motionStdXY, config.mcl.motionStdXYPerIn, config.mcl.motionStdTheta,
+                 config.mcl.motionStdThetaPerRad);
+    appendFormat(out,
+                 "mcl lat_std_per_rad=%.4f lat_std_per_in_rad=%.4f lat_bias_per_rad=%.4f lat_bias_per_in_rad=%.4f\n",
+                 config.mcl.motionLateralStdPerRad, config.mcl.motionLateralStdPerInRad,
+                 config.mcl.motionLateralBiasPerRad, config.mcl.motionLateralBiasPerInRad);
+    appendFormat(out,
+                 "mcl init_xy=%.3f init_th=%.5f conf_spread=%.3f rough_xy=%.4f rough_th=%.5f side_rough_per_rad=%.4f\n",
+                 config.mcl.initStdXY, config.mcl.initStdTheta, config.mcl.confidenceMaxSpread,
+                 config.mcl.rougheningStdXY, config.mcl.rougheningStdTheta, config.mcl.sideRougheningStdPerRad);
+    appendFormat(out,
+                 "ekf proc_xy=%.4f proc_xy_per_in=%.4f proc_th=%.5f proc_th_per_rad=%.5f lat_per_rad=%.4f lat_per_in_rad=%.4f\n",
+                 config.ekf.processStdXY, config.ekf.processStdXYPerIn, config.ekf.processStdTheta,
+                 config.ekf.processStdThetaPerRad, config.ekf.processStdLateralPerRad,
+                 config.ekf.processStdLateralPerInRad);
+    for (size_t i = 0; i < config.sensors.size(); ++i) {
+        const auto& sensor = config.sensors[i];
+        appendFormat(out,
+                     "sensor%lu dx=%.3f dy=%.3f dtheta_deg=%.2f min=%.2f max=%.2f min_conf=%d configured=%d\n",
+                     static_cast<unsigned long>(i), sensor.dx, sensor.dy, lemlib::radToDeg(sensor.dtheta),
+                     sensor.minRange, sensor.maxRange, sensor.minConfidence, sensor.sensor != nullptr);
+    }
+}
+
+std::string buildTuneReport(TuneLogOutputMode outputMode = kTuneLogOutputMode) {
+    std::array<TuneCheckpoint, kTuneCheckpointCapacity> checkpoints {};
+    int checkpointCount = 0;
+    const char* status = nullptr;
+    const char* stepName = nullptr;
+    lemlib::Pose startPoseSnapshot {0, 0, 0};
+    TuneRunMode mode = TuneRunMode::Idle;
+    TuneTestCase testCase = kDefaultTuneTestCase;
+    RelocalizationSummary relocalize {};
+
+    tuneMutex.take();
+    checkpoints = tuneCheckpoints;
+    checkpointCount = tuneCheckpointCount;
+    status = tuneStatus;
+    stepName = tuneStepName;
+    startPoseSnapshot = tuneStartPose;
+    mode = tuneRunMode;
+    testCase = tuneTestCase;
+    relocalize = relocalizationSummary;
+    tuneMutex.give();
+    const TuneTestDefinition test = tuneTestDefinition(testCase);
+
+    std::string report;
+    appendFormat(report, "=== LOCALIZATION TUNE REPORT ===\n");
+    appendFormat(report, "time_ms=%lu\n", static_cast<unsigned long>(pros::millis()));
+    appendFormat(report, "status=%s\n", status);
+    appendFormat(report, "step=%s\n", stepName);
+    appendFormat(report, "mode=%s\n", tuneRunModeName(mode));
+    appendFormat(report, "test_case=%d %s\n", tuneTestCaseNumber(testCase), test.name);
+    appendFormat(report, "test_objective=%s\n", test.objective);
+    appendFormat(report, "output_mode=%s\n", tuneLogOutputModeName(outputMode));
+    const lemlib::Pose startPose =
+        checkpointCount > 0 && checkpoints[0].recorded ? checkpoints[0].expected : startPoseSnapshot;
+    appendFormat(report, "start_pose=%.1f %.1f %.1f\n", startPose.x, startPose.y, lemlib::radToDeg(startPose.theta));
+    appendFormat(report, "relocalize_attempted=%d\n", relocalize.attempted);
+    appendFormat(report, "relocalize_success=%d\n", relocalize.success);
+    appendFormat(report, "relocalize_status=%s\n", relocalize.status);
+    appendFormat(report, "relocalize_pose=%.1f %.1f %.1f\n", relocalize.pose.x, relocalize.pose.y,
+                 lemlib::radToDeg(relocalize.pose.theta));
+    appendFormat(report, "relocalize_heading mode=%s imu=%.1f hypotheses=%d\n", relocalize.headingMode,
+                 lemlib::radToDeg(relocalize.imuHeading), relocalize.headingHypotheses);
+    appendFormat(report, "relocalize_conf=%.3f active=%d iter=%d\n", relocalize.confidence,
+                 relocalize.activeSensors, relocalize.iterations);
+    appendFormat(report, "relocalize_var=%.3f %.3f %.5f\n", relocalize.varX, relocalize.varY,
+                 relocalize.varTheta);
+    appendFormat(report, "relocalize_sensors F %.1f/%d R %.1f/%d\n", relocalize.distances.front.distance,
+                 relocalize.distances.front.confidence, relocalize.distances.right.distance,
+                 relocalize.distances.right.confidence);
+    appendFormat(report, "relocalize_sensors B %.1f/%d L %.1f/%d\n", relocalize.distances.back.distance,
+                 relocalize.distances.back.confidence, relocalize.distances.left.distance,
+                 relocalize.distances.left.confidence);
+    appendFormat(report, "route_step_count=%lu\n", static_cast<unsigned long>(test.stepCount));
+    for (size_t i = 0; i < test.stepCount; ++i) {
+        const AutonomousRouteStep& step = test.steps[i];
+        const lemlib::Pose target = autonomousRouteTarget(startPose, step);
+        appendFormat(report,
+                     "route_step%lu=%s type=%s local=%.1f %.1f heading_offset=%.1f abs=%.1f %.1f %.1f timeout=%d max=%.0f\n",
+                     static_cast<unsigned long>(i + 1), step.name,
+                     step.kind == TuneMotionKind::Turn ? "turn" : "move", step.localRight, step.localForward,
+                     step.headingOffsetDeg, target.x, target.y, lemlib::radToDeg(target.theta), step.timeoutMs,
+                     step.maxSpeed);
+    }
+    appendFormat(report, "checkpoint_count=%d\n\n", checkpointCount);
+    if (outputMode == TuneLogOutputMode::DeepDive) {
+        appendLocalizationConfig(report);
+        appendFormat(report, "\n");
+    }
+
+    for (int i = 0; i < checkpointCount; ++i) {
+        const TuneCheckpoint& checkpoint = checkpoints[i];
+        const float expectedTheta = lemlib::radToDeg(checkpoint.expected.theta);
+        const float reportedTheta = lemlib::radToDeg(checkpoint.reported.theta);
+        const float fusedTheta = lemlib::radToDeg(checkpoint.debug.fusedPose.theta);
+        const float mclTheta = lemlib::radToDeg(checkpoint.debug.mclPose.theta);
+        const float errorX = checkpoint.reported.x - checkpoint.expected.x;
+        const float errorY = checkpoint.reported.y - checkpoint.expected.y;
+        const float errorTheta = wrapDegrees(reportedTheta - expectedTheta);
+
+        appendFormat(report, "[%d] %s\n", i + 1, checkpoint.name);
+        appendFormat(report, "Exp %.1f %.1f %.1f\n", checkpoint.expected.x, checkpoint.expected.y, expectedTheta);
+        appendFormat(report, "Rep %.1f %.1f %.1f\n", checkpoint.reported.x, checkpoint.reported.y, reportedTheta);
+        appendFormat(report, "Err %.1f %.1f %.1f\n", errorX, errorY, errorTheta);
+        appendFormat(report, "Seq %lu\n", static_cast<unsigned long>(checkpoint.odomSeq));
+        appendFormat(report, "F %.1f/%d R %.1f/%d\n", checkpoint.distances.front.distance,
+                     checkpoint.distances.front.confidence, checkpoint.distances.right.distance,
+                     checkpoint.distances.right.confidence);
+        appendFormat(report, "B %.1f/%d L %.1f/%d\n", checkpoint.distances.back.distance,
+                     checkpoint.distances.back.confidence, checkpoint.distances.left.distance,
+                     checkpoint.distances.left.confidence);
+        appendFormat(report, "A%d C%.2f OK%d\n", checkpoint.debug.activeSensors, checkpoint.debug.mclConfidence,
+                     checkpoint.debug.correctionAccepted);
+        appendFormat(report, "Fus %.1f %.1f %.1f\n", checkpoint.debug.fusedPose.x, checkpoint.debug.fusedPose.y,
+                     fusedTheta);
+        appendFormat(report, "MCL %.1f %.1f %.1f\n", checkpoint.debug.mclPose.x, checkpoint.debug.mclPose.y,
+                     mclTheta);
+        appendFormat(report, "NIS %.2f ESS %.1f\n", checkpoint.debug.lastNis, checkpoint.debug.mclEss);
+        appendFormat(report, "Var %.2f %.2f\n", checkpoint.debug.mclVarX, checkpoint.debug.mclVarY);
+        appendFormat(report, "ThVar %.3f Stale%d\n\n", checkpoint.debug.mclVarTheta,
+                     checkpoint.debug.sensorsStale);
+    }
+
+    return report;
+}
+
+std::string buildTuneTraceCsv() {
+    const auto traceSamples = lemlib::localization::getTraceSamples(false);
+    const auto config = lemlib::localization::getConfig();
+    RelocalizationSummary relocalize {};
+    TuneTestCase testCase = kDefaultTuneTestCase;
+
+    tuneMutex.take();
+    relocalize = relocalizationSummary;
+    testCase = tuneTestCase;
+    tuneMutex.give();
+    const TuneTestDefinition test = tuneTestDefinition(testCase);
+
+    std::string csv;
+    appendFormat(csv, "# localization_trace_v2\n");
+    appendFormat(csv, "# test_case,%d,%s,%s\n", tuneTestCaseNumber(testCase), test.name, test.objective);
+    appendFormat(csv, "# relocalize,%d,%d,%s,%.4f,%.4f,%.4f,%.6f,%.6f,%.8f,%d,%d\n", relocalize.attempted,
+                 relocalize.success, relocalize.status, relocalize.pose.x, relocalize.pose.y,
+                 lemlib::radToDeg(relocalize.pose.theta), relocalize.confidence, relocalize.varX, relocalize.varY,
+                 relocalize.activeSensors, relocalize.iterations);
+    appendFormat(csv, "# relocalize_heading,%s,%.4f,%d\n", relocalize.headingMode,
+                 lemlib::radToDeg(relocalize.imuHeading), relocalize.headingHypotheses);
+    appendFormat(csv, "# ekf_period_ms=%lu,mcl_period_ms=%lu,nis_gate=%.3f,min_correction_sensors=%d,min_confidence=%.3f,blend=%.3f\n",
+                 static_cast<unsigned long>(config.fusion.ekfPeriodMs),
+                 static_cast<unsigned long>(config.fusion.mclPeriodMs), config.fusion.nisGate,
+                 config.fusion.minCorrectionSensors, config.fusion.minConfidence, config.fusion.blend);
+    appendFormat(csv, "# max_var_xy=%.3f,max_var_theta=%.5f,max_meas_xy=%.3f,max_meas_theta_deg=%.3f,max_corr_xy=%.3f,max_corr_theta_deg=%.3f,stale_ms=%lu\n",
+                 config.fusion.maxVarXY, config.fusion.maxVarTheta, config.fusion.maxMeasurementDeltaXY,
+                 lemlib::radToDeg(config.fusion.maxMeasurementDeltaTheta), config.fusion.maxCorrectionXY,
+                 lemlib::radToDeg(config.fusion.maxCorrectionTheta),
+                 static_cast<unsigned long>(config.fusion.sensorStaleMs));
+    appendFormat(csv, "# field_bounds,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", config.field.minX, config.field.maxX,
+                 config.field.minY, config.field.maxY, config.field.fieldMargin, config.field.obstacleMargin);
+    appendFormat(csv, "# odom_model,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", vertical.getOffset(),
+                 horizontal.getOffset(), drivetrain.trackWidth, vertical.getWheelDiameter(),
+                 vertical.getGearRatio(), horizontal.getWheelDiameter(), horizontal.getGearRatio());
+    for (size_t i = 0; i < config.field.obstacles.size(); ++i) {
+        const auto& obstacle = config.field.obstacles[i];
+        const char* type =
+            obstacle.type == lemlib::localization::FieldConfig::Obstacle::Type::Circle ? "circle" : "rect";
+        appendFormat(csv, "# obstacle,%lu,%s,%.4f,%.4f,%.4f,%.4f,%.4f\n", static_cast<unsigned long>(i), type,
+                     obstacle.x, obstacle.y, obstacle.radius, obstacle.halfW, obstacle.halfH);
+    }
+    for (size_t i = 0; i < config.sensors.size(); ++i) {
+        const auto& sensor = config.sensors[i];
+        appendFormat(csv, "# sensor_model,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n", static_cast<unsigned long>(i),
+                     sensor.dx, sensor.dy, lemlib::radToDeg(sensor.dtheta), sensor.minRange, sensor.maxRange,
+                     sensor.minConfidence);
+    }
+    appendFormat(
+        csv,
+        "time_ms,odom_seq,odom_x,odom_y,odom_theta_deg,odom_local_x,odom_local_y,odom_delta_theta_deg,odom_tel_seq,odom_tel_dt,odom_heading_before_deg,odom_heading_after_deg,odom_delta_heading_deg,odom_heading_horizontal_pair,odom_heading_vertical_pair,odom_heading_imu,odom_heading_fallback,odom_vertical1_raw,odom_vertical2_raw,odom_horizontal1_raw,odom_horizontal2_raw,odom_imu_raw_deg,odom_delta_vertical1,odom_delta_vertical2,odom_delta_horizontal1,odom_delta_horizontal2,odom_delta_imu_deg,odom_selected_vertical_raw,odom_selected_horizontal_raw,odom_selected_delta_vertical,odom_selected_delta_horizontal,odom_selected_vertical_offset,odom_selected_horizontal_offset,ekf_x,ekf_y,ekf_theta_deg,applied_x,applied_y,applied_theta_deg,target_corr_x,target_corr_y,target_corr_theta_deg,applied_corr_x,applied_corr_y,applied_corr_theta_deg,mcl_x,mcl_y,mcl_theta_deg,mcl_conf,mcl_ess,last_nis,mcl_var_x,mcl_var_y,mcl_var_theta,active_sensors,mcl_valid,sensors_stale,correction_accepted,front_dist,front_conf,front_in_range,front_conf_ok,front_used,right_dist,right_conf,right_in_range,right_conf_ok,right_used,back_dist,back_conf,back_in_range,back_conf_ok,back_used,left_dist,left_conf,left_in_range,left_conf_ok,left_used\n");
+
+    for (const auto& sample : traceSamples) {
+        appendFormat(
+            csv,
+            "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d\n",
+            static_cast<unsigned long>(sample.timeMs), static_cast<unsigned long>(sample.odomSeq),
+            sample.odomPose.x, sample.odomPose.y, sample.odomPose.theta, sample.odomDelta.localX,
+            sample.odomDelta.localY, sample.odomDelta.deltaTheta,
+            static_cast<unsigned long>(sample.odomTelemetry.seq), sample.odomTelemetry.dt,
+            sample.odomTelemetry.headingBefore, sample.odomTelemetry.headingAfter,
+            sample.odomTelemetry.deltaHeading, sample.odomTelemetry.usedHorizontalHeadingPair,
+            sample.odomTelemetry.usedVerticalHeadingPair, sample.odomTelemetry.usedImuHeading,
+            sample.odomTelemetry.usedHeadingFallback, sample.odomTelemetry.vertical1Raw,
+            sample.odomTelemetry.vertical2Raw, sample.odomTelemetry.horizontal1Raw,
+            sample.odomTelemetry.horizontal2Raw, sample.odomTelemetry.imuRaw,
+            sample.odomTelemetry.deltaVertical1, sample.odomTelemetry.deltaVertical2,
+            sample.odomTelemetry.deltaHorizontal1, sample.odomTelemetry.deltaHorizontal2,
+            sample.odomTelemetry.deltaImu, sample.odomTelemetry.selectedVerticalRaw,
+            sample.odomTelemetry.selectedHorizontalRaw, sample.odomTelemetry.selectedDeltaVertical,
+            sample.odomTelemetry.selectedDeltaHorizontal, sample.odomTelemetry.selectedVerticalOffset,
+            sample.odomTelemetry.selectedHorizontalOffset, sample.ekfPose.x, sample.ekfPose.y,
+            sample.ekfPose.theta, sample.appliedPose.x, sample.appliedPose.y, sample.appliedPose.theta,
+            sample.targetCorrectionX, sample.targetCorrectionY, sample.targetCorrectionTheta,
+            sample.appliedCorrectionX, sample.appliedCorrectionY, sample.appliedCorrectionTheta,
+            sample.mclPose.x, sample.mclPose.y, sample.mclPose.theta, sample.mclConfidence, sample.mclEss,
+            sample.lastNis, sample.mclVarX, sample.mclVarY, sample.mclVarTheta, sample.activeSensors,
+            sample.mclValid, sample.sensorsStale, sample.correctionAccepted, sample.sensors[0].distance,
+            sample.sensors[0].confidence, sample.sensors[0].inRange, sample.sensors[0].confidenceAccepted,
+            sample.sensors[0].used, sample.sensors[1].distance, sample.sensors[1].confidence,
+            sample.sensors[1].inRange, sample.sensors[1].confidenceAccepted, sample.sensors[1].used,
+            sample.sensors[2].distance, sample.sensors[2].confidence, sample.sensors[2].inRange,
+            sample.sensors[2].confidenceAccepted, sample.sensors[2].used, sample.sensors[3].distance,
+            sample.sensors[3].confidence, sample.sensors[3].inRange, sample.sensors[3].confidenceAccepted,
+            sample.sensors[3].used);
+    }
+
+    return csv;
+}
+
+std::string buildTuneLogFile() {
+    std::string log = buildTuneReport();
+    if (kTuneLogOutputMode == TuneLogOutputMode::DeepDive) {
+        appendFormat(log, "=== LOCALIZATION TRACE CSV ===\n");
+        log.append(buildTuneTraceCsv());
+    }
+    return log;
+}
+
+bool writeTextFile(const char* path, const std::string& contents) {
+    std::FILE* file = std::fopen(path, "w");
+    if (file == nullptr) return false;
+    const size_t written = std::fwrite(contents.data(), sizeof(char), contents.size(), file);
+    std::fclose(file);
+    return written == contents.size();
+}
+
+bool readTextFile(const char* path, std::string& contents) {
+    std::FILE* file = std::fopen(path, "r");
+    if (file == nullptr) return false;
+    if (std::fseek(file, 0, SEEK_END) != 0) {
+        std::fclose(file);
+        return false;
+    }
+
+    const long size = std::ftell(file);
+    if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+
+    std::string buffer(static_cast<size_t>(size), '\0');
+    const size_t read = std::fread(buffer.data(), sizeof(char), buffer.size(), file);
+    std::fclose(file);
+    if (read != buffer.size()) return false;
+    contents = std::move(buffer);
+    return true;
+}
+
+void persistTuneLogInternal(const std::string& fullLog) { writeTextFile(kTuneInternalLogPath, fullLog); }
+
+void restoreInternalTuneLogIfPresent() {
+    std::string persistedLog;
+    if (!readTextFile(kTuneInternalLogPath, persistedLog) || persistedLog.empty()) return;
+    cachePendingTuneTerminalLog(persistedLog);
+    setTuneExportFeedback("Recovered internal log", 0);
+}
+
+void streamTextToTerminal(const std::string& text) {
+    constexpr size_t kChunkSize = 512;
+    constexpr std::uint32_t kChunkDelayMs = 2;
+    const int serialFd = ::open("serial", O_RDWR);
+    if (serialFd >= 0) {
+        pros::c::fdctl(serialFd, SERCTL_ACTIVATE, reinterpret_cast<void*>(kStdoutStreamId));
+        pros::c::fdctl(serialFd, SERCTL_BLKWRITE, nullptr);
+    }
+
+    for (size_t pos = 0; pos < text.size(); pos += kChunkSize) {
+        const size_t count = std::min(kChunkSize, text.size() - pos);
+        std::printf("%.*s", static_cast<int>(count), text.data() + pos);
+        std::fflush(stdout);
+        if (serialFd >= 0) ::write(serialFd, text.data() + pos, count);
+        pros::delay(kChunkDelayMs);
+    }
+
+    if (serialFd >= 0) ::close(serialFd);
+}
+
+void ensureTerminalStdoutActive() {
+    pros::c::serctl(SERCTL_ACTIVATE, reinterpret_cast<void*>(kStdoutStreamId));
+}
+
+void streamTuneLogBlockToTerminal(const std::string& fullLog) {
+    constexpr const char* kTerminalBeginMarker = "=== BEGIN LOCALIZATION TUNE LOG ===\n";
+    constexpr const char* kTerminalEndMarker = "\n=== END LOCALIZATION TUNE LOG ===\n";
+    ensureTerminalStdoutActive();
+    streamTextToTerminal(kTerminalBeginMarker);
+    streamTextToTerminal(fullLog);
+    streamTextToTerminal(kTerminalEndMarker);
+}
+
+void cachePendingTuneTerminalLog(const std::string& fullLog) {
+    pendingTuneLogMutex.take();
+    pendingTuneTerminalLog = fullLog;
+    pendingTuneTerminalReplay = !fullLog.empty();
+    pendingTuneTerminalStreaming = false;
+    pendingTuneTerminalDumpRequested = false;
+    pendingTuneLogMutex.give();
+}
+
+void clearPendingTuneTerminalLog() {
+    pendingTuneLogMutex.take();
+    pendingTuneTerminalLog.clear();
+    pendingTuneTerminalReplay = false;
+    pendingTuneTerminalStreaming = false;
+    pendingTuneTerminalDumpRequested = false;
+    pendingTuneLogMutex.give();
+    clearExportFeedback();
+}
+
+bool hasPendingTuneTerminalReplay() {
+    bool ready = false;
+    pendingTuneLogMutex.take();
+    ready = pendingTuneTerminalReplay && !pendingTuneTerminalLog.empty();
+    pendingTuneLogMutex.give();
+    return ready;
+}
+
+bool hasLiveTuneData() {
+    bool hasData = false;
+    tuneMutex.take();
+    hasData = tuneTestRunning || tuneCheckpointCount > 0 || relocalizationSummary.attempted ||
+              tuneRunMode != TuneRunMode::Idle || (tuneStatus != nullptr && std::string_view(tuneStatus) != "Idle");
+    tuneMutex.give();
+    if (hasData) return true;
+    return !lemlib::localization::getTraceSamples(false).empty();
+}
+
+bool hasTuneExportAvailable() { return hasPendingTuneTerminalReplay() || hasLiveTuneData(); }
+
+bool queueTuneDataExportToTerminal() {
+    pendingTuneLogMutex.take();
+    const bool hasCachedLog = pendingTuneTerminalReplay && !pendingTuneTerminalLog.empty();
+    pendingTuneLogMutex.give();
+
+    if (!hasCachedLog) {
+        if (!hasLiveTuneData()) return false;
+        cachePendingTuneTerminalLog(buildTuneLogFile());
+    }
+
+    pendingTuneLogMutex.take();
+    pendingTuneTerminalDumpRequested = pendingTuneTerminalReplay && !pendingTuneTerminalLog.empty();
+    const bool queued = pendingTuneTerminalDumpRequested;
+    pendingTuneLogMutex.give();
+    return queued;
+}
+
+void terminalReplayTaskFn() {
+    while (true) {
+        std::string replayLog;
+
+        pendingTuneLogMutex.take();
+        const bool shouldReplay = pendingTuneTerminalReplay && pendingTuneTerminalDumpRequested &&
+                                  !pendingTuneTerminalStreaming && !pendingTuneTerminalLog.empty();
+        if (shouldReplay) {
+            pendingTuneTerminalStreaming = true;
+            pendingTuneTerminalDumpRequested = false;
+            replayLog = pendingTuneTerminalLog;
+        }
+        pendingTuneLogMutex.give();
+
+        if (!replayLog.empty()) {
+            setTuneExportFeedback("Exporting tune log...", 0);
+            streamTuneLogBlockToTerminal(replayLog);
+
+            pendingTuneLogMutex.take();
+            pendingTuneTerminalStreaming = false;
+            pendingTuneTerminalReplay = !pendingTuneTerminalLog.empty();
+            pendingTuneLogMutex.give();
+
+            setTuneExportFeedback("USB dump attempted", kTuneExportFeedbackMs);
+        }
+
+        pros::delay(50);
+    }
+}
+
+void emitTuneReport() {
+    const std::string fullLog = buildTuneLogFile();
+
+    if (pros::usd::is_installed() != 1) {
+        cachePendingTuneTerminalLog(fullLog);
+        persistTuneLogInternal(fullLog);
+        setTuneExportFeedback("Log cached in RAM", 0);
+        lemlib::bufferedStdout().print(
+            "No SD card detected; cached tune log in RAM. After plugging in later, press Y or tap the brain to "
+            "dump it\n");
+        return;
+    }
+    if (!writeTextFile(kTuneLogPath, fullLog)) {
+        cachePendingTuneTerminalLog(fullLog);
+        persistTuneLogInternal(fullLog);
+        setTuneExportFeedback("Log cached in RAM", 0);
+        lemlib::bufferedStdout().print(
+            "Tune report write failed: {}; cached tune log in RAM. Press Y or tap the brain to dump it\n",
+            kTuneLogPath);
+    } else {
+        clearPendingTuneTerminalLog();
+        const std::string report = buildTuneReport();
+        lemlib::bufferedStdout().print("\n{}\n", report);
+        lemlib::bufferedStdout().print("Tune report saved: {}\n", kTuneLogPath);
+    }
+}
+
+bool exportTuneDataToTerminalNow() {
+    if (!queueTuneDataExportToTerminal()) return false;
+    setTuneExportFeedback("Export queued...", kTuneExportFeedbackMs);
+    return true;
+}
+
+void storeTuneCheckpoint(const char* name, const lemlib::Pose& expected) {
+    TuneCheckpoint checkpoint {};
+    checkpoint.name = name;
+    checkpoint.expected = expected;
+    const auto traceSample = lemlib::localization::getLatestTraceSample(true);
+    if (traceSample.timeMs != 0) {
+        checkpoint.reported = traceSample.appliedPose;
+        checkpoint.debug.fusedPose = traceSample.ekfPose;
+        checkpoint.debug.mclPose = traceSample.mclPose;
+        checkpoint.debug.mclConfidence = traceSample.mclConfidence;
+        checkpoint.debug.mclEss = traceSample.mclEss;
+        checkpoint.debug.lastNis = traceSample.lastNis;
+        checkpoint.debug.mclVarX = traceSample.mclVarX;
+        checkpoint.debug.mclVarY = traceSample.mclVarY;
+        checkpoint.debug.mclVarTheta = traceSample.mclVarTheta;
+        checkpoint.debug.activeSensors = traceSample.activeSensors;
+        checkpoint.debug.mclValid = traceSample.mclValid;
+        checkpoint.debug.sensorsStale = traceSample.sensorsStale;
+        checkpoint.debug.correctionAccepted = traceSample.correctionAccepted;
+        checkpoint.distances = captureDistances(traceSample);
+        checkpoint.odomSeq = traceSample.odomSeq;
+    } else {
+        checkpoint.reported = chassis.getPose(true);
+        checkpoint.debug = lemlib::localization::getDebugInfo(true);
+        checkpoint.distances = captureDistances();
+    }
+    checkpoint.recorded = true;
+
+    tuneMutex.take();
+    const int slot =
+        (tuneCheckpointCount < static_cast<int>(tuneCheckpoints.size())) ? tuneCheckpointCount :
+                                                                           static_cast<int>(tuneCheckpoints.size()) - 1;
+    tuneCheckpoints[slot] = checkpoint;
+    if (tuneCheckpointCount < static_cast<int>(tuneCheckpoints.size())) ++tuneCheckpointCount;
+    tuneSelectedCheckpoint = slot;
+    tuneMutex.give();
+
+    const float errorX = checkpoint.reported.x - expected.x;
+    const float errorY = checkpoint.reported.y - expected.y;
+    const float errorTheta = wrapDegrees(lemlib::radToDeg(checkpoint.reported.theta - expected.theta));
+    lemlib::telemetrySink()->info(
+        "Tune checkpoint {} expected={} reported={} err=({:.2f}, {:.2f}, {:.2f} deg) active={} conf={:.2f} accept={}",
+        name, expected, checkpoint.reported, errorX, errorY, errorTheta, checkpoint.debug.activeSensors,
+        checkpoint.debug.mclConfidence, checkpoint.debug.correctionAccepted);
+}
+
+float currentHeadingRadians() {
+    const double imuRotationDeg = imu.get_rotation();
+    if (std::isfinite(imuRotationDeg)) return wrapRadians(lemlib::degToRad(static_cast<float>(imuRotationDeg)));
+    return wrapRadians(chassis.getPose(true).theta);
+}
+
+bool sensorSnapshotUsable(const SensorSnapshot& snapshot, const lemlib::localization::SensorConfig& sensor) {
+    if (snapshot.distance < sensor.minRange || snapshot.distance > sensor.maxRange) return false;
+    if (snapshot.confidence >= 0 && snapshot.confidence < sensor.minConfidence) return false;
+    return snapshot.distance > 0.0f;
+}
+
+int countUsableDistanceSnapshots(const lemlib::localization::LocalizationConfig& config,
+                                 const DistanceSnapshot& snapshot) {
+    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
+    int count = 0;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        if (config.sensors[i].sensor == nullptr) continue;
+        if (sensorSnapshotUsable(samples[i], config.sensors[i])) ++count;
+    }
+    return count;
+}
+
+WallAxisDirection classifyWallAxisDirection(float heading) {
+    const float normalized = wrapRadians(heading);
+    const float absHeading = std::fabs(normalized);
+    if (std::fabs(normalized) <= lemlib::degToRad(30.0f)) return WallAxisDirection::PosY;
+    if (std::fabs(absHeading - kPi) <= lemlib::degToRad(30.0f)) return WallAxisDirection::NegY;
+    if (std::fabs(normalized - kPiOver2) <= lemlib::degToRad(30.0f)) return WallAxisDirection::PosX;
+    if (std::fabs(normalized + kPiOver2) <= lemlib::degToRad(30.0f)) return WallAxisDirection::NegX;
+    return WallAxisDirection::Unknown;
+}
+
+DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::LocalizationConfig& config,
+                                             const DistanceSnapshot& snapshot, float heading) {
+    DirectWallSolveCandidate candidate {};
+    candidate.pose.theta = wrapRadians(heading);
+
+    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
+    float xSum = 0.0f;
+    float ySum = 0.0f;
+
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto& sensor = config.sensors[i];
+        const auto& sample = samples[i];
+        if (sensor.sensor == nullptr || !sensorSnapshotUsable(sample, sensor)) continue;
+
+        const float sinTheta = std::sin(candidate.pose.theta);
+        const float cosTheta = std::cos(candidate.pose.theta);
+        const float sensorGlobalX = sensor.dx * cosTheta + sensor.dy * sinTheta;
+        const float sensorGlobalY = -sensor.dx * sinTheta + sensor.dy * cosTheta;
+        const auto axis = classifyWallAxisDirection(candidate.pose.theta + sensor.dtheta);
+
+        switch (axis) {
+            case WallAxisDirection::PosX:
+                xSum += config.field.maxX - sample.distance - sensorGlobalX;
+                ++candidate.xSensors;
+                ++candidate.usedSensors;
+                break;
+            case WallAxisDirection::NegX:
+                xSum += config.field.minX + sample.distance - sensorGlobalX;
+                ++candidate.xSensors;
+                ++candidate.usedSensors;
+                break;
+            case WallAxisDirection::PosY:
+                ySum += config.field.maxY - sample.distance - sensorGlobalY;
+                ++candidate.ySensors;
+                ++candidate.usedSensors;
+                break;
+            case WallAxisDirection::NegY:
+                ySum += config.field.minY + sample.distance - sensorGlobalY;
+                ++candidate.ySensors;
+                ++candidate.usedSensors;
+                break;
+            case WallAxisDirection::Unknown:
+                break;
+        }
+    }
+
+    if (candidate.xSensors == 0 || candidate.ySensors == 0 || candidate.usedSensors < 2) return candidate;
+
+    candidate.pose.x = xSum / static_cast<float>(candidate.xSensors);
+    candidate.pose.y = ySum / static_cast<float>(candidate.ySensors);
+
+    float residualSum = 0.0f;
+    int residualCount = 0;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto& sensor = config.sensors[i];
+        const auto& sample = samples[i];
+        if (sensor.sensor == nullptr || !sensorSnapshotUsable(sample, sensor)) continue;
+
+        const float sinTheta = std::sin(candidate.pose.theta);
+        const float cosTheta = std::cos(candidate.pose.theta);
+        const float sensorX = candidate.pose.x + sensor.dx * cosTheta + sensor.dy * sinTheta;
+        const float sensorY = candidate.pose.y - sensor.dx * sinTheta + sensor.dy * cosTheta;
+
+        float predicted = -1.0f;
+        switch (classifyWallAxisDirection(candidate.pose.theta + sensor.dtheta)) {
+            case WallAxisDirection::PosX: predicted = config.field.maxX - sensorX; break;
+            case WallAxisDirection::NegX: predicted = sensorX - config.field.minX; break;
+            case WallAxisDirection::PosY: predicted = config.field.maxY - sensorY; break;
+            case WallAxisDirection::NegY: predicted = sensorY - config.field.minY; break;
+            case WallAxisDirection::Unknown: break;
+        }
+        if (predicted <= 0.0f) continue;
+
+        residualSum += std::fabs(predicted - sample.distance);
+        ++residualCount;
+    }
+
+    if (residualCount == 0) return candidate;
+
+    candidate.meanAbsResidual = residualSum / static_cast<float>(residualCount);
+    const bool insideField = candidate.pose.x >= config.field.minX && candidate.pose.x <= config.field.maxX &&
+                             candidate.pose.y >= config.field.minY && candidate.pose.y <= config.field.maxY;
+    candidate.valid = insideField;
+    return candidate;
+}
+
+bool relocalizationAccepted(const lemlib::localization::MCLMeasurement& measurement,
+                            const lemlib::localization::LocalizationConfig& config) {
+    return measurement.valid && measurement.activeSensors >= kRelocalizeMinSensors &&
+           measurement.confidence >= kRelocalizeMinConfidence &&
+           measurement.covariance.m[0][0] <= config.fusion.maxVarXY &&
+           measurement.covariance.m[1][1] <= config.fusion.maxVarXY &&
+           measurement.covariance.m[2][2] <= config.fusion.maxVarTheta;
+}
+
+bool relocalizationWeakAccepted(const lemlib::localization::MCLMeasurement& measurement,
+                                const lemlib::localization::LocalizationConfig& config) {
+    if (!measurement.valid || measurement.activeSensors < kRelocalizeMinSensors) return false;
+
+    const float maxVarXY = std::min(config.fusion.maxVarXY, kRelocalizeWeakMaxVarXY);
+    const float maxVarTheta = std::min(config.fusion.maxVarTheta, kRelocalizeWeakMaxVarTheta);
+    if (measurement.covariance.m[0][0] > maxVarXY || measurement.covariance.m[1][1] > maxVarXY ||
+        measurement.covariance.m[2][2] > maxVarTheta) {
+        return false;
+    }
+
+    const float minConfidence =
+        measurement.activeSensors >= 3 ? kRelocalizeWeakConfidence : kRelocalizeWeakConfidenceTwoSensors;
+    return measurement.confidence >= minConfidence;
+}
+
+bool relocalizationWallDirectAccepted(const RelocalizationSummary& summary,
+                                      const lemlib::localization::LocalizationConfig& config) {
+    return summary.activeSensors >= kRelocalizeMinSensors &&
+           summary.confidence >= kRelocalizeMinConfidence && summary.varX <= config.fusion.maxVarXY &&
+           summary.varY <= config.fusion.maxVarXY && summary.varTheta <= config.fusion.maxVarTheta;
+}
+
+const char* relocalizationStatus(const lemlib::localization::MCLMeasurement& measurement,
+                                 const lemlib::localization::LocalizationConfig& config) {
+    if (!measurement.valid) return "no_valid_pose";
+    if (measurement.activeSensors < kRelocalizeMinSensors) return "not_enough_live_sensors";
+    if (relocalizationWeakAccepted(measurement, config)) return "weak_accept";
+    if (measurement.confidence < kRelocalizeMinConfidence) return "low_confidence";
+    if (measurement.covariance.m[0][0] > config.fusion.maxVarXY ||
+        measurement.covariance.m[1][1] > config.fusion.maxVarXY ||
+        measurement.covariance.m[2][2] > config.fusion.maxVarTheta) {
+        return "high_variance";
+    }
+    return "accepted";
+}
+
+bool relocalizationMeasurementBetter(const lemlib::localization::MCLMeasurement& lhs,
+                                     const lemlib::localization::MCLMeasurement& rhs,
+                                     const lemlib::localization::LocalizationConfig& config) {
+    const bool lhsAccepted = relocalizationAccepted(lhs, config);
+    const bool rhsAccepted = relocalizationAccepted(rhs, config);
+    if (lhsAccepted != rhsAccepted) return lhsAccepted;
+    const bool lhsWeakAccepted = relocalizationWeakAccepted(lhs, config);
+    const bool rhsWeakAccepted = relocalizationWeakAccepted(rhs, config);
+    if (lhsWeakAccepted != rhsWeakAccepted) return lhsWeakAccepted;
+    if (lhs.valid != rhs.valid) return lhs.valid;
+    if (lhs.activeSensors != rhs.activeSensors) return lhs.activeSensors > rhs.activeSensors;
+    if (std::fabs(lhs.confidence - rhs.confidence) > 1e-5f) return lhs.confidence > rhs.confidence;
+
+    const float lhsVarXY = lhs.covariance.m[0][0] + lhs.covariance.m[1][1];
+    const float rhsVarXY = rhs.covariance.m[0][0] + rhs.covariance.m[1][1];
+    if (std::fabs(lhsVarXY - rhsVarXY) > 1e-5f) return lhsVarXY < rhsVarXY;
+    if (std::fabs(lhs.covariance.m[2][2] - rhs.covariance.m[2][2]) > 1e-6f) {
+        return lhs.covariance.m[2][2] < rhs.covariance.m[2][2];
+    }
+
+    return false;
+}
+
+bool relocalizationCandidateBetter(const RelocalizationCandidate& lhs, const RelocalizationCandidate& rhs,
+                                   const lemlib::localization::LocalizationConfig& config) {
+    if (lhs.hasMeasurement != rhs.hasMeasurement) return lhs.hasMeasurement;
+    if (!lhs.hasMeasurement) return false;
+    return relocalizationMeasurementBetter(lhs.measurement, rhs.measurement, config);
+}
+
+RelocalizationCandidate evaluateRelocalizationHeading(const lemlib::localization::LocalizationConfig& config,
+                                                      const lemlib::localization::MCLConfig& baseConfig,
+                                                      const std::array<lemlib::localization::SensorObservation, 4>& observations,
+                                                      float heading, float headingStd, std::uint32_t deadlineMs) {
+    RelocalizationCandidate candidate {};
+    candidate.seedHeading = wrapRadians(heading);
+
+    auto candidateConfig = baseConfig;
+    candidateConfig.initStdTheta = headingStd;
+
+    lemlib::localization::MCL relocalizer;
+    relocalizer.configure(config.field, candidateConfig, config.sensors);
+    relocalizer.reset(lemlib::Pose(0.0f, 0.0f, candidate.seedHeading));
+
+    for (int i = 0; i < kRelocalizeIterationsPerHypothesis && pros::millis() < deadlineMs; ++i) {
+        const auto measurement = relocalizer.update(observations);
+        ++candidate.iterations;
+
+        if (!candidate.hasMeasurement || relocalizationMeasurementBetter(measurement, candidate.measurement, config)) {
+            candidate.measurement = measurement;
+            candidate.hasMeasurement = true;
+        }
+
+        if (relocalizationAccepted(measurement, config)) {
+            candidate.measurement = measurement;
+            candidate.hasMeasurement = true;
+            break;
+        }
+    }
+
+    return candidate;
+}
+
+RelocalizationCandidate evaluateRelocalizationPoseSeed(const lemlib::localization::LocalizationConfig& config,
+                                                       const lemlib::localization::MCLConfig& baseConfig,
+                                                       const std::array<lemlib::localization::SensorObservation, 4>& observations,
+                                                       const lemlib::Pose& seedPose, std::uint32_t deadlineMs) {
+    RelocalizationCandidate candidate {};
+    candidate.seedHeading = wrapRadians(seedPose.theta);
+
+    lemlib::localization::MCL relocalizer;
+    relocalizer.configure(config.field, baseConfig, config.sensors);
+    relocalizer.reset(seedPose);
+
+    for (int i = 0; i < kRelocalizeIterationsPerHypothesis && pros::millis() < deadlineMs; ++i) {
+        const auto measurement = relocalizer.update(observations);
+        ++candidate.iterations;
+
+        if (!candidate.hasMeasurement || relocalizationMeasurementBetter(measurement, candidate.measurement, config)) {
+            candidate.measurement = measurement;
+            candidate.hasMeasurement = true;
+        }
+
+        if (relocalizationAccepted(measurement, config)) {
+            candidate.measurement = measurement;
+            candidate.hasMeasurement = true;
+            break;
+        }
+    }
+
+    return candidate;
+}
+
+bool delayWithAbort(std::uint32_t delayMs) {
+    for (std::uint32_t elapsed = 0; elapsed < delayMs; elapsed += 10) {
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
+            chassis.cancelMotion();
+            return false;
+        }
+        pros::delay(10);
+    }
+    return true;
+}
+
+bool waitForTuneMotionCompletion(TuneMotionKind kind, const lemlib::Pose& expected, int timeoutMs, bool allowAbort) {
+    const std::uint32_t startedAt = pros::millis();
+    int stableCycles = 0;
+    bool sawMotionRunning = false;
+
+    while (pros::millis() - startedAt < static_cast<std::uint32_t>(std::max(timeoutMs, 0))) {
+        if (allowAbort && controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
+            chassis.cancelAllMotions();
+            return false;
+        }
+
+        const bool motionRunning = chassis.isInMotion();
+        sawMotionRunning = sawMotionRunning || motionRunning;
+
+        const lemlib::Pose pose = chassis.getPose(true);
+        const float positionError = pose.distance(expected);
+        const float headingError =
+            std::fabs(wrapDegrees(lemlib::radToDeg(wrapRadians(pose.theta - expected.theta))));
+        const bool closeEnough =
+            kind == TuneMotionKind::Move ? positionError <= kTuneMoveCompletionDistIn &&
+                                               headingError <= kTuneMoveCompletionHeadingDeg
+                                         : headingError <= kTuneTurnCompletionHeadingDeg;
+
+        if (closeEnough) {
+            stableCycles++;
+            if (stableCycles >= kTuneMotionStableCycles) {
+                chassis.cancelMotion();
+                pros::delay(kTuneMotionCancelSettleMs);
+                return true;
+            }
+        } else {
+            stableCycles = 0;
+        }
+
+        if (sawMotionRunning && !motionRunning) return true;
+        pros::delay(kTuneMotionPollMs);
+    }
+
+    if (chassis.isInMotion()) {
+        chassis.cancelMotion();
+        pros::delay(kTuneMotionCancelSettleMs);
+    }
+    return true;
+}
+
+bool settleAndCapture(const char* name, const lemlib::Pose& expected, bool allowAbort) {
+    setState("Settling", name, true);
+    if (allowAbort) {
+        if (!delayWithAbort(kTuneSettleMs)) return false;
+    } else {
+        pros::delay(kTuneSettleMs);
+    }
+    storeTuneCheckpoint(name, expected);
+    return true;
+}
+
+bool waitForPostMoveLocalizationUpdate(bool allowAbort) {
+    const std::uint32_t startedAt = pros::millis();
+
+    while (pros::millis() - startedAt < kTunePostMoveCorrectionWindowMs) {
+        if (allowAbort && controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
+            chassis.cancelAllMotions();
+            return false;
+        }
+
+        const auto debug = lemlib::localization::getDebugInfo(true);
+        const bool goodMeasurement =
+            debug.activeSensors >= 2 && debug.lastNis >= 0.0f && debug.lastNis <= kTunePostMoveGoodNis &&
+            !debug.sensorsStale;
+        if (debug.correctionAccepted || goodMeasurement) return true;
+
+        pros::delay(kTuneMotionPollMs);
+    }
+
+    return true;
+}
+
+bool runMovePoseStep(const char* name, const lemlib::Pose& expected, int timeout,
+                     const lemlib::MoveToPoseParams& params, bool allowAbort) {
+    setState("Move", name, true);
+    chassis.moveToPose(expected.x, expected.y, internalRadiansToMoveHeadingDeg(expected.theta), timeout, params, true);
+    if (!waitForTuneMotionCompletion(TuneMotionKind::Move, expected, timeout, allowAbort)) return false;
+    if (!waitForPostMoveLocalizationUpdate(allowAbort)) return false;
+    return settleAndCapture(name, expected, allowAbort);
+}
+
+bool runTurnStep(const char* name, const lemlib::Pose& expected, int timeout,
+                 const lemlib::TurnToHeadingParams& params, bool allowAbort) {
+    setState("Turn", name, true);
+    chassis.turnToHeading(lemlib::radToDeg(expected.theta), timeout, params, true);
+    if (!waitForTuneMotionCompletion(TuneMotionKind::Turn, expected, timeout, allowAbort)) return false;
+    if (!waitForPostMoveLocalizationUpdate(allowAbort)) return false;
+    return settleAndCapture(name, expected, allowAbort);
+}
+
+bool beginTuneFinalization(const char* status, const char* stepName) {
+    bool shouldFinalize = false;
+    tuneMutex.take();
+    if (tuneTestRunning) {
+        tuneStatus = status;
+        tuneStepName = stepName;
+        tuneTestRunning = false;
+        shouldFinalize = true;
+    }
+    tuneMutex.give();
+    return shouldFinalize;
+}
+
+void printCheckpointPage(const TuneCheckpoint& checkpoint, int index, int count, const char* status, int page) {
+    const float expectedTheta = lemlib::radToDeg(checkpoint.expected.theta);
+    const float reportedTheta = lemlib::radToDeg(checkpoint.reported.theta);
+    const float errorX = checkpoint.reported.x - checkpoint.expected.x;
+    const float errorY = checkpoint.reported.y - checkpoint.expected.y;
+    const float errorTheta = wrapDegrees(reportedTheta - expectedTheta);
+    const bool logReady = hasTuneExportAvailable();
+    const char* exportFeedback = currentTuneExportFeedback();
+
+    pros::screen::print(TEXT_MEDIUM, 1, "Tune %s %d/%d", status, index + 1, count);
+    pros::screen::print(TEXT_MEDIUM, 2, "%s", checkpoint.name);
+    if (page == 0) {
+        pros::screen::print(TEXT_MEDIUM, 3, "Exp %.1f %.1f %.1f", checkpoint.expected.x, checkpoint.expected.y,
+                            expectedTheta);
+        pros::screen::print(TEXT_MEDIUM, 4, "Rep %.1f %.1f %.1f", checkpoint.reported.x, checkpoint.reported.y,
+                            reportedTheta);
+        pros::screen::print(TEXT_MEDIUM, 5, "Err %.1f %.1f %.1f", errorX, errorY, errorTheta);
+        pros::screen::print(TEXT_MEDIUM, 6, "F %.1f/%d R %.1f/%d", checkpoint.distances.front.distance,
+                            checkpoint.distances.front.confidence, checkpoint.distances.right.distance,
+                            checkpoint.distances.right.confidence);
+        pros::screen::print(TEXT_MEDIUM, 7, "B %.1f/%d L %.1f/%d", checkpoint.distances.back.distance,
+                            checkpoint.distances.back.confidence, checkpoint.distances.left.distance,
+                            checkpoint.distances.left.confidence);
+        if (exportFeedback != nullptr) {
+            pros::screen::print(TEXT_MEDIUM, 8, "%s", exportFeedback);
+        } else {
+            pros::screen::print(TEXT_MEDIUM, 8, logReady ? "LOG READY tap LR dump" : "A%d C%.2f OK%d",
+                                checkpoint.debug.activeSensors, checkpoint.debug.mclConfidence,
+                                checkpoint.debug.correctionAccepted);
+        }
+    } else {
+        const float fusedTheta = lemlib::radToDeg(checkpoint.debug.fusedPose.theta);
+        const float mclTheta = lemlib::radToDeg(checkpoint.debug.mclPose.theta);
+        pros::screen::print(TEXT_MEDIUM, 3, "Fus %.1f %.1f %.1f", checkpoint.debug.fusedPose.x,
+                            checkpoint.debug.fusedPose.y, fusedTheta);
+        pros::screen::print(TEXT_MEDIUM, 4, "MCL %.1f %.1f %.1f", checkpoint.debug.mclPose.x,
+                            checkpoint.debug.mclPose.y, mclTheta);
+        pros::screen::print(TEXT_MEDIUM, 5, "NIS %.2f ESS %.1f", checkpoint.debug.lastNis, checkpoint.debug.mclEss);
+        pros::screen::print(TEXT_MEDIUM, 6, "Var %.2f %.2f", checkpoint.debug.mclVarX, checkpoint.debug.mclVarY);
+        pros::screen::print(TEXT_MEDIUM, 7, "ThVar %.3f Stale%d", checkpoint.debug.mclVarTheta,
+                            checkpoint.debug.sensorsStale);
+        if (exportFeedback != nullptr) pros::screen::print(TEXT_MEDIUM, 8, "%s", exportFeedback);
+        else pros::screen::print(TEXT_MEDIUM, 8, logReady ? "LOG READY tap LR dump" : "Pg2 Up toggle X clr");
+    }
+}
+
+void screenTaskFn() {
+    std::uint32_t lastTapSequenceHandled = 0;
+
+    while (true) {
+        TuneCheckpoint checkpoint {};
+        int checkpointCount = 0;
+        int checkpointIndex = 0;
+        int page = 0;
+        const char* status = nullptr;
+        const char* step = nullptr;
+        bool running = false;
+        lemlib::Pose startPose {0, 0, 0};
+
+        tuneMutex.take();
+        checkpointCount = tuneCheckpointCount;
+        checkpointIndex = tuneSelectedCheckpoint;
+        page = tuneDisplayPage;
+        status = tuneStatus;
+        step = tuneStepName;
+        running = tuneTestRunning;
+        startPose = tuneStartPose;
+        if (checkpointCount > 0) {
+            if (checkpointIndex < 0) checkpointIndex = 0;
+            if (checkpointIndex >= checkpointCount) checkpointIndex = checkpointCount - 1;
+            checkpoint = tuneCheckpoints[checkpointIndex];
+        }
+        tuneMutex.give();
+
+        const bool logReady = hasTuneExportAvailable();
+        const bool autonomousActive = pros::competition::is_autonomous() != 0;
+        const bool disabledActive = pros::competition::is_disabled() != 0;
+        const char* modeLabel =
+            autonomousActive ? "AUTO" :
+            (driverControlLoopActive ? "DRIVER" :
+            (manualDriveFallbackActive ? "MANUAL" :
+            (disabledActive ? "DISABLED" : "IDLE")));
+        const int controllerConnected = pros::c::controller_is_connected(pros::E_CONTROLLER_MASTER);
+        const int leftY = pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_LEFT_Y);
+        const int rightX =
+            pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_RIGHT_X);
+        const bool exportTapCallback = tuneExportTapSequence != lastTapSequenceHandled;
+        lastTapSequenceHandled = tuneExportTapSequence;
+        if (exportTapCallback) {
+            if (logReady) {
+                if (exportTuneDataToTerminalNow()) {
+                    setTuneExportFeedback("Export queued...", kTuneExportFeedbackMs);
+                } else {
+                    setTuneExportFeedback("Export failed", kTuneExportFeedbackMs);
+                    setState("Idle", "Export failed", false);
+                }
+            } else {
+                setTuneExportFeedback("No tune data ready", kTuneExportFeedbackMs);
+                setState("Idle", "No tune data ready", false);
+            }
+        }
+
+        pros::screen::erase();
+        if (checkpointCount == 0) {
+            const lemlib::Pose pose = chassis.getPose();
+            const float startHeading = lemlib::radToDeg(startPose.theta);
+            const DistanceSnapshot distances = captureDistances();
+            pros::screen::print(TEXT_MEDIUM, 1, "Mode %s CTL %d", modeLabel, controllerConnected);
+            pros::screen::print(TEXT_MEDIUM, 2, "Tune %s", status);
+            pros::screen::print(TEXT_MEDIUM, 3, "%s", step);
+            pros::screen::print(TEXT_MEDIUM, 4, "LY %d RX %d DL %d MF %d", leftY, rightX,
+                                driverDriveLoopTicking ? 1 : 0, manualDriveFallbackActive ? 1 : 0);
+            pros::screen::print(TEXT_MEDIUM, 5, "Start %.1f %.1f %.0f", startPose.x, startPose.y, startHeading);
+            pros::screen::print(TEXT_MEDIUM, 6, "Pose %.1f %.1f %.1f", pose.x, pose.y, pose.theta);
+            pros::screen::print(TEXT_MEDIUM, 7, "F %.1f/%d R %.1f/%d", distances.front.distance,
+                                distances.front.confidence, distances.right.distance, distances.right.confidence);
+            const char* exportFeedback = currentTuneExportFeedback();
+            if (exportFeedback != nullptr) {
+                pros::screen::print(TEXT_MEDIUM, 8, "%s", exportFeedback);
+            } else {
+                pros::screen::print(TEXT_MEDIUM, 8, logReady ? "Tap lower-right to dump" : "B %.1f/%d L %.1f/%d",
+                                    distances.back.distance, distances.back.confidence, distances.left.distance,
+                                    distances.left.confidence);
+            }
+        } else {
+            printCheckpointPage(checkpoint, checkpointIndex, checkpointCount, status, page);
+        }
+
+        if (running) pros::screen::print(TEXT_MEDIUM, 8, "Autonomous run active");
+        pros::delay(50);
+    }
+}
+
+void overlayControlTaskFn() {
+    while (true) {
+        bool tuneRunning = false;
+        TuneRunMode runMode = TuneRunMode::Idle;
+
+        tuneMutex.take();
+        tuneRunning = tuneTestRunning;
+        runMode = tuneRunMode;
+        tuneMutex.give();
+
+        const bool autonomousActive = pros::competition::is_autonomous() != 0;
+        if (tuneRunning && runMode == TuneRunMode::AutonomousRelocalized && !autonomousActive) {
+            finalizeInterruptedRunIfNeeded("Interrupted", "Autonomous ended outside callback");
+            pros::delay(20);
+            continue;
+        }
+        pros::delay(20);
+    }
+}
+
+void manualDriveFallbackTaskFn() {
+    bool wasActive = false;
+
+    while (true) {
+        bool tuneRunning = false;
+        bool overlayActive = false;
+        tuneMutex.take();
+        tuneRunning = tuneTestRunning;
+        overlayActive = tuneOverlayActive;
+        tuneMutex.give();
+
+        const bool autonomousActive = pros::competition::is_autonomous() != 0;
+        const bool competitionConnected = pros::competition::is_connected() != 0;
+        const bool controllerConnected = pros::c::controller_is_connected(pros::E_CONTROLLER_MASTER) > 0;
+        const bool shouldDrive = !competitionConnected && !driverControlLoopActive && !autonomousActive &&
+                                 !tuneRunning && !overlayActive && controllerConnected;
+
+        manualDriveFallbackActive = shouldDrive;
+        if (shouldDrive) {
+            const int leftY =
+                pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_LEFT_Y);
+            const int rightX =
+                pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_RIGHT_X);
+            const int leftDrive = std::clamp(leftY + rightX, -127, 127);
+            const int rightDrive = std::clamp(leftY - rightX, -127, 127);
+            commandTeleopDriveOutputs(leftDrive, rightDrive);
+        } else if (wasActive) {
+            commandTeleopDriveOutputs(0, 0);
+        }
+
+        wasActive = shouldDrive;
+        pros::delay(10);
+    }
+}
+} // namespace
+
+void initializeRuntime() {
+    pros::screen::touch_callback(handleTuneExportTap, pros::E_TOUCH_RELEASED);
+    if (screenTask == nullptr) screenTask = new pros::Task([] { screenTaskFn(); });
+    if (overlayControlTask == nullptr) overlayControlTask = new pros::Task([] { overlayControlTaskFn(); });
+    if (terminalReplayTask == nullptr) terminalReplayTask = new pros::Task([] { terminalReplayTaskFn(); });
+    if (manualDriveFallbackTask == nullptr) manualDriveFallbackTask = new pros::Task([] { manualDriveFallbackTaskFn(); });
+    restoreInternalTuneLogIfPresent();
+}
+
+void setState(const char* status, const char* stepName, bool running) {
+    tuneMutex.take();
+    tuneStatus = status;
+    tuneStepName = stepName;
+    tuneTestRunning = running;
+    tuneMutex.give();
+}
+
+void clearExportFeedback() {
+    tuneMutex.take();
+    tuneExportFeedback = nullptr;
+    tuneExportFeedbackUntilMs = 0;
+    tuneMutex.give();
+}
+
+void storeRelocalizationSummary(const RelocalizationSummary& summary) {
+    tuneMutex.take();
+    relocalizationSummary = summary;
+    tuneMutex.give();
+}
+
+void setStartPose(const lemlib::Pose& pose) {
+    tuneMutex.take();
+    tuneStartPose = pose;
+    tuneMutex.give();
+}
+
+void setDriverControlLoopActive(bool active) { driverControlLoopActive = active; }
+
+void setDriverDriveLoopTicking(bool active) { driverDriveLoopTicking = active; }
+
+void prepareAutonomousRelocalizedRun(const lemlib::Pose& currentPose) {
+    clearTuneResults();
+    clearRelocalizationSummary();
+    clearPendingTuneTerminalLog();
+    clearExportFeedback();
+    lemlib::localization::clearTrace();
+
+    tuneMutex.take();
+    tuneRunMode = TuneRunMode::AutonomousRelocalized;
+    tuneStartPose = currentPose;
+    tuneMutex.give();
+}
+
+RelocalizationSummary performGlobalRelocalization() {
+    return autonomous_localization::performGlobalRelocalization();
+}
+
+void finalizeRun(const char* status, const char* stepName, const char* rumble) {
+    chassis.cancelMotion();
+    if (!beginTuneFinalization(status, stepName)) return;
+    lemlib::localization::setTraceEnabled(false);
+    emitTuneReport();
+    if (rumble != nullptr && rumble[0] != '\0') controller.rumble(rumble);
+}
+
+void finalizeInterruptedRunIfNeeded(const char* status, const char* stepName) {
+    if (!beginTuneFinalization(status, stepName)) return;
+
+    disableEightMotorPositionHold();
+    stopAutonomousManipulatorControl();
+    stopReleasedPtoControls();
+    chassis.cancelAllMotions();
+    chassis.tank(0, 0, true);
+    lemlib::localization::setTraceEnabled(false);
+    lemlib::bufferedStdout().print("Finalizing interrupted tune run: {}\n", stepName);
+    emitTuneReport();
+    controller.rumble(". .");
+}
+
+void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbort) {
+    const TuneTestCase selectedTestCase = tuneTestCaseFromNumber(testNumber);
+    const TuneTestDefinition test = tuneTestDefinition(selectedTestCase);
+    clearTuneResults();
+    clearPendingTuneTerminalLog();
+    clearRelocalizationSummary();
+    clearExportFeedback();
+
+    tuneMutex.take();
+    tuneRunMode = TuneRunMode::AutonomousRelocalized;
+    tuneStartPose = start;
+    tuneTestCase = selectedTestCase;
+    tuneMutex.give();
+
+    setState("Setup", "Apply start pose", true);
+    chassis.cancelMotion();
+    lemlib::localization::clearTrace();
+    lemlib::localization::setTraceEnabled(true);
+    chassis.setPose(start, true);
+    if (!lemlib::localization::isRunning()) lemlib::localization::start();
+    else lemlib::localization::syncPose(start);
+    pros::delay(kTuneInitialSettleMs);
+
+    if (!settleAndCapture("Start hold", start, allowAbort)) {
+        finalizeRun("Aborted", "Stopped during start hold", ". .");
+        return;
+    }
+
+    for (size_t i = 0; i < test.stepCount; ++i) {
+        const AutonomousRouteStep& step = test.steps[i];
+        const lemlib::Pose target = autonomousRouteTarget(start, step);
+        bool stepOk = false;
+        if (step.kind == TuneMotionKind::Turn) {
+            lemlib::TurnToHeadingParams params {};
+            params.maxSpeed = static_cast<int>(step.maxSpeed);
+            params.minSpeed = static_cast<int>(step.minSpeed);
+            params.earlyExitRange = step.earlyExitRange;
+            stepOk = runTurnStep(step.name, target, step.timeoutMs, params, allowAbort);
+        } else {
+            lemlib::MoveToPoseParams params {};
+            params.forwards = step.forwards;
+            params.lead = step.lead;
+            params.maxSpeed = step.maxSpeed;
+            params.minSpeed = step.minSpeed;
+            params.earlyExitRange = step.earlyExitRange;
+            stepOk = runMovePoseStep(step.name, target, step.timeoutMs, params, allowAbort);
+        }
+        if (!stepOk) {
+            finalizeRun("Aborted", step.name, ". .");
+            return;
+        }
+    }
+
+    finalizeRun("Complete", "Use left/right to review", "--");
+}
+
+void runAutonomousRoute(const lemlib::Pose& start, bool allowAbort) {
+    runAutonomousRoute(start, tuneTestCaseNumber(kDefaultTuneTestCase), allowAbort);
+}
+} // namespace localization_tune

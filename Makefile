@@ -11,6 +11,11 @@ FWDIR:=$(ROOT)/firmware
 BINDIR=$(ROOT)/bin
 SRCDIR=$(ROOT)/src
 INCDIR=$(ROOT)/include
+ARM_GNU_TOOLCHAIN_BIN:=$(HOME)/.local/arm-gnu-toolchain/bin
+
+ifneq (,$(wildcard $(ARM_GNU_TOOLCHAIN_BIN)/arm-none-eabi-g++))
+export PATH:=$(ARM_GNU_TOOLCHAIN_BIN):$(PATH)
+endif
 
 WARNFLAGS+=
 EXTRA_CFLAGS=
@@ -24,20 +29,19 @@ USE_PACKAGE:=1
 EXCLUDE_COLD_LIBRARIES:= 
 
 # Set this to 1 to add additional rules to compile your project as a PROS library template
-IS_LIBRARY:=0
-# TODO: CHANGE THIS! 
-# Be sure that your header files are in the include directory inside of a folder with the
-# same name as what you set LIBNAME to below.
-LIBNAME:=libbest
-VERSION:=1.0.0
+IS_LIBRARY:=1
+LIBNAME:=LemLib
+VERSION:=0.5.6
+
 # EXCLUDE_SRC_FROM_LIB= $(SRCDIR)/unpublishedfile.c
 # this line excludes opcontrol.c and similar files
 EXCLUDE_SRC_FROM_LIB+=$(foreach file, $(SRCDIR)/main,$(foreach cext,$(CEXTS),$(file).$(cext)) $(foreach cxxext,$(CXXEXTS),$(file).$(cxxext)))
 
 # files that get distributed to every user (beyond your source archive) - add
 # whatever files you want here. This line is configured to add all header files
-# that are in the directory include/LIBNAME
-TEMPLATE_FILES=$(INCDIR)/$(LIBNAME)/*.h $(INCDIR)/$(LIBNAME)/*.hpp
+# that are in the the include directory get exported
+
+TEMPLATE_FILES=$(INCDIR)/lemlib/*.hpp $(INCDIR)/lemlib/logger/*.hpp $(INCDIR)/lemlib/chassis/*.hpp $(INCDIR)/fmt/*.h $(INCDIR)/fmt/LICENSE $(FWDIR)/hot-cold-asset.mk $(ROOT)/static/example.txt $(INCDIR)/lemlib/LICENSE $(INCDIR)/lemlib/README.md $(INCDIR)/lemlib/VERSION
 
 .DEFAULT_GOAL=quick
 
@@ -45,31 +49,3 @@ TEMPLATE_FILES=$(INCDIR)/$(LIBNAME)/*.h $(INCDIR)/$(LIBNAME)/*.hpp
 ################################################################################
 ########## Nothing below this line should be edited by typical users ###########
 -include ./common.mk
-
-CFLAGS   += -Iinclude/lemlib
-CXXFLAGS += -Iinclude/lemlib
-
-CPPFLAGS += -Iinclude/lemlib
-CFLAGS   += -Iinclude/lemlib
-CXXFLAGS += -Iinclude/lemlib
-
-INCLUDEPATHS += include/lemlib
-
-INCLUDEPATHS += include/lemlib
-
-INCLUDEPATHS += include/lemlib
-CPPFLAGS += -Iinclude/lemlib
-CFLAGS   += -Iinclude/lemlib
-CXXFLAGS += -Iinclude/lemlib
-
-CXXFLAGS += -Iinclude/lemlib -iquote include/lemlib
-CFLAGS   += -Iinclude/lemlib -iquote include/lemlib
-CPPFLAGS += -Iinclude/lemlib -iquote include/lemlib
-
-CXXFLAGS += -Iinclude/lemlib -iquote include/lemlib
-CFLAGS   += -Iinclude/lemlib -iquote include/lemlib
-CPPFLAGS += -Iinclude/lemlib -iquote include/lemlib
-
-CXXFLAGS += -Iinclude/lemlib -iquote include/lemlib
-CFLAGS   += -Iinclude/lemlib -iquote include/lemlib
-CPPFLAGS += -Iinclude/lemlib -iquote include/lemlib

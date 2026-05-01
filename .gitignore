@@ -1,43 +1,33 @@
-.vscode/
-
-# Prerequisites
-*.d
-
 # Compiled Object files
-*.slo
-*.lo
 *.o
 *.obj
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
 # Executables
-*.exe
-*.out
-*.app
+*.bin
+*.elf
 
-# debug information files
-*.dwo
+# PROS
+bin/
+.vscode/
+.cache/
+compile_commands.json
+temp.log
+temp.errors
+*.ini
+.d/
+
+# template files
+*.zip
+
+# Docs
+docs/package-lock.json
+docs/package.json
+docs/node_modules/
+latex
+
+# MacOS
+.DS_Store
+docs/_build
+docs/html
+docs/xml
+html

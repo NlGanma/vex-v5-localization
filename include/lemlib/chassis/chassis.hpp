@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pros/adi.hpp"
 #include "pros/rtos.hpp"
 #include "pros/imu.hpp"
 #include "lemlib/asset.hpp"
@@ -8,6 +9,7 @@
 #include "lemlib/pid.hpp"
 #include "lemlib/exitcondition.hpp"
 #include "lemlib/driveCurve.hpp"
+#include <atomic>
 
 namespace lemlib {
 
@@ -323,6 +325,49 @@ struct MoveToPointParams {
         float earlyExitRange = 0;
 };
 
+/**
+ * @brief Logical PTO role for a released PTO motor group
+ */
+enum class PtoRole {
+    DISABLED, /** motor group is not assigned to an auxiliary role */
+    MotorRole1, /** motor group is assigned to auxiliary role 1 */
+    MotorRole2, /** motor group is assigned to auxiliary role 2 */
+    MotorRole3, /** motor group is assigned to auxiliary role 3 */
+    MotorRole4 /** motor group is assigned to auxiliary role 4 */
+};
+
+/**
+ * @brief A PTO output slot. This can be a single motor or a grouped MotorGroup
+ */
+struct PtoMotorGroup {
+        /** motor or motor group controlled by this PTO slot */
+        pros::MotorGroup* motors = nullptr;
+        /** side of the drivetrain this slot should mirror when PTO is engaged */
+        DriveSide driveSide = DriveSide::LEFT;
+};
+
+/**
+ * @brief Pointers required to configure a PTO on the chassis
+ */
+struct PtoSettings {
+        /** piston that mechanically switches the PTO. nullptr disables piston control */
+        pros::adi::DigitalOut* piston = nullptr;
+        /** up to 4 PTO slots. Each slot can hold one motor or a grouped MotorGroup */
+        PtoMotorGroup motorGroups[4] = {};
+        /** digital output value that corresponds to the PTO being engaged/retracted */
+        bool engagedValue = true;
+};
+
+/**
+ * @brief Parameters for Chassis::disengagePto
+ */
+struct PtoReleaseParams {
+        /** role assignment for each PTO slot once the drivetrain is reduced back to the base drive */
+        PtoRole motorRoles[4] = {PtoRole::DISABLED, PtoRole::DISABLED, PtoRole::DISABLED, PtoRole::DISABLED};
+        /** whether the released PTO motors should be stopped immediately */
+        bool stopMotors = true;
+};
+
 // default drive curve
 extern ExpoDriveCurve defaultDriveCurve;
 
@@ -368,6 +413,15 @@ class Chassis {
          * @endcode
          */
         void calibrate(bool calibrateIMU = true);
+        /**
+         * @brief Update the chassis controller settings at runtime
+         *
+         * @param lateralSettings settings for the lateral controller
+         * @param angularSettings settings for the angular controller
+         *
+         * @note Changes are immediate and will affect a motion in progress
+         */
+        void setControllerSettings(ControllerSettings lateralSettings, ControllerSettings angularSettings);
         /**
          * @brief Set the pose of the chassis
          *
@@ -466,6 +520,55 @@ class Chassis {
          * @endcode
          */
         void waitUntilDone();
+        /**
+         * @brief Configure an optional PTO that can be merged into the drivetrain
+         *
+         * @param settings PTO piston and motor groups
+         */
+        void configurePto(PtoSettings settings);
+        /**
+         * @brief Retract the PTO piston and merge the PTO motors into the drivetrain
+         *
+         * @param async whether to launch the change in a background task. true by default
+         */
+        void engagePto(bool async = true);
+        /**
+         * @brief Extend the PTO piston and release the PTO motors back to auxiliary roles
+         *
+         * @param params role assignments for the released PTO motor groups
+         * @param async whether to launch the change in a background task. true by default
+         */
+        void disengagePto(PtoReleaseParams params = {}, bool async = true);
+        /**
+         * @brief Move every released PTO motor group assigned to the selected role
+         *
+         * @param role role to command
+         * @param power power from -127 to 127
+         */
+        void movePtoRole(PtoRole role, int power);
+        /**
+         * @brief Move one released PTO slot directly
+         *
+         * @param index PTO slot index, 0-3
+         * @param power power from -127 to 127
+         */
+        void movePtoGroup(int index, int power);
+        /**
+         * @return whether the PTO is currently engaged into the drivetrain
+         */
+        bool isPtoEngaged() const;
+        /**
+         * @return currently assigned role for the selected PTO slot
+         */
+        PtoRole getPtoRole(int index) const;
+        /**
+         * @return currently assigned role for the first configured left PTO slot
+         */
+        PtoRole getLeftPtoRole() const;
+        /**
+         * @return currently assigned role for the first configured right PTO slot
+         */
+        PtoRole getRightPtoRole() const;
         /**
          * @brief Sets the brake mode of the drivetrain motors
          *
@@ -680,6 +783,16 @@ class Chassis {
          * @endcode
          */
         void moveToPoint(float x, float y, int timeout, MoveToPointParams params = {}, bool async = true);
+        /**
+         * @brief Drive both sides of the drivetrain at the same power for an optional amount of time.
+         *
+         * @note A timeout of 0 or less applies the power immediately and returns without entering the motion queue.
+         *
+         * @param power drivetrain power from -127 to 127
+         * @param timeout duration in milliseconds. 0 or less latches the command until another drive write
+         * @param async whether the timed pulse should run asynchronously
+         */
+        void drivePulse(float power, int timeout, bool async = false);
         /**
          * @brief Move the chassis along a path
          *
@@ -909,6 +1022,14 @@ class Chassis {
          * @warning Do not interact with these unless you know what you are doing
          */
         PID angularPID;
+        /**
+         * @return the last commanded left drivetrain output
+         */
+        float getLastCommandedLeftOutput() const;
+        /**
+         * @return the last commanded right drivetrain output
+         */
+        float getLastCommandedRightOutput() const;
     protected:
         /**
          * @brief Indicates that this motion is queued and blocks current task until this motion reaches front of queue
@@ -918,11 +1039,35 @@ class Chassis {
          * @brief Dequeues this motion and permits queued task to run
          */
         void endMotion();
+        /**
+         * @brief Move the drivetrain. If the PTO is engaged, the PTO motors mirror the drive output.
+         */
+        void moveDrive(float left, float right);
+        /**
+         * @brief Move one side of the drivetrain and the corresponding engaged PTO motors.
+         */
+        void moveDriveSide(DriveSide side, float power);
+        /**
+         * @brief Brake one side of the drivetrain and the corresponding engaged PTO motors.
+         */
+        void brakeDriveSide(DriveSide side);
+        /**
+         * @brief Stop the drivetrain and any engaged PTO drive motors.
+         */
+        void stopDrive();
+        /**
+         * @brief Get the brake mode of one drive side.
+         */
+        pros::motor_brake_mode_e getDriveSideBrakeMode(DriveSide side) const;
+        /**
+         * @brief Set the brake mode of one drive side and any matching engaged PTO motors.
+         */
+        void setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mode_e mode);
 
         bool motionRunning = false;
         bool motionQueued = false;
 
-        float distTraveled = 0;
+        float distTraveled = -1;
 
         ControllerSettings lateralSettings;
         ControllerSettings angularSettings;
@@ -936,6 +1081,11 @@ class Chassis {
         ExitCondition angularLargeExit;
         ExitCondition angularSmallExit;
     private:
+        PtoSettings pto {};
+        bool ptoEngaged = false;
+        PtoRole ptoRoles[4] = {PtoRole::DISABLED, PtoRole::DISABLED, PtoRole::DISABLED, PtoRole::DISABLED};
+        std::atomic<float> lastCommandedLeftOutput = 0.0f;
+        std::atomic<float> lastCommandedRightOutput = 0.0f;
         pros::Mutex mutex;
 };
 } // namespace lemlib

@@ -17,6 +17,10 @@ class ExitCondition {
          */
         ExitCondition(const float range, const int time);
         /**
+         * @brief Update the exit-condition bounds at runtime and reset its timer state
+         */
+        void configure(float range, int time);
+        /**
          * @brief whether the exit condition has been met
          *
          * @return true exit condition met
@@ -60,8 +64,8 @@ class ExitCondition {
          */
         void reset();
     protected:
-        const float range;
-        const int time;
+        float range;
+        int time;
         int startTime = -1;
         bool done = false;
 };

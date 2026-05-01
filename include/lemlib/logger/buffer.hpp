@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <string>
@@ -10,7 +11,7 @@ namespace lemlib {
 /**
  * @brief A buffer implementation
  *
- * Asynchronously processes a backlog of strings at a given rate. The strings are processed in a first in last out
+ * Asynchronously processes a backlog of strings at a given rate. The strings are processed in a first in first out
  * order.
  */
 class Buffer {
@@ -66,7 +67,9 @@ class Buffer {
 
         pros::Mutex mutex;
         pros::Task task;
+        std::atomic<bool> running {true};
+        std::atomic<bool> taskStopped {false};
 
-        uint32_t rate;
+        uint32_t rate = 10;
 };
 } // namespace lemlib

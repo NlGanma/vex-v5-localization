@@ -168,6 +168,18 @@ class TrackingWheel {
          */
         float getOffset();
         /**
+         * @brief Get the tracking wheel diameter in inches
+         *
+         * @return float wheel diameter
+         */
+        float getWheelDiameter();
+        /**
+         * @brief Get the tracking wheel gear ratio
+         *
+         * @return float gear ratio
+         */
+        float getGearRatio();
+        /**
          * @brief Get the type of tracking wheel
          *
          * @return int - 1 if motor group, 0 otherwise

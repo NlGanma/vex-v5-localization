@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <string>
+#include "pros/llemu.h"
 
 /******************************************************************************/
 /**                        LLEMU Conditional Include                         **/
