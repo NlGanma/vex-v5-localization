@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <vector>
 
 #include "lemlib/chassis/odom.hpp"
@@ -40,14 +41,29 @@ struct DebugInfo {
         bool mclValid = false;
         bool sensorsStale = false;
         bool correctionAccepted = false;
+        uint32_t correctionRejectMask = 0;
+        float measurementPoseDelta = 0.0f;
+        float measurementHeadingDelta = 0.0f;
+        int correctionInlierSensors = 0;
+        float correctionMeanResidual = 0.0f;
+        float correctionMaxResidual = 0.0f;
+        int candidateStableScans = 0;
+        int requiredStableScans = 0;
 };
 
 struct TraceSensorInfo {
         float distance = -1.0f;
+        float objectVelocity = 0.0f;
+        float expectedDistance = -1.0f;
+        float residual = 0.0f;
         int confidence = -1;
+        int objectSize = -1;
+        std::uint16_t readingAgeMs = 0;
+        std::uint16_t readingSeq = 0;
         bool inRange = false;
         bool confidenceAccepted = false;
         bool used = false;
+        bool readingChanged = false;
 };
 
 struct TraceSample {
@@ -56,6 +72,7 @@ struct TraceSample {
         lemlib::OdomDelta odomDelta {};
         lemlib::OdomTelemetry odomTelemetry {};
         lemlib::Pose odomPose {0, 0, 0};
+        lemlib::Pose odomOnlyPose {0, 0, 0};
         lemlib::Pose ekfPose {0, 0, 0};
         lemlib::Pose appliedPose {0, 0, 0};
         lemlib::Pose mclPose {0, 0, 0};
@@ -75,6 +92,14 @@ struct TraceSample {
         bool mclValid = false;
         bool sensorsStale = false;
         bool correctionAccepted = false;
+        uint32_t correctionRejectMask = 0;
+        float measurementPoseDelta = 0.0f;
+        float measurementHeadingDelta = 0.0f;
+        int correctionInlierSensors = 0;
+        float correctionMeanResidual = 0.0f;
+        float correctionMaxResidual = 0.0f;
+        int candidateStableScans = 0;
+        int requiredStableScans = 0;
         std::array<TraceSensorInfo, 4> sensors {};
 };
 
@@ -90,6 +115,8 @@ void configure(const LocalizationConfig& config);
 void start();
 void stop();
 bool isRunning();
+void setMotionCorrectionSuppressed(bool suppressed);
+bool isMotionCorrectionSuppressed();
 void syncPose(lemlib::Pose pose);
 void syncPose(lemlib::Pose pose, uint32_t seq);
 

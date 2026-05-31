@@ -195,6 +195,19 @@ void lemlib::setPose(lemlib::Pose pose, bool radians) { setPoseImpl(pose, radian
 
 void lemlib::detail::setPoseSilent(lemlib::Pose pose, bool radians) { setPoseImpl(pose, radians, false, false); }
 
+bool lemlib::detail::setPoseSilentIfSeq(lemlib::Pose pose, uint32_t expectedSeq, bool radians) {
+    const lemlib::Pose poseRad = radians ? pose : lemlib::Pose(pose.x, pose.y, lemlib::degToRad(pose.theta));
+    // Same lock order as lemlib::update() (odomUpdateMutex -> odomStateMutex) so
+    // no odom integration can interleave between the seq check and the write.
+    odomUpdateMutex.take();
+    odomStateMutex.take();
+    const bool seqMatches = (odomPoseSeq == expectedSeq);
+    if (seqMatches) odomPose = poseRad;
+    odomStateMutex.give();
+    odomUpdateMutex.give();
+    return seqMatches;
+}
+
 lemlib::Pose lemlib::getSpeed(bool radians) {
     odomStateMutex.take();
     const Pose speed = odomSpeed;

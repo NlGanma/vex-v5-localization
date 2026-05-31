@@ -10,12 +10,7 @@ In this tutorial, we will be be using Pure Pursuit. Pure Pursuit is a path follo
 
 ## What is Pure Pursuit?
 
-Pure Pursuit is a path following algorithm that allows the robot to follow a path quickly. It works by drawing an imaginary circle around the robot, and then finding the intersection of the circle and the path. The robot will then drive towards the intersection. This is shown in the GIF below:
-
-```{image} ../assets/7_pure_pursuit/pursuit.gif
-:height: 400
-:align: center
-```
+Pure Pursuit is a path following algorithm that allows the robot to follow a path quickly. It works by drawing an imaginary circle around the robot, and then finding the intersection of the circle and the path. The robot will then drive towards the intersection.
 
 Tuning Pure Pursuit is very simple. If you want the robot to follow the path more closely, decrease the lookahead distance. If you want the robot to follow the path more loosely, but faster, then increase the lookahead distance. A good starting point is 10-15 inches, but this will vary depending on each motion.
 
@@ -29,12 +24,7 @@ Using the Path Generator is simple:
  - Left click to add a waypoint.
  - Right click to remove a waypoint.
 
-Another feature of the path.jerryio is the ability to make the robot go faster or slower at certain points. The planner will automatically slow down the robot around sharp corners and decelerate as it approaches the end of the path. You can view the velocity of the path at each waypoint on the speed graph at the bottom of the page. See the video below:
-
-```{image} ../assets/7_pure_pursuit/custom_speed.gif
-:height: 400
-:align: center
-```
+Another feature of the path.jerryio is the ability to make the robot go faster or slower at certain points. The planner will automatically slow down the robot around sharp corners and decelerate as it approaches the end of the path. You can view the velocity of the path at each waypoint on the speed graph at the bottom of the page.
 
 For further information on the path.jerryio, check out its [user guide](https://github.com/Jerrylum/path.jerryio/wiki).
 

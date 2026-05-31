@@ -25,12 +25,11 @@ constexpr std::uint32_t kTuneSettleMs = 5;
 constexpr std::uint32_t kTuneInitialSettleMs = 15;
 constexpr std::uint32_t kTuneMotionPollMs = 5;
 constexpr std::uint32_t kTuneMotionCancelSettleMs = 5;
-constexpr int kTuneMotionStableCycles = 1;
-constexpr float kTuneMoveCompletionDistIn = 3.0f;
-constexpr float kTuneMoveCompletionHeadingDeg = 8.0f;
-constexpr float kTuneTurnCompletionHeadingDeg = 3.0f;
 constexpr std::uint32_t kTunePostMoveCorrectionWindowMs = 120;
 constexpr float kTunePostMoveGoodNis = 2.0f;
+constexpr std::uint32_t kTuneRejectMotionSuppressedMask = 1u << 9;
+constexpr int kTunePostMoveMinInlierSensors = 2;
+constexpr float kTunePostMoveMaxResidual = 4.0f;
 constexpr int kTuneCheckpointCapacity = 16;
 constexpr const char* kTuneLogPath = "/usd/localization_tune_latest.txt";
 constexpr const char* kTuneInternalLogPath = "localization_tune_latest_internal.txt";
@@ -52,6 +51,7 @@ constexpr int kTuneExportTapMinX = 200;
 constexpr int kTuneExportTapMinY = 120;
 constexpr std::uint32_t kTuneExportFeedbackMs = 2000;
 constexpr std::uintptr_t kStdoutStreamId = 0x74756f73u; // little-endian "sout"
+constexpr std::array<const char*, 4> kTraceSensorNames {{"front", "right", "back", "left"}};
 
 struct TuneCheckpoint {
     const char* name = "Not recorded";
@@ -63,7 +63,7 @@ struct TuneCheckpoint {
     bool recorded = false;
 };
 
-enum class TuneMotionKind { Move, Turn };
+enum class TuneMotionKind { Move, Turn, Drive };
 
 struct AutonomousRouteStep {
     TuneMotionKind kind = TuneMotionKind::Move;
@@ -80,7 +80,7 @@ struct AutonomousRouteStep {
 };
 
 enum class TuneRunMode { Idle, AutonomousRelocalized };
-enum class TuneTestCase { TurnCenter = 1, StraightScale = 2, SquareCross = 3 };
+enum class TuneTestCase { TurnCenter = 1, StraightScale = 2, SquareCross = 3, DriveProbe = 4, SensorAngle = 5 };
 enum class TuneLogOutputMode { Lean, DeepDive };
 enum class WallAxisDirection { PosX, NegX, PosY, NegY, Unknown };
 
@@ -103,28 +103,49 @@ constexpr std::array<AutonomousRouteStep, 7> kTurnCenterRoute {{
     {TuneMotionKind::Turn, "Turn -45", 0.0f, 0.0f, -45.0f, 1400, true, 0.0f, 85.0f, 0.0f, 0.0f},
     {TuneMotionKind::Turn, "Return 0", 0.0f, 0.0f, 0.0f, 1200, true, 0.0f, 85.0f, 0.0f, 0.0f},
 }};
+constexpr std::array<AutonomousRouteStep, 8> kSensorAngleRoute {{
+    {TuneMotionKind::Turn, "Angle 45", 0.0f, 0.0f, 45.0f, 950, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle 90", 0.0f, 0.0f, 90.0f, 950, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle 135", 0.0f, 0.0f, 135.0f, 1000, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle 180", 0.0f, 0.0f, 180.0f, 1050, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle -135", 0.0f, 0.0f, -135.0f, 1000, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle -90", 0.0f, 0.0f, -90.0f, 950, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle -45", 0.0f, 0.0f, -45.0f, 950, true, 0.0f, 85.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Angle 0", 0.0f, 0.0f, 0.0f, 950, true, 0.0f, 85.0f, 0.0f, 0.0f},
+}};
 constexpr std::array<AutonomousRouteStep, 4> kStraightScaleRoute {{
     {TuneMotionKind::Move, "Forward 24", 0.0f, 24.0f, 0.0f, 2200, true, 0.35f, 85.0f, 0.0f, 0.0f},
     {TuneMotionKind::Move, "Forward 48", 0.0f, 48.0f, 0.0f, 2800, true, 0.35f, 95.0f, 0.0f, 0.0f},
     {TuneMotionKind::Move, "Reverse 24", 0.0f, 24.0f, 0.0f, 2600, false, 0.35f, 80.0f, 0.0f, 0.0f},
     {TuneMotionKind::Move, "Reverse 0", 0.0f, 0.0f, 0.0f, 2600, false, 0.35f, 80.0f, 0.0f, 0.0f},
 }};
-constexpr std::array<AutonomousRouteStep, 15> kSquareCrossRoute {{
-    {TuneMotionKind::Move, "Square north", 0.0f, 24.0f, 0.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+// Trimmed from the full square+cross (15 steps, ~30s budget) to a single 24"
+// square loop that returns home, so it fits the ~15s autonomous window. Keeps
+// turns + translation + a clean return-home position-drift check (the "beat
+// odom" metric); the diagonal-cross segments were removed and can be restored
+// if a longer window is available. Move timeouts/speed tightened (2000ms @ 95)
+// so each leg completes well inside its cap. 90 deg turns need ~1200ms to
+// settle (1000ms undershot ~5 deg). Budget: 4*2000 + 3*1200 = 11.6s + ~3s startup.
+constexpr std::array<AutonomousRouteStep, 7> kSquareCrossRoute {{
+    {TuneMotionKind::Move, "Square north", 0.0f, 24.0f, 0.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
     {TuneMotionKind::Turn, "Face east", 0.0f, 24.0f, 90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Square east", 24.0f, 24.0f, 90.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square east", 24.0f, 24.0f, 90.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
     {TuneMotionKind::Turn, "Face south", 24.0f, 24.0f, 180.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Square south", 24.0f, 0.0f, 180.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square south", 24.0f, 0.0f, 180.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
     {TuneMotionKind::Turn, "Face west", 24.0f, 0.0f, -90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Square west", 0.0f, 0.0f, -90.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Turn, "Face diag NE", 0.0f, 0.0f, 45.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Cross NE", 24.0f, 24.0f, 45.0f, 3000, true, 0.50f, 86.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Turn, "Face south", 24.0f, 24.0f, 180.0f, 1400, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Cross south", 24.0f, 0.0f, 180.0f, 2400, true, 0.42f, 82.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Turn, "Face diag NW", 24.0f, 0.0f, -45.0f, 1400, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Cross NW", 0.0f, 24.0f, -45.0f, 3000, true, 0.50f, 86.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Turn, "Face home", 0.0f, 24.0f, 180.0f, 1400, true, 0.0f, 80.0f, 0.0f, 0.0f},
-    {TuneMotionKind::Move, "Return home", 0.0f, 0.0f, 180.0f, 2600, true, 0.42f, 82.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Return home", 0.0f, 0.0f, -90.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
+}};
+// Open-loop straight-drive probe (no PID). For Drive steps: maxSpeed = raw tank
+// power, timeoutMs = drive duration, forwards = direction. Equal power is sent to
+// both sides with the drive curve disabled, so the heading trace reveals drive
+// balance: flat heading at equal power => drivetrain balanced (moveToPose's
+// controller is at fault); a veer whose sign flips between forward/reverse =>
+// drivetrain imbalance. Runs out-and-back at two power levels to stay near start.
+constexpr std::array<AutonomousRouteStep, 4> kDriveProbeRoute {{
+    {TuneMotionKind::Drive, "Open fwd 60", 0.0f, 18.0f, 0.0f, 1000, true, 0.0f, 60.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Drive, "Open rev 60", 0.0f, 0.0f, 0.0f, 1000, false, 0.0f, 60.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Drive, "Open fwd 90", 0.0f, 27.0f, 0.0f, 1000, true, 0.0f, 90.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Drive, "Open rev 90", 0.0f, 0.0f, 0.0f, 1000, false, 0.0f, 90.0f, 0.0f, 0.0f},
 }};
 
 struct DirectWallSolveCandidate {
@@ -256,6 +277,11 @@ SensorSnapshot combineSensorSnapshots(const std::array<SensorSnapshot, N>& sampl
     std::array<float, N> distances {};
     size_t distanceCount = 0;
 
+    // Distance is the median of valid samples (robust to a single bad reading);
+    // confidence is the best observed across samples. The two are aggregated
+    // independently, so the reported confidence is optimistic relative to the
+    // median sample -- bounded downstream by the relocalize accept threshold and
+    // residual gates, so it cannot manufacture a false accept.
     for (const auto& sample : samples) {
         if (sample.distance > 0.0f) distances[distanceCount++] = sample.distance;
         if (sample.confidence > combined.confidence) combined.confidence = sample.confidence;
@@ -335,10 +361,6 @@ float wrapRadians(float radians) {
     return radians;
 }
 
-float internalRadiansToMoveHeadingDeg(float thetaRadians) {
-    return lemlib::radToDeg(kPiOver2 - thetaRadians);
-}
-
 lemlib::Pose offsetPose(const lemlib::Pose& start, float localRight, float localForward, float deltaTheta) {
     const float sinTheta = std::sin(start.theta);
     const float cosTheta = std::cos(start.theta);
@@ -378,6 +400,8 @@ TuneTestCase tuneTestCaseFromNumber(int testNumber) {
     switch (testNumber) {
         case 2: return TuneTestCase::StraightScale;
         case 3: return TuneTestCase::SquareCross;
+        case 4: return TuneTestCase::DriveProbe;
+        case 5: return TuneTestCase::SensorAngle;
         case 1:
         default: return TuneTestCase::TurnCenter;
     }
@@ -387,8 +411,19 @@ int tuneTestCaseNumber(TuneTestCase testCase) {
     switch (testCase) {
         case TuneTestCase::StraightScale: return 2;
         case TuneTestCase::SquareCross: return 3;
+        case TuneTestCase::DriveProbe: return 4;
+        case TuneTestCase::SensorAngle: return 5;
         case TuneTestCase::TurnCenter:
         default: return 1;
+    }
+}
+
+const char* tuneMotionKindName(TuneMotionKind kind) {
+    switch (kind) {
+        case TuneMotionKind::Turn: return "turn";
+        case TuneMotionKind::Drive: return "drive";
+        case TuneMotionKind::Move:
+        default: return "move";
     }
 }
 
@@ -398,8 +433,14 @@ TuneTestDefinition tuneTestDefinition(TuneTestCase testCase) {
             return {testCase, "Straight scale", "Forward/reverse distance scale and lateral drift",
                     kStraightScaleRoute.data(), kStraightScaleRoute.size()};
         case TuneTestCase::SquareCross:
-            return {testCase, "Square cross", "Combined lateral PID, angular PID, tracking, and sensor fusion",
+            return {testCase, "Square loop", "Square loop returning home: turns + translation + return-home drift vs odom",
                     kSquareCrossRoute.data(), kSquareCrossRoute.size()};
+        case TuneTestCase::DriveProbe:
+            return {testCase, "Drive probe", "Open-loop straight drive: drivetrain balance vs moveToPose",
+                    kDriveProbeRoute.data(), kDriveProbeRoute.size()};
+        case TuneTestCase::SensorAngle:
+            return {testCase, "Sensor angle", "Stationary heading sweep for distance-sensor mounting angle fit",
+                    kSensorAngleRoute.data(), kSensorAngleRoute.size()};
         case TuneTestCase::TurnCenter:
         default:
             return {TuneTestCase::TurnCenter, "Turn center", "Angular PID and rotational center drift",
@@ -499,8 +540,9 @@ std::string buildTuneReport(TuneLogOutputMode outputMode = kTuneLogOutputMode) {
                  lemlib::radToDeg(relocalize.pose.theta));
     appendFormat(report, "relocalize_heading mode=%s imu=%.1f hypotheses=%d\n", relocalize.headingMode,
                  lemlib::radToDeg(relocalize.imuHeading), relocalize.headingHypotheses);
-    appendFormat(report, "relocalize_conf=%.3f active=%d iter=%d\n", relocalize.confidence,
-                 relocalize.activeSensors, relocalize.iterations);
+    appendFormat(report, "relocalize_conf=%.3f active=%d scored=%d iter=%d\n", relocalize.confidence,
+                 relocalize.activeSensors, relocalize.scoredSensors, relocalize.iterations);
+    appendFormat(report, "relocalize_residual=%.3f %.3f\n", relocalize.meanResidual, relocalize.maxResidual);
     appendFormat(report, "relocalize_var=%.3f %.3f %.5f\n", relocalize.varX, relocalize.varY,
                  relocalize.varTheta);
     appendFormat(report, "relocalize_sensors F %.1f/%d R %.1f/%d\n", relocalize.distances.front.distance,
@@ -515,8 +557,8 @@ std::string buildTuneReport(TuneLogOutputMode outputMode = kTuneLogOutputMode) {
         const lemlib::Pose target = autonomousRouteTarget(startPose, step);
         appendFormat(report,
                      "route_step%lu=%s type=%s local=%.1f %.1f heading_offset=%.1f abs=%.1f %.1f %.1f timeout=%d max=%.0f\n",
-                     static_cast<unsigned long>(i + 1), step.name,
-                     step.kind == TuneMotionKind::Turn ? "turn" : "move", step.localRight, step.localForward,
+                     static_cast<unsigned long>(i + 1), step.name, tuneMotionKindName(step.kind), step.localRight,
+                     step.localForward,
                      step.headingOffsetDeg, target.x, target.y, lemlib::radToDeg(target.theta), step.timeoutMs,
                      step.maxSpeed);
     }
@@ -549,6 +591,12 @@ std::string buildTuneReport(TuneLogOutputMode outputMode = kTuneLogOutputMode) {
                      checkpoint.distances.left.confidence);
         appendFormat(report, "A%d C%.2f OK%d\n", checkpoint.debug.activeSensors, checkpoint.debug.mclConfidence,
                      checkpoint.debug.correctionAccepted);
+        appendFormat(report, "Gate mask=%lu dxy=%.2f dth=%.2f stable=%d/%d inl=%d res=%.2f/%.2f\n",
+                     static_cast<unsigned long>(checkpoint.debug.correctionRejectMask),
+                     checkpoint.debug.measurementPoseDelta, checkpoint.debug.measurementHeadingDelta,
+                     checkpoint.debug.candidateStableScans, checkpoint.debug.requiredStableScans,
+                     checkpoint.debug.correctionInlierSensors, checkpoint.debug.correctionMeanResidual,
+                     checkpoint.debug.correctionMaxResidual);
         appendFormat(report, "Fus %.1f %.1f %.1f\n", checkpoint.debug.fusedPose.x, checkpoint.debug.fusedPose.y,
                      fusedTheta);
         appendFormat(report, "MCL %.1f %.1f %.1f\n", checkpoint.debug.mclPose.x, checkpoint.debug.mclPose.y,
@@ -581,6 +629,8 @@ std::string buildTuneTraceCsv() {
                  relocalize.success, relocalize.status, relocalize.pose.x, relocalize.pose.y,
                  lemlib::radToDeg(relocalize.pose.theta), relocalize.confidence, relocalize.varX, relocalize.varY,
                  relocalize.activeSensors, relocalize.iterations);
+    appendFormat(csv, "# relocalize_residual,%.6f,%.6f,%d\n", relocalize.meanResidual, relocalize.maxResidual,
+                 relocalize.scoredSensors);
     appendFormat(csv, "# relocalize_heading,%s,%.4f,%d\n", relocalize.headingMode,
                  lemlib::radToDeg(relocalize.imuHeading), relocalize.headingHypotheses);
     appendFormat(csv, "# ekf_period_ms=%lu,mcl_period_ms=%lu,nis_gate=%.3f,min_correction_sensors=%d,min_confidence=%.3f,blend=%.3f\n",
@@ -612,15 +662,23 @@ std::string buildTuneTraceCsv() {
     }
     appendFormat(
         csv,
-        "time_ms,odom_seq,odom_x,odom_y,odom_theta_deg,odom_local_x,odom_local_y,odom_delta_theta_deg,odom_tel_seq,odom_tel_dt,odom_heading_before_deg,odom_heading_after_deg,odom_delta_heading_deg,odom_heading_horizontal_pair,odom_heading_vertical_pair,odom_heading_imu,odom_heading_fallback,odom_vertical1_raw,odom_vertical2_raw,odom_horizontal1_raw,odom_horizontal2_raw,odom_imu_raw_deg,odom_delta_vertical1,odom_delta_vertical2,odom_delta_horizontal1,odom_delta_horizontal2,odom_delta_imu_deg,odom_selected_vertical_raw,odom_selected_horizontal_raw,odom_selected_delta_vertical,odom_selected_delta_horizontal,odom_selected_vertical_offset,odom_selected_horizontal_offset,ekf_x,ekf_y,ekf_theta_deg,applied_x,applied_y,applied_theta_deg,target_corr_x,target_corr_y,target_corr_theta_deg,applied_corr_x,applied_corr_y,applied_corr_theta_deg,mcl_x,mcl_y,mcl_theta_deg,mcl_conf,mcl_ess,last_nis,mcl_var_x,mcl_var_y,mcl_var_theta,active_sensors,mcl_valid,sensors_stale,correction_accepted,front_dist,front_conf,front_in_range,front_conf_ok,front_used,right_dist,right_conf,right_in_range,right_conf_ok,right_used,back_dist,back_conf,back_in_range,back_conf_ok,back_used,left_dist,left_conf,left_in_range,left_conf_ok,left_used\n");
+        "time_ms,odom_seq,odom_x,odom_y,odom_theta_deg,odom_only_x,odom_only_y,odom_only_theta_deg,odom_local_x,odom_local_y,odom_delta_theta_deg,odom_tel_seq,odom_tel_dt,odom_heading_before_deg,odom_heading_after_deg,odom_delta_heading_deg,odom_heading_horizontal_pair,odom_heading_vertical_pair,odom_heading_imu,odom_heading_fallback,odom_vertical1_raw,odom_vertical2_raw,odom_horizontal1_raw,odom_horizontal2_raw,odom_imu_raw_deg,odom_delta_vertical1,odom_delta_vertical2,odom_delta_horizontal1,odom_delta_horizontal2,odom_delta_imu_deg,odom_selected_vertical_raw,odom_selected_horizontal_raw,odom_selected_delta_vertical,odom_selected_delta_horizontal,odom_selected_vertical_offset,odom_selected_horizontal_offset,ekf_x,ekf_y,ekf_theta_deg,applied_x,applied_y,applied_theta_deg,target_corr_x,target_corr_y,target_corr_theta_deg,applied_corr_x,applied_corr_y,applied_corr_theta_deg,mcl_x,mcl_y,mcl_theta_deg,mcl_conf,mcl_ess,last_nis,mcl_var_x,mcl_var_y,mcl_var_theta,active_sensors,mcl_valid,sensors_stale,correction_accepted,correction_reject_mask,meas_delta_xy,meas_delta_theta_deg,candidate_inlier_sensors,candidate_mean_residual,candidate_max_residual,candidate_stable_scans,required_stable_scans");
+    for (const char* sensorName : kTraceSensorNames) {
+        appendFormat(csv,
+                     ",%s_dist,%s_conf,%s_in_range,%s_conf_ok,%s_used,%s_size,%s_velocity,%s_expected,%s_residual,%s_age_ms,%s_reading_seq,%s_changed",
+                     sensorName, sensorName, sensorName, sensorName, sensorName, sensorName, sensorName, sensorName,
+                     sensorName, sensorName, sensorName, sensorName);
+    }
+    appendFormat(csv, "\n");
 
     for (const auto& sample : traceSamples) {
         appendFormat(
             csv,
-            "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%.4f,%d,%d,%d,%d\n",
+            "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%d,%d,%d,%d,%lu,%.4f,%.4f,%d,%.4f,%.4f,%d,%d",
             static_cast<unsigned long>(sample.timeMs), static_cast<unsigned long>(sample.odomSeq),
-            sample.odomPose.x, sample.odomPose.y, sample.odomPose.theta, sample.odomDelta.localX,
-            sample.odomDelta.localY, sample.odomDelta.deltaTheta,
+            sample.odomPose.x, sample.odomPose.y, sample.odomPose.theta, sample.odomOnlyPose.x,
+            sample.odomOnlyPose.y, sample.odomOnlyPose.theta, sample.odomDelta.localX, sample.odomDelta.localY,
+            sample.odomDelta.deltaTheta,
             static_cast<unsigned long>(sample.odomTelemetry.seq), sample.odomTelemetry.dt,
             sample.odomTelemetry.headingBefore, sample.odomTelemetry.headingAfter,
             sample.odomTelemetry.deltaHeading, sample.odomTelemetry.usedHorizontalHeadingPair,
@@ -639,14 +697,18 @@ std::string buildTuneTraceCsv() {
             sample.appliedCorrectionX, sample.appliedCorrectionY, sample.appliedCorrectionTheta,
             sample.mclPose.x, sample.mclPose.y, sample.mclPose.theta, sample.mclConfidence, sample.mclEss,
             sample.lastNis, sample.mclVarX, sample.mclVarY, sample.mclVarTheta, sample.activeSensors,
-            sample.mclValid, sample.sensorsStale, sample.correctionAccepted, sample.sensors[0].distance,
-            sample.sensors[0].confidence, sample.sensors[0].inRange, sample.sensors[0].confidenceAccepted,
-            sample.sensors[0].used, sample.sensors[1].distance, sample.sensors[1].confidence,
-            sample.sensors[1].inRange, sample.sensors[1].confidenceAccepted, sample.sensors[1].used,
-            sample.sensors[2].distance, sample.sensors[2].confidence, sample.sensors[2].inRange,
-            sample.sensors[2].confidenceAccepted, sample.sensors[2].used, sample.sensors[3].distance,
-            sample.sensors[3].confidence, sample.sensors[3].inRange, sample.sensors[3].confidenceAccepted,
-            sample.sensors[3].used);
+            sample.mclValid, sample.sensorsStale, sample.correctionAccepted,
+            static_cast<unsigned long>(sample.correctionRejectMask), sample.measurementPoseDelta,
+            sample.measurementHeadingDelta, sample.correctionInlierSensors, sample.correctionMeanResidual,
+            sample.correctionMaxResidual, sample.candidateStableScans, sample.requiredStableScans);
+        for (const auto& sensor : sample.sensors) {
+            appendFormat(csv, ",%.4f,%d,%d,%d,%d,%d,%.6f,%.4f,%.4f,%u,%u,%d", sensor.distance, sensor.confidence,
+                         sensor.inRange, sensor.confidenceAccepted, sensor.used, sensor.objectSize,
+                         sensor.objectVelocity, sensor.expectedDistance, sensor.residual,
+                         static_cast<unsigned int>(sensor.readingAgeMs), static_cast<unsigned int>(sensor.readingSeq),
+                         sensor.readingChanged);
+        }
+        appendFormat(csv, "\n");
     }
 
     return csv;
@@ -871,6 +933,14 @@ void storeTuneCheckpoint(const char* name, const lemlib::Pose& expected) {
         checkpoint.debug.mclValid = traceSample.mclValid;
         checkpoint.debug.sensorsStale = traceSample.sensorsStale;
         checkpoint.debug.correctionAccepted = traceSample.correctionAccepted;
+        checkpoint.debug.correctionRejectMask = traceSample.correctionRejectMask;
+        checkpoint.debug.measurementPoseDelta = traceSample.measurementPoseDelta;
+        checkpoint.debug.measurementHeadingDelta = traceSample.measurementHeadingDelta;
+        checkpoint.debug.correctionInlierSensors = traceSample.correctionInlierSensors;
+        checkpoint.debug.correctionMeanResidual = traceSample.correctionMeanResidual;
+        checkpoint.debug.correctionMaxResidual = traceSample.correctionMaxResidual;
+        checkpoint.debug.candidateStableScans = traceSample.candidateStableScans;
+        checkpoint.debug.requiredStableScans = traceSample.requiredStableScans;
         checkpoint.distances = captureDistances(traceSample);
         checkpoint.odomSeq = traceSample.odomSeq;
     } else {
@@ -949,26 +1019,29 @@ DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::Localiz
         const float cosTheta = std::cos(candidate.pose.theta);
         const float sensorGlobalX = sensor.dx * cosTheta + sensor.dy * sinTheta;
         const float sensorGlobalY = -sensor.dx * sinTheta + sensor.dy * cosTheta;
-        const auto axis = classifyWallAxisDirection(candidate.pose.theta + sensor.dtheta);
+        const float sensorHeading = candidate.pose.theta + sensor.dtheta;
+        const float rayDirX = std::sin(sensorHeading);
+        const float rayDirY = std::cos(sensorHeading);
+        const auto axis = classifyWallAxisDirection(sensorHeading);
 
         switch (axis) {
             case WallAxisDirection::PosX:
-                xSum += config.field.maxX - sample.distance - sensorGlobalX;
+                xSum += config.field.maxX - rayDirX * sample.distance - sensorGlobalX;
                 ++candidate.xSensors;
                 ++candidate.usedSensors;
                 break;
             case WallAxisDirection::NegX:
-                xSum += config.field.minX + sample.distance - sensorGlobalX;
+                xSum += config.field.minX - rayDirX * sample.distance - sensorGlobalX;
                 ++candidate.xSensors;
                 ++candidate.usedSensors;
                 break;
             case WallAxisDirection::PosY:
-                ySum += config.field.maxY - sample.distance - sensorGlobalY;
+                ySum += config.field.maxY - rayDirY * sample.distance - sensorGlobalY;
                 ++candidate.ySensors;
                 ++candidate.usedSensors;
                 break;
             case WallAxisDirection::NegY:
-                ySum += config.field.minY + sample.distance - sensorGlobalY;
+                ySum += config.field.minY - rayDirY * sample.distance - sensorGlobalY;
                 ++candidate.ySensors;
                 ++candidate.usedSensors;
                 break;
@@ -993,13 +1066,16 @@ DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::Localiz
         const float cosTheta = std::cos(candidate.pose.theta);
         const float sensorX = candidate.pose.x + sensor.dx * cosTheta + sensor.dy * sinTheta;
         const float sensorY = candidate.pose.y - sensor.dx * sinTheta + sensor.dy * cosTheta;
+        const float sensorHeading = candidate.pose.theta + sensor.dtheta;
+        const float rayDirX = std::sin(sensorHeading);
+        const float rayDirY = std::cos(sensorHeading);
 
         float predicted = -1.0f;
-        switch (classifyWallAxisDirection(candidate.pose.theta + sensor.dtheta)) {
-            case WallAxisDirection::PosX: predicted = config.field.maxX - sensorX; break;
-            case WallAxisDirection::NegX: predicted = sensorX - config.field.minX; break;
-            case WallAxisDirection::PosY: predicted = config.field.maxY - sensorY; break;
-            case WallAxisDirection::NegY: predicted = sensorY - config.field.minY; break;
+        switch (classifyWallAxisDirection(sensorHeading)) {
+            case WallAxisDirection::PosX: predicted = (config.field.maxX - sensorX) / rayDirX; break;
+            case WallAxisDirection::NegX: predicted = (config.field.minX - sensorX) / rayDirX; break;
+            case WallAxisDirection::PosY: predicted = (config.field.maxY - sensorY) / rayDirY; break;
+            case WallAxisDirection::NegY: predicted = (config.field.minY - sensorY) / rayDirY; break;
             case WallAxisDirection::Unknown: break;
         }
         if (predicted <= 0.0f) continue;
@@ -1156,50 +1232,16 @@ RelocalizationCandidate evaluateRelocalizationPoseSeed(const lemlib::localizatio
     return candidate;
 }
 
-bool delayWithAbort(std::uint32_t delayMs) {
-    for (std::uint32_t elapsed = 0; elapsed < delayMs; elapsed += 10) {
-        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
-            chassis.cancelMotion();
-            return false;
-        }
-        pros::delay(10);
-    }
-    return true;
-}
-
 bool waitForTuneMotionCompletion(TuneMotionKind kind, const lemlib::Pose& expected, int timeoutMs, bool allowAbort) {
+    (void)allowAbort;
+    (void)kind;
+    (void)expected;
     const std::uint32_t startedAt = pros::millis();
-    int stableCycles = 0;
     bool sawMotionRunning = false;
 
     while (pros::millis() - startedAt < static_cast<std::uint32_t>(std::max(timeoutMs, 0))) {
-        if (allowAbort && controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
-            chassis.cancelAllMotions();
-            return false;
-        }
-
         const bool motionRunning = chassis.isInMotion();
         sawMotionRunning = sawMotionRunning || motionRunning;
-
-        const lemlib::Pose pose = chassis.getPose(true);
-        const float positionError = pose.distance(expected);
-        const float headingError =
-            std::fabs(wrapDegrees(lemlib::radToDeg(wrapRadians(pose.theta - expected.theta))));
-        const bool closeEnough =
-            kind == TuneMotionKind::Move ? positionError <= kTuneMoveCompletionDistIn &&
-                                               headingError <= kTuneMoveCompletionHeadingDeg
-                                         : headingError <= kTuneTurnCompletionHeadingDeg;
-
-        if (closeEnough) {
-            stableCycles++;
-            if (stableCycles >= kTuneMotionStableCycles) {
-                chassis.cancelMotion();
-                pros::delay(kTuneMotionCancelSettleMs);
-                return true;
-            }
-        } else {
-            stableCycles = 0;
-        }
 
         if (sawMotionRunning && !motionRunning) return true;
         pros::delay(kTuneMotionPollMs);
@@ -1213,30 +1255,27 @@ bool waitForTuneMotionCompletion(TuneMotionKind kind, const lemlib::Pose& expect
 }
 
 bool settleAndCapture(const char* name, const lemlib::Pose& expected, bool allowAbort) {
+    (void)allowAbort;
     setState("Settling", name, true);
-    if (allowAbort) {
-        if (!delayWithAbort(kTuneSettleMs)) return false;
-    } else {
-        pros::delay(kTuneSettleMs);
-    }
+    pros::delay(kTuneSettleMs);
     storeTuneCheckpoint(name, expected);
     return true;
 }
 
 bool waitForPostMoveLocalizationUpdate(bool allowAbort) {
+    (void)allowAbort;
     const std::uint32_t startedAt = pros::millis();
 
     while (pros::millis() - startedAt < kTunePostMoveCorrectionWindowMs) {
-        if (allowAbort && controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
-            chassis.cancelAllMotions();
-            return false;
-        }
-
         const auto debug = lemlib::localization::getDebugInfo(true);
+        const auto sample = lemlib::localization::getLatestTraceSample(true);
+        const bool freshAfterMotion = sample.timeMs >= startedAt &&
+                                      (sample.correctionRejectMask & kTuneRejectMotionSuppressedMask) == 0;
         const bool goodMeasurement =
-            debug.activeSensors >= 2 && debug.lastNis >= 0.0f && debug.lastNis <= kTunePostMoveGoodNis &&
-            !debug.sensorsStale;
-        if (debug.correctionAccepted || goodMeasurement) return true;
+            freshAfterMotion && debug.activeSensors >= 2 && debug.lastNis >= 0.0f &&
+            debug.lastNis <= kTunePostMoveGoodNis && debug.correctionInlierSensors >= kTunePostMoveMinInlierSensors &&
+            debug.correctionMaxResidual <= kTunePostMoveMaxResidual && !debug.sensorsStale;
+        if ((freshAfterMotion && debug.correctionAccepted) || goodMeasurement) return true;
 
         pros::delay(kTuneMotionPollMs);
     }
@@ -1247,7 +1286,9 @@ bool waitForPostMoveLocalizationUpdate(bool allowAbort) {
 bool runMovePoseStep(const char* name, const lemlib::Pose& expected, int timeout,
                      const lemlib::MoveToPoseParams& params, bool allowAbort) {
     setState("Move", name, true);
-    chassis.moveToPose(expected.x, expected.y, internalRadiansToMoveHeadingDeg(expected.theta), timeout, params, true);
+    // Chassis::moveToPose accepts LemLib field-heading degrees (0 = field +Y)
+    // and converts to its internal standard-position heading itself.
+    chassis.moveToPose(expected.x, expected.y, lemlib::radToDeg(expected.theta), timeout, params, true);
     if (!waitForTuneMotionCompletion(TuneMotionKind::Move, expected, timeout, allowAbort)) return false;
     if (!waitForPostMoveLocalizationUpdate(allowAbort)) return false;
     return settleAndCapture(name, expected, allowAbort);
@@ -1259,6 +1300,24 @@ bool runTurnStep(const char* name, const lemlib::Pose& expected, int timeout,
     chassis.turnToHeading(lemlib::radToDeg(expected.theta), timeout, params, true);
     if (!waitForTuneMotionCompletion(TuneMotionKind::Turn, expected, timeout, allowAbort)) return false;
     if (!waitForPostMoveLocalizationUpdate(allowAbort)) return false;
+    return settleAndCapture(name, expected, allowAbort);
+}
+
+bool runDriveProbeStep(const char* name, const lemlib::Pose& expected, int durationMs, float power, bool forwards,
+                       bool allowAbort) {
+    setState("Drive", name, true);
+    // Open-loop: equal raw power to both sides, drive curve disabled, no PID. The
+    // expected heading is the start heading, so the captured heading error is the
+    // pure drivetrain veer over this segment.
+    chassis.cancelMotion();
+    const int command = static_cast<int>(forwards ? power : -power);
+    const std::uint32_t startedAt = pros::millis();
+    while (pros::millis() - startedAt < static_cast<std::uint32_t>(durationMs)) {
+        chassis.tank(command, command, true);
+        pros::delay(10);
+    }
+    chassis.tank(0, 0, true);
+    pros::delay(150); // let the robot fully stop and odom settle before capture
     return settleAndCapture(name, expected, allowAbort);
 }
 
@@ -1566,14 +1625,35 @@ void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbo
     else lemlib::localization::syncPose(start);
     pros::delay(kTuneInitialSettleMs);
 
-    if (!settleAndCapture("Start hold", start, allowAbort)) {
+    // Solve the absolute pose from the perimeter walls while the robot is
+    // stationary at the start. Hand placement varies by several inches (most of
+    // all in the forward axis), so the fixed start carries a large, variable
+    // reference error that MCL cannot recover from when it is seeded tightly
+    // around that wrong start. When the wall solve is accepted, commit it so odom
+    // and MCL both begin from the true field pose, and shift the run's reference
+    // pose to match so checkpoint expected/error values stay meaningful. Fusion
+    // gates and noise models are intentionally left unchanged.
+    setState("Setup", "Relocalize", true);
+    const RelocalizationSummary relocalization = performGlobalRelocalization();
+    storeRelocalizationSummary(relocalization);
+
+    lemlib::Pose runStart = start;
+    if (relocalization.success) {
+        runStart = relocalization.pose;
+        chassis.setPose(runStart, true);
+        lemlib::localization::syncPose(runStart);
+        setStartPose(runStart);
+        pros::delay(kTuneInitialSettleMs);
+    }
+
+    if (!settleAndCapture("Start hold", runStart, allowAbort)) {
         finalizeRun("Aborted", "Stopped during start hold", ". .");
         return;
     }
 
     for (size_t i = 0; i < test.stepCount; ++i) {
         const AutonomousRouteStep& step = test.steps[i];
-        const lemlib::Pose target = autonomousRouteTarget(start, step);
+        const lemlib::Pose target = autonomousRouteTarget(runStart, step);
         bool stepOk = false;
         if (step.kind == TuneMotionKind::Turn) {
             lemlib::TurnToHeadingParams params {};
@@ -1581,6 +1661,8 @@ void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbo
             params.minSpeed = static_cast<int>(step.minSpeed);
             params.earlyExitRange = step.earlyExitRange;
             stepOk = runTurnStep(step.name, target, step.timeoutMs, params, allowAbort);
+        } else if (step.kind == TuneMotionKind::Drive) {
+            stepOk = runDriveProbeStep(step.name, target, step.timeoutMs, step.maxSpeed, step.forwards, allowAbort);
         } else {
             lemlib::MoveToPoseParams params {};
             params.forwards = step.forwards;

@@ -15,6 +15,7 @@ temp.log
 temp.errors
 *.ini
 .d/
+tools/localization_calibration_logs/
 
 # template files
 *.zip

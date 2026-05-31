@@ -9,6 +9,7 @@
 #include "lemlib/chassis/chassis.hpp"
 #include "lemlib/chassis/odom.hpp"
 #include "lemlib/chassis/trackingWheel.hpp"
+#include "lemlib/localization/localization.hpp"
 #include "pros/llemu.hpp"
 #include "pros/rtos.hpp"
 #include "pros/screen.hpp"
@@ -281,6 +282,7 @@ void lemlib::Chassis::setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mo
 }
 
 void lemlib::Chassis::requestMotionStart() {
+    lemlib::localization::setMotionCorrectionSuppressed(true);
     if (this->isInMotion()) this->motionQueued = true; // indicate a motion is queued
     else this->motionRunning = true; // indicate a motion is running
 
@@ -296,6 +298,7 @@ void lemlib::Chassis::endMotion() {
     // move the "queue" forward 1
     this->motionRunning = this->motionQueued;
     this->motionQueued = false;
+    lemlib::localization::setMotionCorrectionSuppressed(this->motionRunning);
 
     // permit queued motion to run
     this->mutex.give();
@@ -303,12 +306,17 @@ void lemlib::Chassis::endMotion() {
 
 void lemlib::Chassis::cancelMotion() {
     this->motionRunning = false;
+    // cancelMotion only cancels the CURRENT motion, not a queued one. If a
+    // motion is still queued it will run next, so keep corrections suppressed;
+    // the queued motion's endMotion will recompute suppression from there.
+    lemlib::localization::setMotionCorrectionSuppressed(this->motionQueued);
     pros::delay(10); // give time for motion to stop
 }
 
 void lemlib::Chassis::cancelAllMotions() {
     this->motionRunning = false;
     this->motionQueued = false;
+    lemlib::localization::setMotionCorrectionSuppressed(false);
     pros::delay(10); // give time for motion to stop
 }
 
@@ -333,7 +341,15 @@ void lemlib::Chassis::drivePulse(float power, int timeout, bool async) {
     }
 
     requestMotionStart();
-    if (!motionRunning) return;
+    if (!this->motionRunning) {
+        // Mirror every other motion: release the mutex and restore the
+        // suppression flag on the cancelled-before-start path. Without this,
+        // a queued drivePulse cancelled before it ran would leak this->mutex
+        // (deadlocking all future motions) and leave correction suppression
+        // stuck true for the rest of the run.
+        this->endMotion();
+        return;
+    }
 
     if (async) {
         pros::Task task([=, this]() { drivePulse(power, pulseTime, false); });

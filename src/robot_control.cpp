@@ -518,13 +518,19 @@ void intake(std::uint32_t durationMs) {
 void stopAutonomousManipulatorControl() {
     autonomousIntakeActive = false;
     autonomousIntakeEndTimeMs = 0;
-    stopReleasedPtoControls();
 
+    // Remove the task FIRST, then zero. Zeroing before the task is gone left a
+    // window where the task (having already read autonomousIntakeActive==true)
+    // could re-issue intake/roller power AFTER the zero and then be frozen by
+    // task.remove() with the released PTO motors still running -- and nothing on
+    // the disabled()/opcontrol-entry path re-zeros those motors.
     if (autonomousManipulatorTaskHandle != nullptr) {
         pros::Task task(autonomousManipulatorTaskHandle);
         task.remove();
         autonomousManipulatorTaskHandle = nullptr;
     }
+
+    stopReleasedPtoControls();
 }
 
 void score(std::uint32_t durationMs, int direction) {

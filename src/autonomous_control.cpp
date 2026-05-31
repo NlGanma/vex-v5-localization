@@ -18,7 +18,7 @@ namespace {
 constexpr float kAutonomousStartAbsX = -27.0f;
 constexpr float kAutonomousStartAbsY = -36.0f;
 constexpr float kAutonomousStartHeadingDeg = 0.0f;
-constexpr int kLocalizationTuneTest = 1; // 0 normal route, 1 turn/center, 2 straight scale, 3 square + cross
+constexpr int kLocalizationTuneTest = 5; // 0 normal route, 1 turn/center, 2 straight scale, 3 square + cross, 4 drive probe, 5 sensor angle
 
 void stopChassisMotion() {
     chassis.cancelAllMotions();
@@ -68,7 +68,7 @@ void autonomous() {
 
     autonomous_localization::StartRelativeChassis localChassis {};
     if (!prepareAutonomousStart(&localChassis)) return;
-    if (kLocalizationTuneTest >= 1 && kLocalizationTuneTest <= 3) {
+    if (kLocalizationTuneTest >= 1 && kLocalizationTuneTest <= 5) {
         const lemlib::Pose tuneStart(kAutonomousStartAbsX, kAutonomousStartAbsY,
                                      lemlib::degToRad(kAutonomousStartHeadingDeg));
         localization_tune::runAutonomousRoute(tuneStart, kLocalizationTuneTest, true);
@@ -76,6 +76,18 @@ void autonomous() {
     }
 
     auto& chassis = localChassis;
+
+    // Anchor the local route frame to the field. While stationary at the start,
+    // relocalize against the perimeter walls: on a confident solve, local
+    // (0, 0, 0) becomes the true field pose so localization corrects the run; if
+    // relocalization fails, fall back to the configured fixed start so the robot
+    // runs the identical start-relative route on odometry from local (0, 0, 0)
+    // while normal gated range fusion stays tied to that track. The physical
+    // route is the same either way. (Tune tests above relocalize inside
+    // runAutonomousRoute, so this only runs for the normal route.)
+    const lemlib::Pose autonomousFixedStart(kAutonomousStartAbsX, kAutonomousStartAbsY,
+                                            lemlib::degToRad(kAutonomousStartHeadingDeg));
+    autonomous_localization::beginAutonomousWithRelocalizationOrFixedStart(autonomousFixedStart, &localChassis);
 
     // Route commands below are start-relative, not field-center-relative.
     // The internal fused pose is still absolute, but this local wrapper lets

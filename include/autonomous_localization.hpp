@@ -26,7 +26,10 @@ struct RelocalizationSummary {
     float varX = 0.0f;
     float varY = 0.0f;
     float varTheta = 0.0f;
+    float meanResidual = 0.0f;
+    float maxResidual = 0.0f;
     int activeSensors = 0;
+    int scoredSensors = 0;
     int iterations = 0;
     int headingHypotheses = 0;
     DistanceSnapshot distances {};
@@ -65,4 +68,12 @@ void applyRelocalizedPose(const lemlib::Pose& pose);
 RelocalizationSummary performGlobalRelocalization();
 bool beginAutonomousWithRelocalization(RelocalizationSummary* summary = nullptr);
 bool beginAutonomousWithFixedStart(const lemlib::Pose& absoluteStartPose, StartRelativeChassis* localChassis = nullptr);
+// Relocalize against the walls and anchor the start-relative route frame.
+// On a confident solve the local origin becomes the true field pose so
+// localization corrects the run; on failure it falls back to the fixed start so
+// the robot runs the identical start-relative route on odometry from local
+// (0, 0, 0). Returns true if relocalization succeeded (the route runs either way).
+bool beginAutonomousWithRelocalizationOrFixedStart(const lemlib::Pose& fixedStartAbsolute,
+                                                   StartRelativeChassis* localChassis = nullptr,
+                                                   RelocalizationSummary* summary = nullptr);
 } // namespace autonomous_localization

@@ -46,7 +46,10 @@ void opcontrol() {
     stopAutonomousManipulatorControl();
     setAllMotorBrakeModes();
     switchToEightMotorDrive();
-    toggleMiddleGoal();
+    // Start teleop in a known retracted state. Using toggleMiddleGoal() here made
+    // the starting position depend on the prior path into opcontrol (it only
+    // lands "down" if it happened to be "up" coming in).
+    middleGoalDown();
     controller.clear_line(1);
     controller.clear_line(2);
 

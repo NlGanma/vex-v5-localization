@@ -298,6 +298,8 @@ MCLMeasurement MCL::update() {
 
         observations[static_cast<size_t>(i)].available = true;
         observations[static_cast<size_t>(i)].distance = static_cast<float>(dist_mm) / 25.4f;
+        observations[static_cast<size_t>(i)].objectSize = s.sensor->get_object_size();
+        observations[static_cast<size_t>(i)].objectVelocity = static_cast<float>(s.sensor->get_object_velocity());
         if (dist_mm >= kConfidenceAvailableMinMm) {
             observations[static_cast<size_t>(i)].confidence = s.sensor->get_confidence();
         }
@@ -330,6 +332,8 @@ MCLMeasurement MCL::update(const std::array<SensorObservation, 4>& observations)
         auto& sensorDebug = out.sensorReadings[static_cast<size_t>(i)];
         if (validDistance) sensorDebug.distance = observation.distance;
         if (confidenceAvailable) sensorDebug.confidence = conf;
+        sensorDebug.objectSize = observation.objectSize;
+        sensorDebug.objectVelocity = observation.objectVelocity;
         if (!validDistance) continue;
 
         const float dist_in = observation.distance;
@@ -426,7 +430,8 @@ MCLMeasurement MCL::update(const std::array<SensorObservation, 4>& observations)
     }
 
     // Resample if needed (systematic)
-    if (ess < cfg_.resampleEssRatio * static_cast<float>(cfg_.numParticles)) {
+    const bool didResample = ess < cfg_.resampleEssRatio * static_cast<float>(cfg_.numParticles);
+    if (didResample) {
         std::vector<Particle> resampled;
         resampled.resize(static_cast<size_t>(cfg_.numParticles));
 
@@ -449,6 +454,12 @@ MCLMeasurement MCL::update(const std::array<SensorObservation, 4>& observations)
             const auto it = std::lower_bound(cdf.begin(), cdf.end(), point);
             int idx = static_cast<int>(std::distance(cdf.begin(), it));
             if (idx >= cfg_.numParticles) idx = cfg_.numParticles - 1;
+            // lower_bound (>=) can land on a zero-mass particle when point == 0
+            // (the stratum start is drawn from [0, 1/N), inclusive of 0) and a
+            // leading particle has zero weight. Advance to the next particle
+            // that actually owns probability mass so resampling never copies a
+            // zero-weight particle.
+            while (idx + 1 < cfg_.numParticles && particles_[idx].weight <= 0.0f) ++idx;
             resampled[i] = particles_[idx];
             resampled[i].weight = 1.0f / static_cast<float>(cfg_.numParticles);
         }
@@ -492,7 +503,11 @@ MCLMeasurement MCL::update(const std::array<SensorObservation, 4>& observations)
     const float ess_ratio = (cfg_.numParticles > 0) ? (ess / static_cast<float>(cfg_.numParticles)) : 0.0f;
     out.confidence = clampf(ess_ratio * (1.0f - (spread / cfg_.confidenceMaxSpread)), 0.0f, 1.0f);
     out.valid = true;
-    accumulatedTurnMag_ = 0.0f;
+    // Only clear the accumulated turn once its side-spread has actually been
+    // injected (which happens inside the resample branch above); otherwise keep
+    // accumulating so a high-ESS no-resample scan does not silently discard the
+    // turn-induced side spread the design intends to apply at the next resample.
+    if (didResample) accumulatedTurnMag_ = 0.0f;
     return out;
 }
 
@@ -534,17 +549,32 @@ float MCL::raycastToField(float sx, float sy, float dirX, float dirY) const {
         const float x4 = sx + t4 * dirX;
         if (t4 > 0.0f && x4 >= field_.minX && x4 <= field_.maxX) t_min = std::min(t_min, t4);
     }
-    // Keep obstacle geometry for particle validity, but do not use it to
-    // occlude runtime distance-sensor rays. On-robot logs show the side/back
-    // sensors consistently returning perimeter-wall distances where the map's
-    // low-profile goal supports would otherwise block the ray, which broadens
-    // and mis-centers the particle cloud during motion.
+
+    // Raw obstacle extents (no obstacleMargin): a sensor ray hits the true
+    // physical surface. The margin is only a particle keep-out buffer in
+    // isInsideObstacle -- see the note there.
+    for (const auto& obstacle : field_.obstacles) {
+        float hit = -1.0f;
+        if (obstacle.type == FieldConfig::Obstacle::Type::Circle) {
+            hit = raycastCircle(sx, sy, dirX, dirY, obstacle.x, obstacle.y, obstacle.radius);
+        } else {
+            hit = raycastRect(sx, sy, dirX, dirY, obstacle.x - obstacle.halfW, obstacle.x + obstacle.halfW,
+                              obstacle.y - obstacle.halfH, obstacle.y + obstacle.halfH);
+        }
+        if (hit > 0.0f) t_min = std::min(t_min, hit);
+    }
 
     if (t_min > kNoHitThreshold) return -1.0f;
     return t_min;
 }
 
 bool MCL::isInsideObstacle(float x, float y) const {
+    // obstacleMargin here is a PARTICLE keep-out buffer: particles landing within
+    // this inflated region are rejected so the cloud never settles inside an
+    // obstacle. It is deliberately NOT applied in raycastToField/expectedDistance,
+    // which must hit the true obstacle surface to model the real sensor. Do not
+    // "sync" the two by adding margin to the raycast -- that would bias the sensor
+    // model. With the shipped config (obstacleMargin = 0) the boundaries coincide.
     const float margin = field_.obstacleMargin;
     for (const auto& obstacle : field_.obstacles) {
         if (obstacle.type == FieldConfig::Obstacle::Type::Circle) {

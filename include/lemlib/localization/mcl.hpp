@@ -43,7 +43,9 @@ struct SensorConfig {
 
 struct SensorMeasurementDebug {
         float distance = -1.0f;
+        float objectVelocity = 0.0f;
         int confidence = -1;
+        int objectSize = -1;
         bool inRange = false;
         bool confidenceAccepted = false;
         bool used = false;
@@ -51,7 +53,9 @@ struct SensorMeasurementDebug {
 
 struct SensorObservation {
         float distance = -1.0f; // inches
+        float objectVelocity = 0.0f; // m/s
         int confidence = -1; // -1 means unavailable
+        int objectSize = -1;
         bool available = false;
 };
 

@@ -1,5 +1,5 @@
 # if "template" is in the make command, do not include static.lib files
-STATIC_ASSET_FILES=$(filter-out $(wildcard static/*.gif),$(wildcard static/*))
+STATIC_ASSET_FILES=$(wildcard static/*)
 ifneq (,$(findstring template,$(MAKECMDGOALS)))
 ASSET_FILES=$(STATIC_ASSET_FILES)
 else

@@ -44,6 +44,7 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
     bool lateralSettled = false;
     bool prevSameSide = false;
     float prevLateralOut = 0; // previous lateral power
+    float prevAngularOut = 0; // previous angular power
 
     // main loop
     while (!timer.isDone() &&
@@ -105,6 +106,16 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
 
         // apply restrictions on angular speed
         angularOut = std::clamp(angularOut, -params.maxSpeed, params.maxSpeed);
+
+        // rate-limit angular output in the large-error regime, mirroring
+        // turnToHeading's slew. The angular reference here is the bearing to the
+        // moving carrot point, so the unslewed kD term can inject a large
+        // per-loop kick that pushes the heading into a divergent oscillation.
+        // Guarded by >20 deg (same threshold turnToHeading uses) so fine
+        // small-angle settling keeps full PID authority.
+        if (fabs(radToDeg(angularError)) > 20)
+            angularOut = slew(angularOut, prevAngularOut, angularSettings.slew);
+        prevAngularOut = angularOut;
 
         // apply restrictions on lateral speed
         lateralOut = std::clamp(lateralOut, -params.maxSpeed, params.maxSpeed);

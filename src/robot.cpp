@@ -13,11 +13,11 @@ pros::MotorGroup rightPtoMotor2({-8}, pros::MotorGearset::blue);
 pros::Imu imu(18);
 pros::Distance distFront(13);
 pros::Distance distRight(17);
-pros::Distance distBack(15);
-pros::Distance distLeft(14);
+pros::Distance distBack(12);
+pros::Distance distLeft(15);
 pros::adi::DigitalOut ptoPiston('B', true);
 
-pros::Rotation horizontalEnc(12);
+pros::Rotation horizontalEnc(14);
 pros::Rotation verticalEnc(19);
 lemlib::TrackingWheel horizontal(&horizontalEnc, lemlib::Omniwheel::NEW_2, -6.75);
 lemlib::TrackingWheel vertical(&verticalEnc, lemlib::Omniwheel::NEW_2, -0.125);

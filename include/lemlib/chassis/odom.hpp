@@ -156,5 +156,15 @@ namespace detail {
  * This updates odom state without resynchronizing the localization filters.
  */
 void setPoseSilent(Pose pose, bool radians = false);
+/**
+ * @brief Seq-guarded silent pose setter used by the localization task.
+ *
+ * Writes the corrected pose only if the published odom sequence still equals
+ * expectedSeq, holding the odom update lock (same order as the tracking task)
+ * so a concurrent odom integration step cannot be silently overwritten.
+ *
+ * @return true if the write was applied, false if odom advanced (write skipped)
+ */
+bool setPoseSilentIfSeq(Pose pose, uint32_t expectedSeq, bool radians = false);
 } // namespace detail
 } // namespace lemlib

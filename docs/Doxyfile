@@ -2721,7 +2721,7 @@ DIR_GRAPH_MAX_DEPTH    = 1
 # Note: If you choose svg you need to set HTML_FILE_EXTENSION to xhtml in order
 # to make the SVG files visible in IE 9+ (other browsers do not have this
 # requirement).
-# Possible values are: png, jpg, gif, svg, png:gd, png:gd:gd, png:cairo,
+# Possible values are: png, jpg, svg, png:gd, png:gd:gd, png:cairo,
 # png:cairo:gd, png:cairo:cairo, png:cairo:gdiplus, png:gdiplus and
 # png:gdiplus:gdiplus.
 # The default value is: png.
