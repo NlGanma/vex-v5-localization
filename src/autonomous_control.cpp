@@ -2,6 +2,7 @@
 
 #include "app_config.hpp"
 #include "autonomous_localization.hpp"
+#include "lemlib/localization/localization.hpp"
 #include "localization_tune.hpp"
 #include "robot_control.hpp"
 
@@ -18,7 +19,7 @@ namespace {
 constexpr float kAutonomousStartAbsX = -27.0f;
 constexpr float kAutonomousStartAbsY = -36.0f;
 constexpr float kAutonomousStartHeadingDeg = 0.0f;
-constexpr int kLocalizationTuneTest = 5; // 0 normal route, 1 turn/center, 2 straight scale, 3 square + cross, 4 drive probe, 5 sensor angle
+constexpr int kLocalizationTuneTest = 0; // 0 normal route, 1 turn/center, 2 straight scale, 3 square loop, 4 drive probe, 5 sensor angle, 6 square + cross
 
 void stopChassisMotion() {
     chassis.cancelAllMotions();
@@ -68,7 +69,7 @@ void autonomous() {
 
     autonomous_localization::StartRelativeChassis localChassis {};
     if (!prepareAutonomousStart(&localChassis)) return;
-    if (kLocalizationTuneTest >= 1 && kLocalizationTuneTest <= 5) {
+    if (kLocalizationTuneTest >= 1 && kLocalizationTuneTest <= 6) {
         const lemlib::Pose tuneStart(kAutonomousStartAbsX, kAutonomousStartAbsY,
                                      lemlib::degToRad(kAutonomousStartHeadingDeg));
         localization_tune::runAutonomousRoute(tuneStart, kLocalizationTuneTest, true);
@@ -87,7 +88,14 @@ void autonomous() {
     // runAutonomousRoute, so this only runs for the normal route.)
     const lemlib::Pose autonomousFixedStart(kAutonomousStartAbsX, kAutonomousStartAbsY,
                                             lemlib::degToRad(kAutonomousStartHeadingDeg));
-    autonomous_localization::beginAutonomousWithRelocalizationOrFixedStart(autonomousFixedStart, &localChassis);
+    localization_tune::prepareAutonomousRelocalizedRun(autonomousFixedStart);
+    localization_tune::setState("Setup", "Relocalize", true);
+    lemlib::localization::setTraceEnabled(true);
+    autonomous_localization::RelocalizationSummary startRelocalization {};
+    autonomous_localization::beginAutonomousWithRelocalizationOrFixedStart(autonomousFixedStart, &localChassis,
+                                                                           &startRelocalization);
+    localization_tune::storeRelocalizationSummary(startRelocalization);
+    localization_tune::setStartPose(startRelocalization.success ? startRelocalization.pose : autonomousFixedStart);
 
     // Route commands below are start-relative, not field-center-relative.
     // The internal fused pose is still absolute, but this local wrapper lets
@@ -140,22 +148,29 @@ void autonomous() {
     // setDescore(false);                                                 // Retract the descore mechanism.
     // toggleDescore();                                                   // Toggle the descore mechanism.
 
-    // Active route:
-    // Zeroed-start heading test: headings are relative to the configured
-    // starting heading above, not absolute field headings.
-    chassis.turnToHeading(0.0f, 1000, {.maxSpeed = 127, .minSpeed = 0}, false);    // Face the starting heading.
-    chassis.waitUntilDone();
-    pros::delay(1000);
-
-    chassis.turnToHeading(90.0f, 1000, {.maxSpeed = 127, .minSpeed = 0}, false);   // Turn 90 deg from the start heading.
-    chassis.waitUntilDone();
-    pros::delay(1000);
-
-    chassis.turnToHeading(180.0f, 1000, {.maxSpeed = 127, .minSpeed = 0}, false);  // Turn 180 deg from the start heading.
-    chassis.waitUntilDone();
-    pros::delay(1000);
-
-    chassis.turnToHeading(270.0f, 1000, {.maxSpeed = 127, .minSpeed = 0}, false);  // Turn 270 deg from the start heading.
-    chassis.waitUntilDone();
-    chassis.moveToPoint(30,  30, 10000, {.maxSpeed = 127, .minSpeed = 0}, false);
+    // Active route: 4-motor validation autonomous. All motion calls are
+    // blocking so the trace exercises the intended sequence deterministically.
+    // Myron is the goat.
+    middleGoalDown();
+    // This is localChassis, not ::chassis: local (0, 0, 0) is wherever the robot
+    // is physically placed at autonomous start, not the field center.
+    chassis.setPose(0, 0, 0);
+    intake(90000);
+    chassis.moveToPoint(5.5, 16, 1500, {.maxSpeed = 127, .minSpeed = 40}, false);
+    loadingMechanismDown();
+    chassis.moveToPoint(28.8, -1.2, 1500, {.maxSpeed = 127, .minSpeed = 60}, false);
+    chassis.turnToHeading(183, 300, {.maxSpeed = 127, .minSpeed = 80}, false);
+    chassis.drivePulse(66, 675);
+    chassis.moveToPoint(30.1, 0, 1500, {.forwards = false, .maxSpeed = 127, .minSpeed = 6}, false);
+    loadingMechanismUp();
+    chassis.turnToHeading(-45, 500, {.maxSpeed = 127, .minSpeed = 100}, false);
+    chassis.turnToHeading(2, 700, {.maxSpeed = 100, .minSpeed = 10}, false);
+    chassis.drivePulse(100, 410);
+    score(1250, 127);
+    chassis.drivePulse(-60, 300);
+    chassis.turnToHeading(41, 500, {.maxSpeed = 127, .minSpeed = 50}, false);
+    chassis.drivePulse(70, 345);
+    chassis.moveToPoint(36.5, 55, 1000, {.maxSpeed = 127, .minSpeed = 90}, false);
+    chassis.turnToHeading(30, 500, {.maxSpeed = 85, .minSpeed = 85}, false);
+    localization_tune::finalizeRun("Complete", "4-motor validation route", "--");
 }

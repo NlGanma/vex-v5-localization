@@ -53,6 +53,7 @@ public:
     void moveToPose(float x, float y, float theta, int timeout, lemlib::MoveToPoseParams params = {},
                     bool async = true);
     void moveToPoint(float x, float y, int timeout, lemlib::MoveToPointParams params = {}, bool async = true);
+    void drivePulse(float power, int timeout, bool async = false);
     void waitUntil(float dist);
     void waitUntilDone();
     void cancelMotion();

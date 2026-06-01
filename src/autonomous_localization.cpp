@@ -30,9 +30,6 @@ constexpr float kDirectWallOutlierPenalty = 4.0f;
 constexpr float kRelocalizeMaxMeanResidual = 5.0f;
 constexpr float kRelocalizeMaxResidual = 12.0f;
 constexpr int kDirectWallCommitMinSensors = 3;
-constexpr int kDirectWallTwoAxisMinSensors = 2;
-constexpr float kDirectWallTwoAxisMaxMeanResidual = 1.5f;
-constexpr float kDirectWallTwoAxisMaxResidual = 3.0f;
 constexpr int kRelocalizeCommitMinSensors = 3;
 // At competition start the IMU heading is a strong, drift-free prior. Use it to
 // break the near-square field's 90/180 deg wall-distance aliasing: penalize
@@ -484,25 +481,20 @@ bool relocalizationRobustOutlierAccepted(const lemlib::localization::MCLMeasurem
 bool relocalizationWallDirectAccepted(const RelocalizationSummary& summary,
                                       const DirectWallSolveCandidate& candidate,
                                       const lemlib::localization::LocalizationConfig& config) {
+    (void)candidate;
     const bool varianceOk = summary.varX <= config.fusion.maxVarXY &&
                             summary.varY <= config.fusion.maxVarXY &&
                             summary.varTheta <= config.fusion.maxVarTheta;
     if (!varianceOk || summary.confidence < kRelocalizeMinConfidence) return false;
 
-    if (summary.activeSensors >= kDirectWallCommitMinSensors &&
-        summary.scoredSensors >= kDirectWallCommitMinSensors) {
-        return true;
-    }
-
-    // On a square field, two sensors are often the only stable startup view.
-    // Accept that only when the direct wall solve is geometrically complete:
-    // at least one X-facing and one Y-facing sensor, both inliers, with much
-    // tighter residuals than the normal 3+ sensor commit path.
-    return candidate.xSensors >= 1 && candidate.ySensors >= 1 &&
-           summary.activeSensors >= kDirectWallTwoAxisMinSensors &&
-           summary.scoredSensors >= kDirectWallTwoAxisMinSensors &&
-           summary.meanResidual <= kDirectWallTwoAxisMaxMeanResidual &&
-           summary.maxResidual <= kDirectWallTwoAxisMaxResidual;
+    // A two-sensor wall solve is exactly determined: if either reading is a
+    // game object, cover, or another robot instead of a perimeter wall, the
+    // residual can still be zero and the pose can be catastrophically wrong.
+    // Require a third agreeing sensor before committing; otherwise the caller
+    // falls back to odometry or to the broader MCL path when enough sensors are
+    // available.
+    return summary.activeSensors >= kDirectWallCommitMinSensors &&
+           summary.scoredSensors >= kDirectWallCommitMinSensors;
 }
 
 const char* relocalizationStatus(const lemlib::localization::MCLMeasurement& measurement,
@@ -717,6 +709,8 @@ void StartRelativeChassis::moveToPoint(float x, float y, int timeout, lemlib::Mo
     ::chassis.moveToPoint(absoluteTarget.x, absoluteTarget.y, timeout, params, async);
 }
 
+void StartRelativeChassis::drivePulse(float power, int timeout, bool async) { ::chassis.drivePulse(power, timeout, async); }
+
 void StartRelativeChassis::waitUntil(float dist) { ::chassis.waitUntil(dist); }
 
 void StartRelativeChassis::waitUntilDone() { ::chassis.waitUntilDone(); }
@@ -800,21 +794,16 @@ RelocalizationSummary performGlobalRelocalization() {
         summary.activeSensors = residuals.inlierSensors;
         summary.scoredSensors = residuals.scoredSensors;
         const bool normalResidualsAccepted = residualsAccepted(residuals, kDirectWallCommitMinSensors);
-        const bool twoAxisResidualsAccepted =
-            residualsAccepted(residuals, kDirectWallTwoAxisMinSensors, kDirectWallTwoAxisMaxMeanResidual,
-                              kDirectWallTwoAxisMaxResidual);
         const bool wallHeadingConsistent = wallHeadingDisagreement <= kRelocalizeMaxHeadingDisagreementRad;
         if (wallHeadingConsistent && relocalizationWallDirectAccepted(summary, bestWallSolve, relocalizeLocConfig) &&
-            (normalResidualsAccepted || twoAxisResidualsAccepted)) {
+            normalResidualsAccepted) {
             summary.success = true;
             summary.status = "wall_direct";
             return summary;
         }
 
         if (usableSnapshots < kRelocalizeCommitMinSensors) {
-            summary.status = !wallHeadingConsistent
-                                 ? "imu_heading_mismatch"
-                                 : (twoAxisResidualsAccepted ? "not_enough_commit_sensors" : "bad_direct_wall_residual");
+            summary.status = !wallHeadingConsistent ? "imu_heading_mismatch" : "not_enough_commit_sensors";
             return summary;
         }
     }
@@ -965,9 +954,9 @@ bool beginAutonomousWithRelocalizationOrFixedStart(const lemlib::Pose& fixedStar
                                                    RelocalizationSummary* summary) {
     ensureLocalizationRunning();
     // Robot must be stationary here: performGlobalRelocalization median-combines
-    // several distance snapshots. The wall_direct solve is near-instant when two
-    // perpendicular walls are in view; a worst-case MCL seed search can take up
-    // to kRelocalizeTimeoutMs before it falls back.
+    // several distance snapshots. A trustworthy wall_direct solve is near-instant
+    // when three agreeing wall-facing sensors are in view; a worst-case MCL seed
+    // search can take up to kRelocalizeTimeoutMs before it falls back.
     const RelocalizationSummary result = performGlobalRelocalization();
     if (summary != nullptr) *summary = result;
 

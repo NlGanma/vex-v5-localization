@@ -30,7 +30,7 @@ constexpr float kTunePostMoveGoodNis = 2.0f;
 constexpr std::uint32_t kTuneRejectMotionSuppressedMask = 1u << 9;
 constexpr int kTunePostMoveMinInlierSensors = 2;
 constexpr float kTunePostMoveMaxResidual = 4.0f;
-constexpr int kTuneCheckpointCapacity = 16;
+constexpr int kTuneCheckpointCapacity = 32;
 constexpr const char* kTuneLogPath = "/usd/localization_tune_latest.txt";
 constexpr const char* kTuneInternalLogPath = "localization_tune_latest_internal.txt";
 constexpr std::uint32_t kRelocalizeTimeoutMs = 3500;
@@ -80,7 +80,15 @@ struct AutonomousRouteStep {
 };
 
 enum class TuneRunMode { Idle, AutonomousRelocalized };
-enum class TuneTestCase { TurnCenter = 1, StraightScale = 2, SquareCross = 3, DriveProbe = 4, SensorAngle = 5 };
+enum class TuneTestCase {
+    NormalRoute = 0,
+    TurnCenter = 1,
+    StraightScale = 2,
+    SquareLoop = 3,
+    DriveProbe = 4,
+    SensorAngle = 5,
+    SquareCross = 6
+};
 enum class TuneLogOutputMode { Lean, DeepDive };
 enum class WallAxisDirection { PosX, NegX, PosY, NegY, Unknown };
 
@@ -119,14 +127,9 @@ constexpr std::array<AutonomousRouteStep, 4> kStraightScaleRoute {{
     {TuneMotionKind::Move, "Reverse 24", 0.0f, 24.0f, 0.0f, 2600, false, 0.35f, 80.0f, 0.0f, 0.0f},
     {TuneMotionKind::Move, "Reverse 0", 0.0f, 0.0f, 0.0f, 2600, false, 0.35f, 80.0f, 0.0f, 0.0f},
 }};
-// Trimmed from the full square+cross (15 steps, ~30s budget) to a single 24"
-// square loop that returns home, so it fits the ~15s autonomous window. Keeps
-// turns + translation + a clean return-home position-drift check (the "beat
-// odom" metric); the diagonal-cross segments were removed and can be restored
-// if a longer window is available. Move timeouts/speed tightened (2000ms @ 95)
-// so each leg completes well inside its cap. 90 deg turns need ~1200ms to
-// settle (1000ms undershot ~5 deg). Budget: 4*2000 + 3*1200 = 11.6s + ~3s startup.
-constexpr std::array<AutonomousRouteStep, 7> kSquareCrossRoute {{
+// Single 24" square loop that returns home. This fits the ~15s autonomous
+// window and is useful as a compact moving-fusion validation route.
+constexpr std::array<AutonomousRouteStep, 7> kSquareLoopRoute {{
     {TuneMotionKind::Move, "Square north", 0.0f, 24.0f, 0.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
     {TuneMotionKind::Turn, "Face east", 0.0f, 24.0f, 90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
     {TuneMotionKind::Move, "Square east", 24.0f, 24.0f, 90.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
@@ -134,6 +137,29 @@ constexpr std::array<AutonomousRouteStep, 7> kSquareCrossRoute {{
     {TuneMotionKind::Move, "Square south", 24.0f, 0.0f, 180.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
     {TuneMotionKind::Turn, "Face west", 24.0f, 0.0f, -90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
     {TuneMotionKind::Move, "Return home", 0.0f, 0.0f, -90.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
+}};
+// Longer route for validation outside the 15s match budget. It runs the square
+// loop, then adds diagonal cross segments so localization sees oblique motion,
+// cardinal turns, diagonal travel, and a final return-home drift check.
+constexpr std::array<AutonomousRouteStep, 18> kSquareCrossRoute {{
+    {TuneMotionKind::Move, "Square north", 0.0f, 24.0f, 0.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face east", 0.0f, 24.0f, 90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square east", 24.0f, 24.0f, 90.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face south", 24.0f, 24.0f, 180.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Square south", 24.0f, 0.0f, 180.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face west", 24.0f, 0.0f, -90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Return home", 0.0f, 0.0f, -90.0f, 2000, true, 0.42f, 95.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face diagonal NE", 0.0f, 0.0f, 45.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Cross SW to NE", 24.0f, 24.0f, 45.0f, 2600, true, 0.42f, 90.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face diagonal SW", 24.0f, 24.0f, -135.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Cross NE to SW", 0.0f, 0.0f, -135.0f, 2600, true, 0.42f, 90.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face north", 0.0f, 0.0f, 0.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Move to NW", 0.0f, 24.0f, 0.0f, 2000, true, 0.42f, 90.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face diagonal SE", 0.0f, 24.0f, 135.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Cross NW to SE", 24.0f, 0.0f, 135.0f, 2600, true, 0.42f, 90.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Face west final", 24.0f, 0.0f, -90.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Move, "Final return home", 0.0f, 0.0f, -90.0f, 2200, true, 0.42f, 90.0f, 0.0f, 0.0f},
+    {TuneMotionKind::Turn, "Final face north", 0.0f, 0.0f, 0.0f, 1200, true, 0.0f, 80.0f, 0.0f, 0.0f},
 }};
 // Open-loop straight-drive probe (no PID). For Drive steps: maxSpeed = raw tank
 // power, timeoutMs = drive duration, forwards = direction. Equal power is sent to
@@ -399,9 +425,10 @@ const char* tuneRunModeName(TuneRunMode mode) {
 TuneTestCase tuneTestCaseFromNumber(int testNumber) {
     switch (testNumber) {
         case 2: return TuneTestCase::StraightScale;
-        case 3: return TuneTestCase::SquareCross;
+        case 3: return TuneTestCase::SquareLoop;
         case 4: return TuneTestCase::DriveProbe;
         case 5: return TuneTestCase::SensorAngle;
+        case 6: return TuneTestCase::SquareCross;
         case 1:
         default: return TuneTestCase::TurnCenter;
     }
@@ -409,10 +436,12 @@ TuneTestCase tuneTestCaseFromNumber(int testNumber) {
 
 int tuneTestCaseNumber(TuneTestCase testCase) {
     switch (testCase) {
+        case TuneTestCase::NormalRoute: return 0;
         case TuneTestCase::StraightScale: return 2;
-        case TuneTestCase::SquareCross: return 3;
+        case TuneTestCase::SquareLoop: return 3;
         case TuneTestCase::DriveProbe: return 4;
         case TuneTestCase::SensorAngle: return 5;
+        case TuneTestCase::SquareCross: return 6;
         case TuneTestCase::TurnCenter:
         default: return 1;
     }
@@ -429,11 +458,18 @@ const char* tuneMotionKindName(TuneMotionKind kind) {
 
 TuneTestDefinition tuneTestDefinition(TuneTestCase testCase) {
     switch (testCase) {
+        case TuneTestCase::NormalRoute:
+            return {testCase, "Normal route", "4-motor validation autonomous with start relocalization/fallback",
+                    nullptr, 0};
         case TuneTestCase::StraightScale:
             return {testCase, "Straight scale", "Forward/reverse distance scale and lateral drift",
                     kStraightScaleRoute.data(), kStraightScaleRoute.size()};
-        case TuneTestCase::SquareCross:
+        case TuneTestCase::SquareLoop:
             return {testCase, "Square loop", "Square loop returning home: turns + translation + return-home drift vs odom",
+                    kSquareLoopRoute.data(), kSquareLoopRoute.size()};
+        case TuneTestCase::SquareCross:
+            return {testCase, "Square + cross",
+                    "Square loop plus diagonal cross segments for oblique moving-fusion validation",
                     kSquareCrossRoute.data(), kSquareCrossRoute.size()};
         case TuneTestCase::DriveProbe:
             return {testCase, "Drive probe", "Open-loop straight drive: drivetrain balance vs moveToPose",
@@ -1572,6 +1608,7 @@ void prepareAutonomousRelocalizedRun(const lemlib::Pose& currentPose) {
 
     tuneMutex.take();
     tuneRunMode = TuneRunMode::AutonomousRelocalized;
+    tuneTestCase = TuneTestCase::NormalRoute;
     tuneStartPose = currentPose;
     tuneMutex.give();
 }

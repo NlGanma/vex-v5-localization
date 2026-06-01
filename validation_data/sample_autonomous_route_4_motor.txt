@@ -1,0 +1,25 @@
+# This route is already wired into src/autonomous_control.cpp when kLocalizationTuneTest = 0.
+# Keep this file as the reference copy for the 4-motor validation autonomous.
+# PTO/eight-motor shift logic is intentionally omitted because the robot is staying in default 4-motor drive.
+
+middleGoalDown();
+# This is the start-relative chassis in src/autonomous_control.cpp, so (0, 0, 0)
+# means wherever the robot is physically placed at autonomous start, not field center.
+chassis.setPose(0, 0, 0);
+intake(90000);
+chassis.moveToPoint(5.5, 16, 1500, {.maxSpeed = 127, .minSpeed = 40}, false);
+loadingMechanismDown();
+chassis.moveToPoint(28.8, -1.2, 1500, {.maxSpeed = 127, .minSpeed = 60}, false);
+chassis.turnToHeading(183, 300, {.maxSpeed = 127, .minSpeed = 80}, false);
+chassis.drivePulse(66, 675);
+chassis.moveToPoint(30.1, 0, 1500, {.forwards = false, .maxSpeed = 127, .minSpeed = 6});
+loadingMechanismUp();
+chassis.turnToHeading(-45, 500, {.maxSpeed = 127, .minSpeed = 100}, false);
+chassis.turnToHeading(2, 700, {.maxSpeed = 100, .minSpeed = 10}, false);
+chassis.drivePulse(100, 410);
+score(1250, 127);
+chassis.drivePulse(-60, 300);
+chassis.turnToHeading(41, 500, {.maxSpeed = 127, .minSpeed = 50}, false);
+chassis.drivePulse(70, 345);
+chassis.moveToPoint(36.5, 55, 1000, {.maxSpeed = 127, .minSpeed = 90}, false);
+chassis.turnToHeading(30, 500, {.maxSpeed = 85, .minSpeed = 85}, false);

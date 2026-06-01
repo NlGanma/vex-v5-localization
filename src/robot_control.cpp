@@ -548,5 +548,8 @@ void score(std::uint32_t durationMs, int direction) {
     }
 
     stopReleasedPtoControls();
-    switchToEightMotorDrive();
+    // Air pump/PTO is unavailable for validation runs, so leave the robot in
+    // released 4-motor mode after scoring instead of trying to shift back to
+    // 8-motor drive.
+    switchToFourMotorDrive();
 }
