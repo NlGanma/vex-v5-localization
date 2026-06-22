@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Future Codex agents: read this first. This file was written on 2026-05-02 to preserve repo context for later chats.
+Future Codex agents: read this first. This file was written on 2026-05-02 and updated on 2026-06-22 to preserve repo context for later chats. Source code and trace metadata override prose when tuning state changes.
 
 ## Project Boundary
 
@@ -185,17 +185,14 @@ Active config is in `src/localization_config.cpp`.
   - `minX = -70.215`, `maxX = 70.215`.
   - `minY = -70.205`, `maxY = 70.205`.
 - `fieldMargin = 10.0` inches, roughly robot radius plus tolerance.
-- `obstacleMargin = 1.0` inch.
-- Obstacles model the 2025-2026 V5RC Push Back field geometry at the 5-7 inch sensor height band:
-  - left/right loader rectangles.
-  - long goal support circles.
-  - center goal support rectangles.
+- `obstacleMargin = 0.0` inch.
+- The active particle-validity field model contains one center rectangle with 3-inch half-width and half-height.
 - Distance sensor model in robot coordinates: `dx` is positive right, `dy` is positive forward, `dtheta` is clockwise from robot front, units inches/radians.
 - Sensor configs:
-  - front: `&distFront`, `dx=-9.312`, `dy=2.5`, `dtheta=-15 deg`, range `5..96 in`, min confidence `15`.
-  - right: `&distRight`, `dx=10.0`, `dy=-0.25`, `dtheta=96 deg`, range `5..96 in`, min confidence `10`.
-  - back: `&distBack`, `dx=2.375`, `dy=-6.875`, `dtheta=210 deg`, range `5..96 in`, min confidence `10`.
-  - left: `&distLeft`, `dx=-3.5`, `dy=-6.75`, `dtheta=-92 deg`, range `5..96 in`, min confidence `15`.
+  - front: `&distFront`, `dx=-2.749`, `dy=-1.875`, `dtheta=-33.95 deg`, range `5..96 in`, min confidence `15`.
+  - right: `&distRight`, `dx=9.938`, `dy=-1.25`, `dtheta=100.75 deg`, range `5..96 in`, min confidence `10`.
+  - back: `&distBack`, `dx=-0.625`, `dy=-10.749`, `dtheta=202.10 deg`, range `5..96 in`, min confidence `10`.
+  - left: `&distLeft`, `dx=-6.437`, `dy=-2.374`, `dtheta=-115.40 deg`, range `5..96 in`, min confidence `15`.
 
 ## Localization Tuning Constants
 
@@ -226,8 +223,9 @@ From `src/localization_config.cpp`:
   - max var theta `0.10`.
   - max measurement delta XY `2.5 in`.
   - max measurement delta theta `4 deg`.
-  - max correction XY `0.08 in/update`.
+  - max correction XY `0.015 in/update`.
   - max correction theta `0.5 deg/update`.
+  - boundary re-anchor enabled, XY cap `2.5 in`, theta cap `1 deg`, idle-only after a fully gated accept.
   - init std XY `2.5`, theta `6 deg`.
   - sensor stale timeout `300 ms`.
 
@@ -312,11 +310,14 @@ From `src/autonomous_control.cpp`:
   - `kAutonomousStartAbsX = -27.0`.
   - `kAutonomousStartAbsY = -36.0`.
   - `kAutonomousStartHeadingDeg = 0.0`.
-- `kLocalizationTuneTest = 1` currently diverts autonomous into tune test 1. Values:
+- `kLocalizationTuneTest = 0` currently runs the normal route. Values:
   - `0`: normal route.
   - `1`: turn/center test.
   - `2`: straight scale test.
-  - `3`: square + cross test.
+  - `3`: square loop test.
+  - `4`: open-loop drive probe.
+  - `5`: stationary sensor-angle sweep.
+  - `6`: square + cross test.
 - `prepareAutonomousStart()` disables hold, stops manipulator/PTO controls, sets brake modes, stops chassis, switches to 4-motor drive, sets loading/middle/descore states, then starts fixed-start localization with a `StartRelativeChassis`.
 - If using `StartRelativeChassis`, route commands are local/start-relative. Use `::chassis` only for raw absolute-field commands.
 - In active route section, there are many commented examples. Preserve them unless the user asks to clean up; they are useful for route authorship.
@@ -334,19 +335,14 @@ In `src/autonomous_localization.cpp` / `include/autonomous_localization.hpp`:
 
 ## Global Relocalization
 
-Implemented twice with similar code:
-
-- `autonomous_localization::performGlobalRelocalization()` in `src/autonomous_localization.cpp`.
-- `localization_tune::performGlobalRelocalization()` delegates to autonomous localization, but `src/localization_tune.cpp` also contains similar helper code for reports/routes.
+Implemented once in `autonomous_localization::performGlobalRelocalization()` in `src/autonomous_localization.cpp`. `localization_tune::performGlobalRelocalization()` delegates to it; the retired duplicate tune-harness implementation was removed.
 
 Relocalization behavior:
 
 - Captures 3 distance snapshots spaced 20 ms apart and median-combines them.
-- Requires at least 2 usable distance sensors.
-- First tries direct wall solve against cardinal headings:
-  - `0`, `90`, `180`, `-90` degrees.
-  - Needs at least one x-facing and one y-facing sensor and at least 2 sensors.
-- Accepts direct wall solve if confidence/variance gates pass.
+- Requires at least 2 usable distance sensors to attempt a solve and at least 3 scored sensors for a normal commit.
+- First tries a direct wall solve once at the trusted field-frame odometry/IMU heading. Walls solve X/Y and never steer heading.
+- A direct commit requires the three-sensor guard plus confidence, variance, mean-residual, and maximum-residual checks. A robust-outlier path can use two inliers only when at least three sensors were scored and the residual gates identify the excluded ray.
 - Otherwise runs MCL heading/pose seed search:
   - timeout `3500 ms`.
   - coarse heading hypotheses `16`.
@@ -354,14 +350,14 @@ Relocalization behavior:
   - iterations per hypothesis `6`.
   - relocalization particle count at least `2400` for global search and at least `1600` for wall seed search.
 - Strong accept:
-  - valid MCL, active sensors >= 2.
+  - valid MCL, active sensors >= 3.
   - confidence >= `0.22`.
   - variance gates <= fusion maxes.
 - Weak accept:
-  - active sensors >= 2.
-  - confidence >= `0.06` for 3+ sensors, `0.09` for 2 sensors.
+  - active sensors >= 3.
+  - confidence >= `0.06`.
   - XY variance <= min(fusion max, `64`), theta variance <= min(fusion max, `0.05`).
-- Status strings include `wall_direct`, `weak_accept`, `low_confidence`, `high_variance`, `not_enough_live_sensors`, `no_valid_pose`.
+- Status strings include `wall_direct`, `weak_accept`, `robust_outlier_accept`, `low_confidence`, `high_variance`, `not_enough_live_sensors`, `not_enough_commit_sensors`, and `no_valid_pose`.
 
 ## Localization Tune Runtime
 
@@ -377,9 +373,13 @@ The tune runtime starts:
 
 Tune tests in `src/localization_tune.cpp`:
 
+- Test 0: `Normal route`, objective full 4-motor validation autonomous with start relocalization/fallback.
 - Test 1: `Turn center`, objective angular PID and rotational center drift. 7 turn steps.
 - Test 2: `Straight scale`, objective forward/reverse distance scale and lateral drift. 4 move steps.
-- Test 3: `Square cross`, objective combined lateral PID, angular PID, tracking, and sensor fusion. 15 steps.
+- Test 3: `Square loop`, objective translation/turn behavior and return-home drift.
+- Test 4: `Drive probe`, objective open-loop drivetrain balance versus closed-loop motion.
+- Test 5: `Sensor angle`, objective stationary distance-sensor mounting-angle fit.
+- Test 6: `Square + cross`, objective long combined route with oblique segments and fusion opportunities.
 - Default test case in tune code is turn center.
 
 Tune logging:
@@ -466,7 +466,7 @@ Offline analyzer:
 ### If asked to change autonomous route
 
 1. Check `src/autonomous_control.cpp`.
-2. Decide whether `kLocalizationTuneTest` should remain enabled. If it is `1`, `2`, or `3`, normal route code will not run.
+2. Decide whether `kLocalizationTuneTest` should remain enabled. If it is `1` through `6`, normal route code will not run.
 3. Use `StartRelativeChassis` for normal authored route points unless the user explicitly wants absolute field commands.
 4. Keep startup states in `prepareAutonomousStart()` consistent with hardware.
 5. Use `waitUntilDone()`/`waitUntil()` as needed; remember LemLib commands default async.
@@ -523,9 +523,11 @@ Check, in order:
 
 - `kSmokeTestMode` is false.
 - `localization_tune::kEnabled` is true.
-- `kLocalizationTuneTest` in `src/autonomous_control.cpp` is `1`, so autonomous currently runs the turn/center tune test instead of the normal route.
+- `kLocalizationTuneTest` in `src/autonomous_control.cpp` is `0`, so autonomous currently runs the normal validation route.
+- `src/tune.txt` is a May 24 pre-calibration Test 5 sweep retained as historical evidence. Its analyzer output is location-specific, contains likely unmodeled occlusions, and is not sufficient by itself for new geometry changes.
+- `report/localization_report.tex` and the generated PDF summarize seven validation runs and the June audit. The boundary re-anchor and latest relocalization cleanup still require the physical protocol in `validation_data/field_test_protocol.md`.
 - The `MCL + EKF + Odom Newly improved` subfolder has build artifacts but no source. Do source work in the parent root.
-- `make quick` and `make library` were up to date when this file was written.
+- Re-run `make quick` after the current unpublished source changes; do not rely on the May build status.
 
 ## Verification Checklist
 

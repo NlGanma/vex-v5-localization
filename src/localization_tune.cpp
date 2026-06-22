@@ -20,7 +20,6 @@
 namespace localization_tune {
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
-constexpr float kPiOver2 = 1.5707963267948966f;
 constexpr std::uint32_t kTuneSettleMs = 5;
 constexpr std::uint32_t kTuneInitialSettleMs = 15;
 constexpr std::uint32_t kTuneMotionPollMs = 5;
@@ -33,20 +32,6 @@ constexpr float kTunePostMoveMaxResidual = 4.0f;
 constexpr int kTuneCheckpointCapacity = 32;
 constexpr const char* kTuneLogPath = "/usd/localization_tune_latest.txt";
 constexpr const char* kTuneInternalLogPath = "localization_tune_latest_internal.txt";
-constexpr std::uint32_t kRelocalizeTimeoutMs = 3500;
-constexpr float kRelocalizeMinConfidence = 0.22f;
-constexpr float kRelocalizeWeakConfidence = 0.06f;
-constexpr float kRelocalizeWeakConfidenceTwoSensors = 0.09f;
-constexpr float kRelocalizeWeakMaxVarXY = 64.0f;
-constexpr float kRelocalizeWeakMaxVarTheta = 0.05f;
-constexpr int kRelocalizeMinSensors = 2;
-constexpr float kRelocalizeStartupMaxRange = 96.0f;
-constexpr int kRelocalizeStartupMinConfidence = 12;
-constexpr int kRelocalizeSnapshotCount = 3;
-constexpr std::uint32_t kRelocalizeSnapshotSpacingMs = 20;
-constexpr int kRelocalizeCoarseHeadingHypotheses = 16;
-constexpr int kRelocalizeRefineHeadingHypotheses = 5;
-constexpr int kRelocalizeIterationsPerHypothesis = 6;
 constexpr int kTuneExportTapMinX = 200;
 constexpr int kTuneExportTapMinY = 120;
 constexpr std::uint32_t kTuneExportFeedbackMs = 2000;
@@ -90,7 +75,6 @@ enum class TuneTestCase {
     SquareCross = 6
 };
 enum class TuneLogOutputMode { Lean, DeepDive };
-enum class WallAxisDirection { PosX, NegX, PosY, NegY, Unknown };
 
 struct TuneTestDefinition {
     TuneTestCase id = TuneTestCase::TurnCenter;
@@ -173,22 +157,6 @@ constexpr std::array<AutonomousRouteStep, 4> kDriveProbeRoute {{
     {TuneMotionKind::Drive, "Open fwd 90", 0.0f, 27.0f, 0.0f, 1000, true, 0.0f, 90.0f, 0.0f, 0.0f},
     {TuneMotionKind::Drive, "Open rev 90", 0.0f, 0.0f, 0.0f, 1000, false, 0.0f, 90.0f, 0.0f, 0.0f},
 }};
-
-struct DirectWallSolveCandidate {
-    bool valid = false;
-    lemlib::Pose pose {0, 0, 0};
-    float meanAbsResidual = 0.0f;
-    int usedSensors = 0;
-    int xSensors = 0;
-    int ySensors = 0;
-};
-
-struct RelocalizationCandidate {
-    lemlib::localization::MCLMeasurement measurement {};
-    float seedHeading = 0.0f;
-    int iterations = 0;
-    bool hasMeasurement = false;
-};
 
 pros::Mutex tuneMutex;
 std::array<TuneCheckpoint, kTuneCheckpointCapacity> tuneCheckpoints {};
@@ -297,57 +265,6 @@ DistanceSnapshot captureDistances() {
     };
 }
 
-template <size_t N>
-SensorSnapshot combineSensorSnapshots(const std::array<SensorSnapshot, N>& samples) {
-    SensorSnapshot combined {};
-    std::array<float, N> distances {};
-    size_t distanceCount = 0;
-
-    // Distance is the median of valid samples (robust to a single bad reading);
-    // confidence is the best observed across samples. The two are aggregated
-    // independently, so the reported confidence is optimistic relative to the
-    // median sample -- bounded downstream by the relocalize accept threshold and
-    // residual gates, so it cannot manufacture a false accept.
-    for (const auto& sample : samples) {
-        if (sample.distance > 0.0f) distances[distanceCount++] = sample.distance;
-        if (sample.confidence > combined.confidence) combined.confidence = sample.confidence;
-    }
-
-    if (distanceCount == 0) return combined;
-
-    std::sort(distances.begin(), distances.begin() + static_cast<std::ptrdiff_t>(distanceCount));
-    if (distanceCount % 2 == 1) combined.distance = distances[distanceCount / 2];
-    else combined.distance = 0.5f * (distances[distanceCount / 2 - 1] + distances[distanceCount / 2]);
-
-    return combined;
-}
-
-DistanceSnapshot captureStableDistances() {
-    std::array<DistanceSnapshot, kRelocalizeSnapshotCount> snapshots {};
-    for (int i = 0; i < kRelocalizeSnapshotCount; ++i) {
-        snapshots[static_cast<size_t>(i)] = captureDistances();
-        if (i + 1 < kRelocalizeSnapshotCount) pros::delay(kRelocalizeSnapshotSpacingMs);
-    }
-
-    std::array<SensorSnapshot, kRelocalizeSnapshotCount> front {};
-    std::array<SensorSnapshot, kRelocalizeSnapshotCount> right {};
-    std::array<SensorSnapshot, kRelocalizeSnapshotCount> back {};
-    std::array<SensorSnapshot, kRelocalizeSnapshotCount> left {};
-    for (int i = 0; i < kRelocalizeSnapshotCount; ++i) {
-        front[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].front;
-        right[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].right;
-        back[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].back;
-        left[static_cast<size_t>(i)] = snapshots[static_cast<size_t>(i)].left;
-    }
-
-    return DistanceSnapshot {
-        combineSensorSnapshots(front),
-        combineSensorSnapshots(right),
-        combineSensorSnapshots(back),
-        combineSensorSnapshots(left),
-    };
-}
-
 DistanceSnapshot captureDistances(const lemlib::localization::TraceSample& sample) {
     auto convert = [](const lemlib::localization::TraceSensorInfo& sensor) {
         SensorSnapshot snapshot {};
@@ -361,18 +278,6 @@ DistanceSnapshot captureDistances(const lemlib::localization::TraceSample& sampl
         convert(sample.sensors[2]),
         convert(sample.sensors[3]),
     };
-}
-
-std::array<lemlib::localization::SensorObservation, 4> makeSensorObservations(const DistanceSnapshot& snapshot) {
-    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
-    std::array<lemlib::localization::SensorObservation, 4> observations {};
-    for (size_t i = 0; i < samples.size(); ++i) {
-        if (samples[i].distance <= 0.0f) continue;
-        observations[i].available = true;
-        observations[i].distance = samples[i].distance;
-        observations[i].confidence = samples[i].confidence;
-    }
-    return observations;
 }
 
 float wrapDegrees(float degrees) {
@@ -1002,270 +907,6 @@ void storeTuneCheckpoint(const char* name, const lemlib::Pose& expected) {
         "Tune checkpoint {} expected={} reported={} err=({:.2f}, {:.2f}, {:.2f} deg) active={} conf={:.2f} accept={}",
         name, expected, checkpoint.reported, errorX, errorY, errorTheta, checkpoint.debug.activeSensors,
         checkpoint.debug.mclConfidence, checkpoint.debug.correctionAccepted);
-}
-
-float currentHeadingRadians() {
-    const double imuRotationDeg = imu.get_rotation();
-    if (std::isfinite(imuRotationDeg)) return wrapRadians(lemlib::degToRad(static_cast<float>(imuRotationDeg)));
-    return wrapRadians(chassis.getPose(true).theta);
-}
-
-bool sensorSnapshotUsable(const SensorSnapshot& snapshot, const lemlib::localization::SensorConfig& sensor) {
-    if (snapshot.distance < sensor.minRange || snapshot.distance > sensor.maxRange) return false;
-    if (snapshot.confidence >= 0 && snapshot.confidence < sensor.minConfidence) return false;
-    return snapshot.distance > 0.0f;
-}
-
-int countUsableDistanceSnapshots(const lemlib::localization::LocalizationConfig& config,
-                                 const DistanceSnapshot& snapshot) {
-    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
-    int count = 0;
-    for (size_t i = 0; i < samples.size(); ++i) {
-        if (config.sensors[i].sensor == nullptr) continue;
-        if (sensorSnapshotUsable(samples[i], config.sensors[i])) ++count;
-    }
-    return count;
-}
-
-WallAxisDirection classifyWallAxisDirection(float heading) {
-    const float normalized = wrapRadians(heading);
-    const float absHeading = std::fabs(normalized);
-    if (std::fabs(normalized) <= lemlib::degToRad(30.0f)) return WallAxisDirection::PosY;
-    if (std::fabs(absHeading - kPi) <= lemlib::degToRad(30.0f)) return WallAxisDirection::NegY;
-    if (std::fabs(normalized - kPiOver2) <= lemlib::degToRad(30.0f)) return WallAxisDirection::PosX;
-    if (std::fabs(normalized + kPiOver2) <= lemlib::degToRad(30.0f)) return WallAxisDirection::NegX;
-    return WallAxisDirection::Unknown;
-}
-
-DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::LocalizationConfig& config,
-                                             const DistanceSnapshot& snapshot, float heading) {
-    DirectWallSolveCandidate candidate {};
-    candidate.pose.theta = wrapRadians(heading);
-
-    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
-    float xSum = 0.0f;
-    float ySum = 0.0f;
-
-    for (size_t i = 0; i < samples.size(); ++i) {
-        const auto& sensor = config.sensors[i];
-        const auto& sample = samples[i];
-        if (sensor.sensor == nullptr || !sensorSnapshotUsable(sample, sensor)) continue;
-
-        const float sinTheta = std::sin(candidate.pose.theta);
-        const float cosTheta = std::cos(candidate.pose.theta);
-        const float sensorGlobalX = sensor.dx * cosTheta + sensor.dy * sinTheta;
-        const float sensorGlobalY = -sensor.dx * sinTheta + sensor.dy * cosTheta;
-        const float sensorHeading = candidate.pose.theta + sensor.dtheta;
-        const float rayDirX = std::sin(sensorHeading);
-        const float rayDirY = std::cos(sensorHeading);
-        const auto axis = classifyWallAxisDirection(sensorHeading);
-
-        switch (axis) {
-            case WallAxisDirection::PosX:
-                xSum += config.field.maxX - rayDirX * sample.distance - sensorGlobalX;
-                ++candidate.xSensors;
-                ++candidate.usedSensors;
-                break;
-            case WallAxisDirection::NegX:
-                xSum += config.field.minX - rayDirX * sample.distance - sensorGlobalX;
-                ++candidate.xSensors;
-                ++candidate.usedSensors;
-                break;
-            case WallAxisDirection::PosY:
-                ySum += config.field.maxY - rayDirY * sample.distance - sensorGlobalY;
-                ++candidate.ySensors;
-                ++candidate.usedSensors;
-                break;
-            case WallAxisDirection::NegY:
-                ySum += config.field.minY - rayDirY * sample.distance - sensorGlobalY;
-                ++candidate.ySensors;
-                ++candidate.usedSensors;
-                break;
-            case WallAxisDirection::Unknown:
-                break;
-        }
-    }
-
-    if (candidate.xSensors == 0 || candidate.ySensors == 0 || candidate.usedSensors < 2) return candidate;
-
-    candidate.pose.x = xSum / static_cast<float>(candidate.xSensors);
-    candidate.pose.y = ySum / static_cast<float>(candidate.ySensors);
-
-    float residualSum = 0.0f;
-    int residualCount = 0;
-    for (size_t i = 0; i < samples.size(); ++i) {
-        const auto& sensor = config.sensors[i];
-        const auto& sample = samples[i];
-        if (sensor.sensor == nullptr || !sensorSnapshotUsable(sample, sensor)) continue;
-
-        const float sinTheta = std::sin(candidate.pose.theta);
-        const float cosTheta = std::cos(candidate.pose.theta);
-        const float sensorX = candidate.pose.x + sensor.dx * cosTheta + sensor.dy * sinTheta;
-        const float sensorY = candidate.pose.y - sensor.dx * sinTheta + sensor.dy * cosTheta;
-        const float sensorHeading = candidate.pose.theta + sensor.dtheta;
-        const float rayDirX = std::sin(sensorHeading);
-        const float rayDirY = std::cos(sensorHeading);
-
-        float predicted = -1.0f;
-        switch (classifyWallAxisDirection(sensorHeading)) {
-            case WallAxisDirection::PosX: predicted = (config.field.maxX - sensorX) / rayDirX; break;
-            case WallAxisDirection::NegX: predicted = (config.field.minX - sensorX) / rayDirX; break;
-            case WallAxisDirection::PosY: predicted = (config.field.maxY - sensorY) / rayDirY; break;
-            case WallAxisDirection::NegY: predicted = (config.field.minY - sensorY) / rayDirY; break;
-            case WallAxisDirection::Unknown: break;
-        }
-        if (predicted <= 0.0f) continue;
-
-        residualSum += std::fabs(predicted - sample.distance);
-        ++residualCount;
-    }
-
-    if (residualCount == 0) return candidate;
-
-    candidate.meanAbsResidual = residualSum / static_cast<float>(residualCount);
-    const bool insideField = candidate.pose.x >= config.field.minX && candidate.pose.x <= config.field.maxX &&
-                             candidate.pose.y >= config.field.minY && candidate.pose.y <= config.field.maxY;
-    candidate.valid = insideField;
-    return candidate;
-}
-
-bool relocalizationAccepted(const lemlib::localization::MCLMeasurement& measurement,
-                            const lemlib::localization::LocalizationConfig& config) {
-    return measurement.valid && measurement.activeSensors >= kRelocalizeMinSensors &&
-           measurement.confidence >= kRelocalizeMinConfidence &&
-           measurement.covariance.m[0][0] <= config.fusion.maxVarXY &&
-           measurement.covariance.m[1][1] <= config.fusion.maxVarXY &&
-           measurement.covariance.m[2][2] <= config.fusion.maxVarTheta;
-}
-
-bool relocalizationWeakAccepted(const lemlib::localization::MCLMeasurement& measurement,
-                                const lemlib::localization::LocalizationConfig& config) {
-    if (!measurement.valid || measurement.activeSensors < kRelocalizeMinSensors) return false;
-
-    const float maxVarXY = std::min(config.fusion.maxVarXY, kRelocalizeWeakMaxVarXY);
-    const float maxVarTheta = std::min(config.fusion.maxVarTheta, kRelocalizeWeakMaxVarTheta);
-    if (measurement.covariance.m[0][0] > maxVarXY || measurement.covariance.m[1][1] > maxVarXY ||
-        measurement.covariance.m[2][2] > maxVarTheta) {
-        return false;
-    }
-
-    const float minConfidence =
-        measurement.activeSensors >= 3 ? kRelocalizeWeakConfidence : kRelocalizeWeakConfidenceTwoSensors;
-    return measurement.confidence >= minConfidence;
-}
-
-bool relocalizationWallDirectAccepted(const RelocalizationSummary& summary,
-                                      const lemlib::localization::LocalizationConfig& config) {
-    return summary.activeSensors >= kRelocalizeMinSensors &&
-           summary.confidence >= kRelocalizeMinConfidence && summary.varX <= config.fusion.maxVarXY &&
-           summary.varY <= config.fusion.maxVarXY && summary.varTheta <= config.fusion.maxVarTheta;
-}
-
-const char* relocalizationStatus(const lemlib::localization::MCLMeasurement& measurement,
-                                 const lemlib::localization::LocalizationConfig& config) {
-    if (!measurement.valid) return "no_valid_pose";
-    if (measurement.activeSensors < kRelocalizeMinSensors) return "not_enough_live_sensors";
-    if (relocalizationWeakAccepted(measurement, config)) return "weak_accept";
-    if (measurement.confidence < kRelocalizeMinConfidence) return "low_confidence";
-    if (measurement.covariance.m[0][0] > config.fusion.maxVarXY ||
-        measurement.covariance.m[1][1] > config.fusion.maxVarXY ||
-        measurement.covariance.m[2][2] > config.fusion.maxVarTheta) {
-        return "high_variance";
-    }
-    return "accepted";
-}
-
-bool relocalizationMeasurementBetter(const lemlib::localization::MCLMeasurement& lhs,
-                                     const lemlib::localization::MCLMeasurement& rhs,
-                                     const lemlib::localization::LocalizationConfig& config) {
-    const bool lhsAccepted = relocalizationAccepted(lhs, config);
-    const bool rhsAccepted = relocalizationAccepted(rhs, config);
-    if (lhsAccepted != rhsAccepted) return lhsAccepted;
-    const bool lhsWeakAccepted = relocalizationWeakAccepted(lhs, config);
-    const bool rhsWeakAccepted = relocalizationWeakAccepted(rhs, config);
-    if (lhsWeakAccepted != rhsWeakAccepted) return lhsWeakAccepted;
-    if (lhs.valid != rhs.valid) return lhs.valid;
-    if (lhs.activeSensors != rhs.activeSensors) return lhs.activeSensors > rhs.activeSensors;
-    if (std::fabs(lhs.confidence - rhs.confidence) > 1e-5f) return lhs.confidence > rhs.confidence;
-
-    const float lhsVarXY = lhs.covariance.m[0][0] + lhs.covariance.m[1][1];
-    const float rhsVarXY = rhs.covariance.m[0][0] + rhs.covariance.m[1][1];
-    if (std::fabs(lhsVarXY - rhsVarXY) > 1e-5f) return lhsVarXY < rhsVarXY;
-    if (std::fabs(lhs.covariance.m[2][2] - rhs.covariance.m[2][2]) > 1e-6f) {
-        return lhs.covariance.m[2][2] < rhs.covariance.m[2][2];
-    }
-
-    return false;
-}
-
-bool relocalizationCandidateBetter(const RelocalizationCandidate& lhs, const RelocalizationCandidate& rhs,
-                                   const lemlib::localization::LocalizationConfig& config) {
-    if (lhs.hasMeasurement != rhs.hasMeasurement) return lhs.hasMeasurement;
-    if (!lhs.hasMeasurement) return false;
-    return relocalizationMeasurementBetter(lhs.measurement, rhs.measurement, config);
-}
-
-RelocalizationCandidate evaluateRelocalizationHeading(const lemlib::localization::LocalizationConfig& config,
-                                                      const lemlib::localization::MCLConfig& baseConfig,
-                                                      const std::array<lemlib::localization::SensorObservation, 4>& observations,
-                                                      float heading, float headingStd, std::uint32_t deadlineMs) {
-    RelocalizationCandidate candidate {};
-    candidate.seedHeading = wrapRadians(heading);
-
-    auto candidateConfig = baseConfig;
-    candidateConfig.initStdTheta = headingStd;
-
-    lemlib::localization::MCL relocalizer;
-    relocalizer.configure(config.field, candidateConfig, config.sensors);
-    relocalizer.reset(lemlib::Pose(0.0f, 0.0f, candidate.seedHeading));
-
-    for (int i = 0; i < kRelocalizeIterationsPerHypothesis && pros::millis() < deadlineMs; ++i) {
-        const auto measurement = relocalizer.update(observations);
-        ++candidate.iterations;
-
-        if (!candidate.hasMeasurement || relocalizationMeasurementBetter(measurement, candidate.measurement, config)) {
-            candidate.measurement = measurement;
-            candidate.hasMeasurement = true;
-        }
-
-        if (relocalizationAccepted(measurement, config)) {
-            candidate.measurement = measurement;
-            candidate.hasMeasurement = true;
-            break;
-        }
-    }
-
-    return candidate;
-}
-
-RelocalizationCandidate evaluateRelocalizationPoseSeed(const lemlib::localization::LocalizationConfig& config,
-                                                       const lemlib::localization::MCLConfig& baseConfig,
-                                                       const std::array<lemlib::localization::SensorObservation, 4>& observations,
-                                                       const lemlib::Pose& seedPose, std::uint32_t deadlineMs) {
-    RelocalizationCandidate candidate {};
-    candidate.seedHeading = wrapRadians(seedPose.theta);
-
-    lemlib::localization::MCL relocalizer;
-    relocalizer.configure(config.field, baseConfig, config.sensors);
-    relocalizer.reset(seedPose);
-
-    for (int i = 0; i < kRelocalizeIterationsPerHypothesis && pros::millis() < deadlineMs; ++i) {
-        const auto measurement = relocalizer.update(observations);
-        ++candidate.iterations;
-
-        if (!candidate.hasMeasurement || relocalizationMeasurementBetter(measurement, candidate.measurement, config)) {
-            candidate.measurement = measurement;
-            candidate.hasMeasurement = true;
-        }
-
-        if (relocalizationAccepted(measurement, config)) {
-            candidate.measurement = measurement;
-            candidate.hasMeasurement = true;
-            break;
-        }
-    }
-
-    return candidate;
 }
 
 bool waitForTuneMotionCompletion(TuneMotionKind kind, const lemlib::Pose& expected, int timeoutMs, bool allowAbort) {

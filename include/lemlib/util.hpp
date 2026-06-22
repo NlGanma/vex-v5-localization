@@ -82,7 +82,7 @@ constexpr float sanitizeAngle(float angle, bool radians = true);
  *
  * @param target target angle
  * @param position position angle
- * @param radians true if angle is in radians, false if not. False by default
+ * @param radians true if angle is in radians, false if not. True by default
  * @param direction which direction to turn to get to the target angle
  * @return float wrapped angle
  *

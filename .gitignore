@@ -16,6 +16,8 @@ temp.errors
 *.ini
 .d/
 tools/localization_calibration_logs/
+__pycache__/
+*.py[cod]
 
 # template files
 *.zip
@@ -25,6 +27,11 @@ docs/package-lock.json
 docs/package.json
 docs/node_modules/
 latex
+report/*.aux
+report/*.fdb_latexmk
+report/*.fls
+report/*.log
+report/*.out
 
 # MacOS
 .DS_Store

@@ -31,13 +31,12 @@ constexpr float kRelocalizeMaxMeanResidual = 5.0f;
 constexpr float kRelocalizeMaxResidual = 12.0f;
 constexpr int kDirectWallCommitMinSensors = 3;
 constexpr int kRelocalizeCommitMinSensors = 3;
-// At competition start the IMU heading is a strong, drift-free prior. Use it to
-// break the near-square field's 90/180 deg wall-distance aliasing: penalize
-// candidate headings that disagree with the IMU, and refuse to commit a
-// wall_direct solve whose snapped cardinal fights the IMU beyond this window.
-constexpr float kRelocalizeHeadingPriorWeightPerRad = 6.0f;
-constexpr float kRelocalizeMaxHeadingDisagreementRad = 0.6981317f; // 40 deg
-constexpr float kRelocalizeHeadingTiebreakRad = 0.3490659f;        // 20 deg
+// At start the field-frame heading prior (odometry heading, IMU-driven) is
+// strong and drift-free. The wall solve runs AT that heading (never snapped
+// cardinals), so wall-distance aliasing cannot steer heading at all; the MCL
+// fallback sweep below still uses the prior as a tiebreak between otherwise
+// comparable hypotheses on the near-square field.
+constexpr float kRelocalizeHeadingTiebreakRad = 0.3490659f; // 20 deg
 
 enum class WallAxisDirection { PosX, NegX, PosY, NegY, Unknown };
 
@@ -148,8 +147,11 @@ float wrapRadians(float radians) {
 }
 
 float currentHeadingRadians() {
-    const double imuRotationDeg = imu.get_rotation();
-    if (std::isfinite(imuRotationDeg)) return wrapRadians(lemlib::degToRad(static_cast<float>(imuRotationDeg)));
+    // Field-frame heading prior. Odometry heading is the IMU rotation integrated
+    // on top of whatever pose was last set (setPose offsets included), so it is
+    // correct for ANY configured start heading. Raw imu.get_rotation() is only
+    // field-aligned when the start heading is exactly 0 deg, which made every
+    // non-zero start a silent landmine for the alias gating below.
     return wrapRadians(chassis.getPose(true).theta);
 }
 
@@ -752,25 +754,18 @@ RelocalizationSummary performGlobalRelocalization() {
         return summary;
     }
 
-    DirectWallSolveCandidate bestWallSolve {};
-    std::array<DirectWallSolveCandidate, 4> wallCandidates {};
-    int wallCandidateCount = 0;
-    const std::array<float, 4> axisHeadings {0.0f, kPiOver2, kPi, -kPiOver2};
-    float bestWallScore = 1.0e9f;
-    for (const float axisHeading : axisHeadings) {
-        const auto candidate = solveDirectWallPose(relocalizeLocConfig, summary.distances, axisHeading, priorPose);
-        if (!candidate.valid) continue;
-        if (wallCandidateCount < static_cast<int>(wallCandidates.size())) wallCandidates[wallCandidateCount++] = candidate;
-        // Bias selection toward the IMU heading so a 90/180 deg-rotated alias on
-        // the near-square field cannot win on a marginally lower residual.
-        const float headingPenalty =
-            kRelocalizeHeadingPriorWeightPerRad * std::fabs(wrapRadians(candidate.pose.theta - summary.imuHeading));
-        const float adjustedScore = candidate.selectionScore + headingPenalty;
-        if (!bestWallSolve.valid || adjustedScore < bestWallScore) {
-            bestWallSolve = candidate;
-            bestWallScore = adjustedScore;
-        }
-    }
+    // Solve the walls once, at the trusted field-frame heading. Heading is never
+    // taken from the walls: on a near-square field a 90/180 deg-rotated alias can
+    // match the ranges almost as well as the truth, and committing a snapped
+    // cardinal would overwrite the IMU-true heading with up to the classification
+    // window (+-30 deg) of error while the residual gates stay quiet (close-wall
+    // starts shrink residuals faster than heading error grows). Solving at the
+    // IMU/odom heading keeps the ray model exact for off-cardinal placements and
+    // removes the alias trap entirely; X/Y still comes from the walls.
+    const DirectWallSolveCandidate bestWallSolve =
+        solveDirectWallPose(relocalizeLocConfig, summary.distances, summary.imuHeading, priorPose);
+    std::array<DirectWallSolveCandidate, 1> wallCandidates {bestWallSolve};
+    const int wallCandidateCount = bestWallSolve.valid ? 1 : 0;
 
     if (bestWallSolve.valid) {
         summary.headingMode = "wall_direct";
@@ -784,18 +779,15 @@ RelocalizationSummary performGlobalRelocalization() {
         const float varianceResidual = std::max(residuals.meanAbsResidual, residuals.maxAbsResidual * 0.5f);
         summary.varX = std::max(varianceResidual * varianceResidual, 4.0f);
         summary.varY = summary.varX;
-        // Honest heading variance: the committed theta is a snapped cardinal, so
-        // its uncertainty is at least its disagreement with the trusted IMU.
-        const float wallHeadingDisagreement = std::fabs(wrapRadians(summary.pose.theta - summary.imuHeading));
-        summary.varTheta = std::max(lemlib::degToRad(3.0f) * lemlib::degToRad(3.0f),
-                                    wallHeadingDisagreement * wallHeadingDisagreement);
+        // The committed theta IS the trusted heading prior (the walls contribute
+        // X/Y only), so heading uncertainty is the prior's own; keep a 3 deg floor.
+        summary.varTheta = lemlib::degToRad(3.0f) * lemlib::degToRad(3.0f);
         summary.meanResidual = residuals.meanAbsResidual;
         summary.maxResidual = residuals.maxAbsResidual;
         summary.activeSensors = residuals.inlierSensors;
         summary.scoredSensors = residuals.scoredSensors;
         const bool normalResidualsAccepted = residualsAccepted(residuals, kDirectWallCommitMinSensors);
-        const bool wallHeadingConsistent = wallHeadingDisagreement <= kRelocalizeMaxHeadingDisagreementRad;
-        if (wallHeadingConsistent && relocalizationWallDirectAccepted(summary, bestWallSolve, relocalizeLocConfig) &&
+        if (relocalizationWallDirectAccepted(summary, bestWallSolve, relocalizeLocConfig) &&
             normalResidualsAccepted) {
             summary.success = true;
             summary.status = "wall_direct";
@@ -803,7 +795,7 @@ RelocalizationSummary performGlobalRelocalization() {
         }
 
         if (usableSnapshots < kRelocalizeCommitMinSensors) {
-            summary.status = !wallHeadingConsistent ? "imu_heading_mismatch" : "not_enough_commit_sensors";
+            summary.status = "not_enough_commit_sensors";
             return summary;
         }
     }

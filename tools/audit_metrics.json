@@ -1,0 +1,1675 @@
+{
+ "run1": {
+  "name": "run1",
+  "meta": {
+   "test_case": "1 Turn center",
+   "status": "Complete",
+   "start_pose": "-16.6 -46.5 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "-16.6 -46.5 0.0",
+   "relocalize_conf": "0.950 active=2 scored=2 iter=0",
+   "relocalize_residual": "0.000 0.000",
+   "relocalize_var": "4.000 4.000 0.00274",
+   "checkpoint_count": "0",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.95,
+   "reloc_active": 2,
+   "reloc_scored": 2,
+   "compiled": "May 31 2026 18:25:41"
+  },
+  "model_err_n": 918,
+  "rows": 984,
+  "duration_s": 10.67,
+  "path_in": 135.3,
+  "motion_pct": 87.9,
+  "scans": 197,
+  "accepted_scans": 0,
+  "accept_events": 0,
+  "accepts": [],
+  "reject_hist": {
+   "unstable_candidate": 78,
+   "motion_suppressed": 173,
+   "not_enough_sensors": 181,
+   "readiness": 181,
+   "sensor_residual": 60,
+   "pose_delta": 135,
+   "no_measurement": 8,
+   "turn_suppressed": 3
+  },
+  "nis_med": 1.775,
+  "nis_p90": 4.252,
+  "nis_max": 4.529,
+  "booked_drift_in": 0.0,
+  "drift_rate_per100": 0.0,
+  "max_seg_in": 135.3,
+  "tail_seg_in": 135.3,
+  "raw_model_max": 0.0,
+  "new_model_max": 0.0,
+  "new_model_end": 0.0,
+  "factor": 1.0,
+  "staircase_violation_in": 0.0,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.0,
+  "applied_total_in": 0.0,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.0,
+  "end_ekf_minus_odom_in": 0.0,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 180,
+    "med_abs_res": 3.8311,
+    "p90_abs_res": 7.3438,
+    "max_abs_res": 22.3084
+   },
+   "right": {
+    "used_rows": 770,
+    "med_abs_res": 14.9233,
+    "p90_abs_res": 45.2133,
+    "max_abs_res": 89.2991
+   },
+   "back": {
+    "used_rows": 735,
+    "med_abs_res": 8.7019,
+    "p90_abs_res": 11.6147,
+    "max_abs_res": 30.4236
+   },
+   "left": {
+    "used_rows": 555,
+    "med_abs_res": 6.4254,
+    "p90_abs_res": 9.1097,
+    "max_abs_res": 38.8357
+   }
+  },
+  "model_err_max": 0.0005,
+  "model_err_med": 0.0,
+  "wall_repro_err": 0.0512
+ },
+ "run2": {
+  "name": "run2",
+  "meta": {
+   "test_case": "3 Square loop",
+   "status": "Complete",
+   "start_pose": "-27.2 -38.6 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "-27.2 -38.6 0.0",
+   "relocalize_conf": "0.950 active=3 scored=3 iter=0",
+   "relocalize_residual": "0.827 1.292",
+   "relocalize_var": "4.000 4.000 0.00274",
+   "checkpoint_count": "8",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.95,
+   "reloc_active": 3,
+   "reloc_scored": 3,
+   "compiled": "May 31 2026 19:03:03"
+  },
+  "model_err_n": 908,
+  "rows": 1133,
+  "duration_s": 12.41,
+  "path_in": 122.6,
+  "motion_pct": 93.1,
+  "scans": 228,
+  "accepted_scans": 2,
+  "accept_events": 2,
+  "accepts": [
+   {
+    "t": 2.101,
+    "path": 24.833691546397773,
+    "cx": -0.0965,
+    "cy": -0.7739,
+    "mag": 0.7798932362830184,
+    "nis": 0.109662,
+    "active": 3,
+    "inl": 3,
+    "mean_res": 0.878,
+    "max_res": 1.3163
+   },
+   {
+    "t": 5.442,
+    "path": 57.14630282931483,
+    "cx": -0.024,
+    "cy": -2.0019,
+    "mag": 2.0020438581609543,
+    "nis": 0.068559,
+    "active": 3,
+    "inl": 2,
+    "mean_res": 6.6201,
+    "max_res": 18.7181
+   }
+  ],
+  "reject_hist": {
+   "unstable_candidate": 61,
+   "motion_suppressed": 211,
+   "not_enough_sensors": 164,
+   "readiness": 164,
+   "no_measurement": 14,
+   "pose_delta": 120,
+   "sensor_residual": 83
+  },
+  "nis_med": 0.257,
+  "nis_p90": 2.747,
+  "nis_max": 6.701,
+  "booked_drift_in": 2.195,
+  "drift_rate_per100": 1.791,
+  "max_seg_in": 65.4,
+  "tail_seg_in": 65.4,
+  "raw_model_max": 2.195,
+  "new_model_max": 1.172,
+  "new_model_end": 1.172,
+  "factor": 1.87,
+  "staircase_violation_in": 0.0001,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.0255,
+  "applied_total_in": 0.94,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.926,
+  "end_ekf_minus_odom_in": 1.269,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 685,
+    "med_abs_res": 19.2678,
+    "p90_abs_res": 27.4794,
+    "max_abs_res": 70.7047
+   },
+   "right": {
+    "used_rows": 817,
+    "med_abs_res": 3.4475,
+    "p90_abs_res": 6.7666,
+    "max_abs_res": 63.6221
+   },
+   "back": {
+    "used_rows": 407,
+    "med_abs_res": 1.9239,
+    "p90_abs_res": 9.7466,
+    "max_abs_res": 65.111
+   },
+   "left": {
+    "used_rows": 887,
+    "med_abs_res": 6.7824,
+    "p90_abs_res": 10.2047,
+    "max_abs_res": 29.4271
+   }
+  },
+  "model_err_max": 0.0002,
+  "model_err_med": 0.0,
+  "checkpoints": [
+   {
+    "idx": 1,
+    "name": "Start hold",
+    "exp": [
+     -27.2,
+     -38.6,
+     0.0
+    ],
+    "rep": [
+     -27.2,
+     -38.6,
+     -0.0
+    ],
+    "err": [
+     -0.0,
+     0.0,
+     -0.0
+    ],
+    "active": 0,
+    "conf": 0.0,
+    "accepted": 0,
+    "mask": 0,
+    "stable": "0/0",
+    "inl": 0,
+    "nis": -1.0
+   },
+   {
+    "idx": 2,
+    "name": "Square north",
+    "exp": [
+     -27.2,
+     -14.6,
+     0.0
+    ],
+    "rep": [
+     -26.8,
+     -16.6,
+     -0.5
+    ],
+    "err": [
+     0.5,
+     -2.1,
+     -0.5
+    ],
+    "active": 3,
+    "conf": 0.93,
+    "accepted": 1,
+    "mask": 0,
+    "stable": "37/2",
+    "inl": 3,
+    "nis": 0.11
+   },
+   {
+    "idx": 3,
+    "name": "Face east",
+    "exp": [
+     -27.2,
+     -14.6,
+     90.0
+    ],
+    "rep": [
+     -27.7,
+     -17.0,
+     84.9
+    ],
+    "err": [
+     -0.4,
+     -2.4,
+     -5.1
+    ],
+    "active": 3,
+    "conf": 0.78,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "9/4",
+    "inl": 0,
+    "nis": 5.21
+   },
+   {
+    "idx": 4,
+    "name": "Square east",
+    "exp": [
+     -3.2,
+     -14.6,
+     90.0
+    ],
+    "rep": [
+     -5.3,
+     -14.9,
+     88.7
+    ],
+    "err": [
+     -2.1,
+     -0.4,
+     -1.3
+    ],
+    "active": 3,
+    "conf": 0.87,
+    "accepted": 1,
+    "mask": 0,
+    "stable": "17/4",
+    "inl": 2,
+    "nis": 0.07
+   },
+   {
+    "idx": 5,
+    "name": "Face south",
+    "exp": [
+     -3.2,
+     -14.6,
+     180.0
+    ],
+    "rep": [
+     -5.4,
+     -14.2,
+     174.6
+    ],
+    "err": [
+     -2.1,
+     0.4,
+     -5.4
+    ],
+    "active": 3,
+    "conf": 0.65,
+    "accepted": 0,
+    "mask": 292,
+    "stable": "9/4",
+    "inl": 0,
+    "nis": 1.05
+   },
+   {
+    "idx": 6,
+    "name": "Square south",
+    "exp": [
+     -3.2,
+     -38.6,
+     180.0
+    ],
+    "rep": [
+     -3.6,
+     -36.6,
+     178.7
+    ],
+    "err": [
+     -0.4,
+     2.0,
+     -1.3
+    ],
+    "active": 3,
+    "conf": 0.79,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "47/4",
+    "inl": 0,
+    "nis": 0.17
+   },
+   {
+    "idx": 7,
+    "name": "Face west",
+    "exp": [
+     -3.2,
+     -38.6,
+     -90.0
+    ],
+    "rep": [
+     -2.1,
+     -36.1,
+     265.2
+    ],
+    "err": [
+     1.1,
+     2.5,
+     -4.8
+    ],
+    "active": 2,
+    "conf": 0.86,
+    "accepted": 0,
+    "mask": 52,
+    "stable": "8/4",
+    "inl": 0,
+    "nis": 0.61
+   },
+   {
+    "idx": 8,
+    "name": "Return home",
+    "exp": [
+     -27.2,
+     -38.6,
+     -90.0
+    ],
+    "rep": [
+     -24.3,
+     -38.5,
+     269.1
+    ],
+    "err": [
+     3.0,
+     0.0,
+     -0.9
+    ],
+    "active": 2,
+    "conf": 0.82,
+    "accepted": 0,
+    "mask": 36,
+    "stable": "48/4",
+    "inl": 2,
+    "nis": 0.21
+   }
+  ],
+  "wall_repro_err": 0.1113
+ },
+ "run3": {
+  "name": "run3",
+  "meta": {
+   "test_case": "6 Square + cross",
+   "status": "Complete",
+   "start_pose": "-26.0 -33.0 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "-26.0 -33.0 0.0",
+   "relocalize_conf": "0.950 active=3 scored=3 iter=0",
+   "relocalize_residual": "0.725 1.133",
+   "relocalize_var": "4.000 4.000 0.00274",
+   "checkpoint_count": "16",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.95,
+   "reloc_active": 3,
+   "reloc_scored": 3,
+   "compiled": "May 31 2026 19:14:50"
+  },
+  "model_err_n": 816,
+  "rows": 3060,
+  "duration_s": 32.47,
+  "path_in": 334.7,
+  "motion_pct": 94.8,
+  "scans": 614,
+  "accepted_scans": 5,
+  "accept_events": 5,
+  "accepts": [
+   {
+    "t": 2.089,
+    "path": 25.315404029173017,
+    "cx": -0.4059,
+    "cy": -0.8206,
+    "mag": 0.9154994101581934,
+    "nis": 0.145957,
+    "active": 3,
+    "inl": 3,
+    "mean_res": 0.8655,
+    "max_res": 1.2564
+   },
+   {
+    "t": 5.497,
+    "path": 58.55792461741516,
+    "cx": -0.2548,
+    "cy": -1.4745,
+    "mag": 1.4963533306007641,
+    "nis": 0.024682,
+    "active": 3,
+    "inl": 2,
+    "mean_res": 22.8247,
+    "max_res": 68.2394
+   },
+   {
+    "t": 23.671,
+    "path": 246.05160716911027,
+    "cx": -0.8601,
+    "cy": -1.5532,
+    "mag": 1.7754442401832844,
+    "nis": 0.028604,
+    "active": 3,
+    "inl": 3,
+    "mean_res": 0.9762,
+    "max_res": 1.495
+   },
+   {
+    "t": 31.231,
+    "path": 325.20205509539244,
+    "cx": -0.6553,
+    "cy": -3.7165,
+    "mag": 3.773829664942497,
+    "nis": 0.286919,
+    "active": 2,
+    "inl": 2,
+    "mean_res": 0.1793,
+    "max_res": 0.2041
+   },
+   {
+    "t": 32.441,
+    "path": 334.6824572820891,
+    "cx": 0.1059,
+    "cy": -1.8583,
+    "mag": 1.8613150458748247,
+    "nis": 1.603067,
+    "active": 3,
+    "inl": 3,
+    "mean_res": 1.0976,
+    "max_res": 1.535
+   }
+  ],
+  "reject_hist": {
+   "unstable_candidate": 409,
+   "motion_suppressed": 580,
+   "not_enough_sensors": 444,
+   "readiness": 447,
+   "sensor_residual": 99,
+   "no_measurement": 246,
+   "pose_delta": 186,
+   "sensors_stale": 28
+  },
+  "nis_med": 0.771,
+  "nis_p90": 9.485,
+  "nis_max": 15.86,
+  "booked_drift_in": 3.853,
+  "drift_rate_per100": 1.151,
+  "max_seg_in": 187.5,
+  "tail_seg_in": 0.0,
+  "raw_model_max": 3.853,
+  "new_model_max": 2.158,
+  "new_model_end": 0.0,
+  "factor": 1.79,
+  "staircase_violation_in": 0.0001,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.024,
+  "applied_total_in": 2.13,
+  "cap_violations": 0,
+  "end_net_applied_in": 2.086,
+  "end_ekf_minus_odom_in": 1.824,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 1315,
+    "med_abs_res": 9.3664,
+    "p90_abs_res": 69.3588,
+    "max_abs_res": 74.0009
+   },
+   "right": {
+    "used_rows": 1451,
+    "med_abs_res": 3.806,
+    "p90_abs_res": 7.8921,
+    "max_abs_res": 87.101
+   },
+   "back": {
+    "used_rows": 1021,
+    "med_abs_res": 2.253,
+    "p90_abs_res": 7.2884,
+    "max_abs_res": 69.2966
+   },
+   "left": {
+    "used_rows": 1721,
+    "med_abs_res": 4.114,
+    "p90_abs_res": 8.4819,
+    "max_abs_res": 28.761
+   }
+  },
+  "model_err_max": 0.0004,
+  "model_err_med": 0.0,
+  "checkpoints": [
+   {
+    "idx": 1,
+    "name": "Start hold",
+    "exp": [
+     -26.0,
+     -33.0,
+     0.0
+    ],
+    "rep": [
+     -26.0,
+     -33.0,
+     0.0
+    ],
+    "err": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "active": 0,
+    "conf": 0.0,
+    "accepted": 0,
+    "mask": 0,
+    "stable": "0/0",
+    "inl": 0,
+    "nis": -1.0
+   },
+   {
+    "idx": 2,
+    "name": "Square north",
+    "exp": [
+     -26.0,
+     -9.0,
+     0.0
+    ],
+    "rep": [
+     -26.1,
+     -11.1,
+     -0.7
+    ],
+    "err": [
+     -0.1,
+     -2.1,
+     -0.7
+    ],
+    "active": 3,
+    "conf": 0.6,
+    "accepted": 1,
+    "mask": 0,
+    "stable": "37/2",
+    "inl": 3,
+    "nis": 0.15
+   },
+   {
+    "idx": 3,
+    "name": "Face east",
+    "exp": [
+     -26.0,
+     -9.0,
+     90.0
+    ],
+    "rep": [
+     -26.9,
+     -11.2,
+     85.1
+    ],
+    "err": [
+     -0.9,
+     -2.2,
+     -4.9
+    ],
+    "active": 3,
+    "conf": 0.62,
+    "accepted": 0,
+    "mask": 300,
+    "stable": "1/4",
+    "inl": 1,
+    "nis": 0.08
+   },
+   {
+    "idx": 4,
+    "name": "Square east",
+    "exp": [
+     -2.0,
+     -9.0,
+     90.0
+    ],
+    "rep": [
+     -4.1,
+     -9.4,
+     88.8
+    ],
+    "err": [
+     -2.1,
+     -0.4,
+     -1.2
+    ],
+    "active": 3,
+    "conf": 0.65,
+    "accepted": 1,
+    "mask": 0,
+    "stable": "13/4",
+    "inl": 2,
+    "nis": 0.02
+   },
+   {
+    "idx": 5,
+    "name": "Face south",
+    "exp": [
+     -2.0,
+     -9.0,
+     180.0
+    ],
+    "rep": [
+     -4.4,
+     -8.8,
+     172.9
+    ],
+    "err": [
+     -2.4,
+     0.2,
+     -7.1
+    ],
+    "active": 3,
+    "conf": 0.65,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "7/4",
+    "inl": 0,
+    "nis": 11.73
+   },
+   {
+    "idx": 6,
+    "name": "Square south",
+    "exp": [
+     -2.0,
+     -33.0,
+     180.0
+    ],
+    "rep": [
+     -2.5,
+     -31.0,
+     179.0
+    ],
+    "err": [
+     -0.5,
+     2.1,
+     -1.0
+    ],
+    "active": 3,
+    "conf": 0.46,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "45/4",
+    "inl": 0,
+    "nis": 7.06
+   },
+   {
+    "idx": 7,
+    "name": "Face west",
+    "exp": [
+     -2.0,
+     -33.0,
+     -90.0
+    ],
+    "rep": [
+     -1.4,
+     -30.7,
+     265.1
+    ],
+    "err": [
+     0.6,
+     2.3,
+     -4.9
+    ],
+    "active": 2,
+    "conf": 0.75,
+    "accepted": 0,
+    "mask": 60,
+    "stable": "1/4",
+    "inl": 1,
+    "nis": 6.64
+   },
+   {
+    "idx": 8,
+    "name": "Return home",
+    "exp": [
+     -26.0,
+     -33.0,
+     -90.0
+    ],
+    "rep": [
+     -22.1,
+     -32.6,
+     268.7
+    ],
+    "err": [
+     3.9,
+     0.5,
+     -1.3
+    ],
+    "active": 2,
+    "conf": 0.29,
+    "accepted": 0,
+    "mask": 8,
+    "stable": "2/4",
+    "inl": 2,
+    "nis": 0.33
+   },
+   {
+    "idx": 9,
+    "name": "Face diagonal NE",
+    "exp": [
+     -26.0,
+     -33.0,
+     45.0
+    ],
+    "rep": [
+     -22.8,
+     -34.6,
+     394.9
+    ],
+    "err": [
+     3.3,
+     -1.6,
+     -10.1
+    ],
+    "active": 2,
+    "conf": 0.54,
+    "accepted": 0,
+    "mask": 60,
+    "stable": "2/4",
+    "inl": 1,
+    "nis": 0.63
+   },
+   {
+    "idx": 10,
+    "name": "Cross SW to NE",
+    "exp": [
+     -2.0,
+     -9.0,
+     45.0
+    ],
+    "rep": [
+     -3.5,
+     -11.1,
+     403.2
+    ],
+    "err": [
+     -1.4,
+     -2.1,
+     -1.8
+    ],
+    "active": 1,
+    "conf": 0.0,
+    "accepted": 0,
+    "mask": 172,
+    "stable": "0/4",
+    "inl": 0,
+    "nis": -1.0
+   },
+   {
+    "idx": 11,
+    "name": "Face diagonal SW",
+    "exp": [
+     -2.0,
+     -9.0,
+     -135.0
+    ],
+    "rep": [
+     -3.0,
+     -11.0,
+     290.6
+    ],
+    "err": [
+     -0.9,
+     -2.0,
+     65.6
+    ],
+    "active": 3,
+    "conf": 0.68,
+    "accepted": 0,
+    "mask": 8,
+    "stable": "1/2",
+    "inl": 3,
+    "nis": 0.24
+   },
+   {
+    "idx": 12,
+    "name": "Cross NE to SW",
+    "exp": [
+     -26.0,
+     -33.0,
+     -135.0
+    ],
+    "rep": [
+     -22.6,
+     -29.7,
+     224.2
+    ],
+    "err": [
+     3.4,
+     3.3,
+     -0.8
+    ],
+    "active": 1,
+    "conf": 0.0,
+    "accepted": 0,
+    "mask": 172,
+    "stable": "0/4",
+    "inl": 0,
+    "nis": -1.0
+   },
+   {
+    "idx": 13,
+    "name": "Face north",
+    "exp": [
+     -26.0,
+     -33.0,
+     0.0
+    ],
+    "rep": [
+     -21.3,
+     -30.8,
+     347.8
+    ],
+    "err": [
+     4.8,
+     2.3,
+     -12.2
+    ],
+    "active": 3,
+    "conf": 0.28,
+    "accepted": 0,
+    "mask": 8,
+    "stable": "1/2",
+    "inl": 3,
+    "nis": 0.13
+   },
+   {
+    "idx": 14,
+    "name": "Move to NW",
+    "exp": [
+     -26.0,
+     -9.0,
+     0.0
+    ],
+    "rep": [
+     -25.3,
+     -14.4,
+     354.7
+    ],
+    "err": [
+     0.7,
+     -5.4,
+     -5.3
+    ],
+    "active": 3,
+    "conf": 0.6,
+    "accepted": 1,
+    "mask": 0,
+    "stable": "38/2",
+    "inl": 3,
+    "nis": 0.03
+   },
+   {
+    "idx": 15,
+    "name": "Face diagonal SE",
+    "exp": [
+     -26.0,
+     -9.0,
+     135.0
+    ],
+    "rep": [
+     -26.7,
+     -14.9,
+     473.2
+    ],
+    "err": [
+     -0.6,
+     -5.9,
+     -21.8
+    ],
+    "active": 1,
+    "conf": 0.0,
+    "accepted": 0,
+    "mask": 172,
+    "stable": "0/4",
+    "inl": 0,
+    "nis": -1.0
+   },
+   {
+    "idx": 16,
+    "name": "Final face north",
+    "exp": [
+     -26.0,
+     -33.0,
+     0.0
+    ],
+    "rep": [
+     -23.2,
+     -34.3,
+     714.5
+    ],
+    "err": [
+     2.8,
+     -1.3,
+     -5.5
+    ],
+    "active": 3,
+    "conf": 0.85,
+    "accepted": 1,
+    "mask": 0,
+    "stable": "6/2",
+    "inl": 3,
+    "nis": 1.6
+   }
+  ],
+  "wall_repro_err": 0.0665
+ },
+ "run4": {
+  "name": "run4",
+  "meta": {
+   "test_case": "1 Turn center",
+   "status": "Complete",
+   "start_pose": "-26.4 -29.7 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "-26.4 -29.7 0.0",
+   "relocalize_conf": "0.950 active=2 scored=2 iter=0",
+   "relocalize_residual": "0.000 0.000",
+   "relocalize_var": "4.000 4.000 0.00274",
+   "checkpoint_count": "0",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.95,
+   "reloc_active": 2,
+   "reloc_scored": 2,
+   "compiled": "May 31 2026 19:22:32"
+  },
+  "model_err_n": 860,
+  "rows": 949,
+  "duration_s": 10.0,
+  "path_in": 138.5,
+  "motion_pct": 86.8,
+  "scans": 191,
+  "accepted_scans": 0,
+  "accept_events": 0,
+  "accepts": [],
+  "reject_hist": {
+   "not_enough_sensors": 177,
+   "unstable_candidate": 107,
+   "readiness": 179,
+   "no_measurement": 36,
+   "motion_suppressed": 165,
+   "sensor_residual": 43,
+   "pose_delta": 111,
+   "turn_suppressed": 2
+  },
+  "nis_med": 4.439,
+  "nis_p90": 7.342,
+  "nis_max": 10.214,
+  "booked_drift_in": 0.0,
+  "drift_rate_per100": 0.0,
+  "max_seg_in": 138.5,
+  "tail_seg_in": 138.5,
+  "raw_model_max": 0.0,
+  "new_model_max": 0.0,
+  "new_model_end": 0.0,
+  "factor": 1.0,
+  "staircase_violation_in": 0.0,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.0,
+  "applied_total_in": 0.0,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.0,
+  "end_ekf_minus_odom_in": 0.0,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 160,
+    "med_abs_res": 4.2933,
+    "p90_abs_res": 10.8943,
+    "max_abs_res": 22.6636
+   },
+   "right": {
+    "used_rows": 724,
+    "med_abs_res": 31.8254,
+    "p90_abs_res": 51.8673,
+    "max_abs_res": 63.9029
+   },
+   "back": {
+    "used_rows": 683,
+    "med_abs_res": 11.9281,
+    "p90_abs_res": 22.3497,
+    "max_abs_res": 50.3616
+   },
+   "left": {
+    "used_rows": 380,
+    "med_abs_res": 15.2079,
+    "p90_abs_res": 30.5338,
+    "max_abs_res": 33.83
+   }
+  },
+  "model_err_max": 0.0002,
+  "model_err_med": 0.0,
+  "wall_repro_err": 0.0247
+ },
+ "run5": {
+  "name": "run5",
+  "meta": {
+   "test_case": "0 Normal route",
+   "status": "Complete",
+   "start_pose": "52.3 -3.0 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "52.3 -3.0 0.0",
+   "relocalize_conf": "0.950 active=2 scored=2 iter=0",
+   "relocalize_residual": "0.000 0.000",
+   "relocalize_var": "4.000 4.000 0.00274",
+   "checkpoint_count": "0",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.95,
+   "reloc_active": 2,
+   "reloc_scored": 2,
+   "compiled": "May 31 2026 19:28:48"
+  },
+  "model_err_n": 841,
+  "rows": 994,
+  "duration_s": 10.35,
+  "path_in": 172.4,
+  "motion_pct": 86.6,
+  "scans": 199,
+  "accepted_scans": 0,
+  "accept_events": 0,
+  "accepts": [],
+  "reject_hist": {
+   "not_enough_sensors": 193,
+   "unstable_candidate": 149,
+   "readiness": 193,
+   "motion_suppressed": 173,
+   "no_measurement": 74,
+   "sensor_residual": 62,
+   "pose_delta": 87,
+   "turn_suppressed": 1,
+   "sensors_stale": 1
+  },
+  "nis_med": 2.357,
+  "nis_p90": 11.862,
+  "nis_max": 15.692,
+  "booked_drift_in": 0.0,
+  "drift_rate_per100": 0.0,
+  "max_seg_in": 172.4,
+  "tail_seg_in": 172.4,
+  "raw_model_max": 0.0,
+  "new_model_max": 0.0,
+  "new_model_end": 0.0,
+  "factor": 1.0,
+  "staircase_violation_in": 0.0,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.0,
+  "applied_total_in": 0.0,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.0,
+  "end_ekf_minus_odom_in": 0.0,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 336,
+    "med_abs_res": 30.8837,
+    "p90_abs_res": 75.8424,
+    "max_abs_res": 93.808
+   },
+   "right": {
+    "used_rows": 812,
+    "med_abs_res": 63.1664,
+    "p90_abs_res": 74.8304,
+    "max_abs_res": 84.1732
+   },
+   "back": {
+    "used_rows": 286,
+    "med_abs_res": 30.1213,
+    "p90_abs_res": 61.3717,
+    "max_abs_res": 88.5909
+   },
+   "left": {
+    "used_rows": 371,
+    "med_abs_res": 63.9414,
+    "p90_abs_res": 76.3586,
+    "max_abs_res": 87.8894
+   }
+  },
+  "model_err_max": 0.0014,
+  "model_err_med": 0.0,
+  "wall_repro_err": 0.0359
+ },
+ "run6": {
+  "name": "run6",
+  "meta": {
+   "test_case": "0 Normal route",
+   "status": "Complete",
+   "start_pose": "-27.0 -36.0 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "0",
+   "relocalize_status": "not_enough_live_sensors",
+   "relocalize_pose": "-27.0 -36.0 -0.1",
+   "relocalize_conf": "0.000 active=0 scored=0 iter=0",
+   "relocalize_residual": "0.000 0.000",
+   "relocalize_var": "0.000 0.000 0.00000",
+   "checkpoint_count": "0",
+   "heading_mode": "heading_search",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.0,
+   "reloc_active": 0,
+   "reloc_scored": 0,
+   "compiled": "May 31 2026 19:35:41"
+  },
+  "model_err_n": 968,
+  "rows": 967,
+  "duration_s": 10.34,
+  "path_in": 110.2,
+  "motion_pct": 87.3,
+  "scans": 195,
+  "accepted_scans": 0,
+  "accept_events": 0,
+  "accepts": [],
+  "reject_hist": {
+   "not_enough_sensors": 190,
+   "unstable_candidate": 95,
+   "readiness": 190,
+   "no_measurement": 21,
+   "motion_suppressed": 169,
+   "sensor_residual": 72,
+   "pose_delta": 117,
+   "turn_suppressed": 7
+  },
+  "nis_med": 1.736,
+  "nis_p90": 4.449,
+  "nis_max": 4.512,
+  "booked_drift_in": 0.0,
+  "drift_rate_per100": 0.0,
+  "max_seg_in": 110.2,
+  "tail_seg_in": 110.2,
+  "raw_model_max": 0.0,
+  "new_model_max": 0.0,
+  "new_model_end": 0.0,
+  "factor": 1.0,
+  "staircase_violation_in": 0.0,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.0,
+  "applied_total_in": 0.0,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.0,
+  "end_ekf_minus_odom_in": 0.0,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 185,
+    "med_abs_res": 19.2433,
+    "p90_abs_res": 38.9699,
+    "max_abs_res": 64.1049
+   },
+   "right": {
+    "used_rows": 785,
+    "med_abs_res": 11.6968,
+    "p90_abs_res": 29.9251,
+    "max_abs_res": 82.914
+   },
+   "back": {
+    "used_rows": 736,
+    "med_abs_res": 7.1147,
+    "p90_abs_res": 11.8866,
+    "max_abs_res": 25.0593
+   },
+   "left": {
+    "used_rows": 475,
+    "med_abs_res": 13.212,
+    "p90_abs_res": 15.5395,
+    "max_abs_res": 43.7778
+   }
+  },
+  "model_err_max": 0.0004,
+  "model_err_med": 0.0
+ },
+ "run7": {
+  "name": "run7",
+  "meta": {
+   "test_case": "0 Normal route",
+   "status": "Complete",
+   "start_pose": "-17.4 -38.1 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "-17.4 -38.1 0.0",
+   "relocalize_conf": "0.885 active=3 scored=3 iter=0",
+   "relocalize_residual": "2.751 4.300",
+   "relocalize_var": "7.569 7.569 0.00274",
+   "checkpoint_count": "0",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.885,
+   "reloc_active": 3,
+   "reloc_scored": 3,
+   "compiled": "May 31 2026 19:35:41"
+  },
+  "model_err_n": 869,
+  "rows": 925,
+  "duration_s": 9.93,
+  "path_in": 130.0,
+  "motion_pct": 86.5,
+  "scans": 186,
+  "accepted_scans": 0,
+  "accept_events": 0,
+  "accepts": [],
+  "reject_hist": {
+   "unstable_candidate": 101,
+   "motion_suppressed": 160,
+   "readiness": 157,
+   "not_enough_sensors": 155,
+   "pose_delta": 128,
+   "sensor_residual": 51,
+   "no_measurement": 27,
+   "turn_suppressed": 2
+  },
+  "nis_med": 2.459,
+  "nis_p90": 5.909,
+  "nis_max": 6.464,
+  "booked_drift_in": 0.0,
+  "drift_rate_per100": 0.0,
+  "max_seg_in": 130.0,
+  "tail_seg_in": 130.0,
+  "raw_model_max": 0.0,
+  "new_model_max": 0.0,
+  "new_model_end": 0.0,
+  "factor": 1.0,
+  "staircase_violation_in": 0.0,
+  "seq_gaps": [
+   [
+    4,
+    43,
+    47
+   ]
+  ],
+  "n_seq_gaps": 1,
+  "max_applied_step_in": 0.0,
+  "applied_total_in": 0.0,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.0,
+  "end_ekf_minus_odom_in": 0.0,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 165,
+    "med_abs_res": 4.6053,
+    "p90_abs_res": 7.7734,
+    "max_abs_res": 81.3007
+   },
+   "right": {
+    "used_rows": 686,
+    "med_abs_res": 27.2778,
+    "p90_abs_res": 47.7936,
+    "max_abs_res": 92.029
+   },
+   "back": {
+    "used_rows": 731,
+    "med_abs_res": 9.2346,
+    "p90_abs_res": 15.2896,
+    "max_abs_res": 19.7552
+   },
+   "left": {
+    "used_rows": 435,
+    "med_abs_res": 4.2814,
+    "p90_abs_res": 8.1141,
+    "max_abs_res": 9.9846
+   }
+  },
+  "model_err_max": 0.0012,
+  "model_err_med": 0.0,
+  "wall_repro_err": 0.0581
+ },
+ "tune": {
+  "name": "tune",
+  "meta": {
+   "test_case": "5 Sensor angle",
+   "status": "Complete",
+   "start_pose": "-47.1 -43.9 0.0",
+   "relocalize_attempted": "1",
+   "relocalize_success": "1",
+   "relocalize_status": "wall_direct",
+   "relocalize_pose": "-47.1 -43.9 0.0",
+   "relocalize_conf": "0.950 active=2 scored=2 iter=0",
+   "relocalize_residual": "0.000 0.000",
+   "relocalize_var": "4.000 4.000 0.00274",
+   "checkpoint_count": "9",
+   "heading_mode": "wall_direct",
+   "imu_heading_deg": -0.1,
+   "hypotheses": 0,
+   "reloc_conf": 0.95,
+   "reloc_active": 2,
+   "reloc_scored": 2,
+   "compiled": "May 24 2026 18:13:51"
+  },
+  "model_err_n": 808,
+  "rows": 807,
+  "duration_s": 8.93,
+  "path_in": 58.4,
+  "motion_pct": 87.2,
+  "scans": 163,
+  "accepted_scans": 0,
+  "accept_events": 0,
+  "accepts": [],
+  "reject_hist": {
+   "not_enough_sensors": 143,
+   "unstable_candidate": 85,
+   "readiness": 143,
+   "sensor_residual": 143,
+   "motion_suppressed": 141,
+   "pose_delta": 140
+  },
+  "nis_med": 7.05,
+  "nis_p90": 10.544,
+  "nis_max": 10.839,
+  "booked_drift_in": 0.0,
+  "drift_rate_per100": 0.0,
+  "max_seg_in": 58.4,
+  "tail_seg_in": 58.4,
+  "raw_model_max": 0.0,
+  "new_model_max": 0.0,
+  "new_model_end": 0.0,
+  "factor": 1.0,
+  "staircase_violation_in": 0.0,
+  "seq_gaps": [],
+  "n_seq_gaps": 0,
+  "max_applied_step_in": 0.0,
+  "applied_total_in": 0.0,
+  "cap_violations": 0,
+  "end_net_applied_in": 0.0,
+  "end_ekf_minus_odom_in": 0.0,
+  "sensor_stats": {
+   "front": {
+    "used_rows": 425,
+    "med_abs_res": 6.7356,
+    "p90_abs_res": 8.7218,
+    "max_abs_res": 20.5872
+   },
+   "right": {
+    "used_rows": 504,
+    "med_abs_res": 4.9855,
+    "p90_abs_res": 10.5071,
+    "max_abs_res": 15.0016
+   },
+   "back": {
+    "used_rows": 481,
+    "med_abs_res": 4.2669,
+    "p90_abs_res": 9.0678,
+    "max_abs_res": 10.319
+   },
+   "left": {
+    "used_rows": 421,
+    "med_abs_res": 3.3153,
+    "p90_abs_res": 6.9513,
+    "max_abs_res": 48.84
+   }
+  },
+  "model_err_max": 0.0005,
+  "model_err_med": 0.0,
+  "checkpoints": [
+   {
+    "idx": 1,
+    "name": "Start hold",
+    "exp": [
+     -47.1,
+     -43.9,
+     0.0
+    ],
+    "rep": [
+     -47.1,
+     -43.9,
+     0.0
+    ],
+    "err": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "active": 0,
+    "conf": 0.0,
+    "accepted": 0,
+    "mask": 0,
+    "stable": "0/0",
+    "inl": 0,
+    "nis": -1.0
+   },
+   {
+    "idx": 2,
+    "name": "Angle 45",
+    "exp": [
+     -47.1,
+     -43.9,
+     45.0
+    ],
+    "rep": [
+     -47.5,
+     -44.6,
+     40.6
+    ],
+    "err": [
+     -0.4,
+     -0.6,
+     -4.4
+    ],
+    "active": 3,
+    "conf": 0.67,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "9/4",
+    "inl": 0,
+    "nis": 7.91
+   },
+   {
+    "idx": 3,
+    "name": "Angle 90",
+    "exp": [
+     -47.1,
+     -43.9,
+     90.0
+    ],
+    "rep": [
+     -47.7,
+     -44.5,
+     85.0
+    ],
+    "err": [
+     -0.6,
+     -0.6,
+     -5.0
+    ],
+    "active": 2,
+    "conf": 0.91,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "9/4",
+    "inl": 1,
+    "nis": 6.87
+   },
+   {
+    "idx": 4,
+    "name": "Angle 135",
+    "exp": [
+     -47.1,
+     -43.9,
+     135.0
+    ],
+    "rep": [
+     -48.4,
+     -44.0,
+     130.1
+    ],
+    "err": [
+     -1.3,
+     -0.0,
+     -4.9
+    ],
+    "active": 2,
+    "conf": 0.52,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "11/4",
+    "inl": 0,
+    "nis": 8.28
+   },
+   {
+    "idx": 5,
+    "name": "Angle 180",
+    "exp": [
+     -47.1,
+     -43.9,
+     180.0
+    ],
+    "rep": [
+     -48.3,
+     -43.8,
+     175.6
+    ],
+    "err": [
+     -1.2,
+     0.2,
+     -4.4
+    ],
+    "active": 2,
+    "conf": 0.66,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "12/4",
+    "inl": 0,
+    "nis": 7.13
+   },
+   {
+    "idx": 6,
+    "name": "Angle -135",
+    "exp": [
+     -47.1,
+     -43.9,
+     -135.0
+    ],
+    "rep": [
+     -47.9,
+     -43.7,
+     220.1
+    ],
+    "err": [
+     -0.8,
+     0.3,
+     -4.9
+    ],
+    "active": 2,
+    "conf": 0.73,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "10/4",
+    "inl": 0,
+    "nis": 5.65
+   },
+   {
+    "idx": 7,
+    "name": "Angle -90",
+    "exp": [
+     -47.1,
+     -43.9,
+     -90.0
+    ],
+    "rep": [
+     -47.6,
+     -43.8,
+     265.0
+    ],
+    "err": [
+     -0.5,
+     0.1,
+     -5.0
+    ],
+    "active": 2,
+    "conf": 0.66,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "9/4",
+    "inl": 2,
+    "nis": 5.46
+   },
+   {
+    "idx": 8,
+    "name": "Angle -45",
+    "exp": [
+     -47.1,
+     -43.9,
+     -45.0
+    ],
+    "rep": [
+     -47.2,
+     -44.2,
+     310.6
+    ],
+    "err": [
+     -0.1,
+     -0.3,
+     -4.4
+    ],
+    "active": 3,
+    "conf": 0.53,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "10/4",
+    "inl": 0,
+    "nis": 10.49
+   },
+   {
+    "idx": 9,
+    "name": "Angle 0",
+    "exp": [
+     -47.1,
+     -43.9,
+     0.0
+    ],
+    "rep": [
+     -47.4,
+     -44.6,
+     356.1
+    ],
+    "err": [
+     -0.3,
+     -0.7,
+     -3.9
+    ],
+    "active": 2,
+    "conf": 0.56,
+    "accepted": 0,
+    "mask": 308,
+    "stable": "9/4",
+    "inl": 0,
+    "nis": 10.6
+   }
+  ],
+  "wall_repro_err": 0.0631
+ }
+}

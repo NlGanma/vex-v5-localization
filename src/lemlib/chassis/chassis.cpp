@@ -300,6 +300,11 @@ void lemlib::Chassis::endMotion() {
     this->motionQueued = false;
     lemlib::localization::setMotionCorrectionSuppressed(this->motionRunning);
 
+    // Robot just went fully idle between segments: ask localization to commit its
+    // trusted pose in one bounded step so the next motion starts from truth. No-op
+    // if no gated fix lands before the next motion suppresses corrections again.
+    if (!this->motionRunning) lemlib::localization::requestBoundaryReanchor();
+
     // permit queued motion to run
     this->mutex.give();
 }
@@ -310,6 +315,7 @@ void lemlib::Chassis::cancelMotion() {
     // motion is still queued it will run next, so keep corrections suppressed;
     // the queued motion's endMotion will recompute suppression from there.
     lemlib::localization::setMotionCorrectionSuppressed(this->motionQueued);
+    if (!this->motionQueued) lemlib::localization::requestBoundaryReanchor();
     pros::delay(10); // give time for motion to stop
 }
 
@@ -317,6 +323,7 @@ void lemlib::Chassis::cancelAllMotions() {
     this->motionRunning = false;
     this->motionQueued = false;
     lemlib::localization::setMotionCorrectionSuppressed(false);
+    lemlib::localization::requestBoundaryReanchor();
     pros::delay(10); // give time for motion to stop
 }
 

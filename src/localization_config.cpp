@@ -68,6 +68,13 @@ lemlib::localization::LocalizationConfig buildLocalizationConfig() {
     loc.fusion.maxMeasurementDeltaTheta = lemlib::degToRad(4.0f);
     loc.fusion.maxCorrectionXY = 0.015f;
     loc.fusion.maxCorrectionTheta = lemlib::degToRad(0.5f);
+    // One-shot re-anchor applied only between motions (robot stopped) on a fully
+    // gated accept. XY cap matches maxMeasurementDeltaXY (the accept gate already
+    // bounds the fix to this); heading cap kept tight -- the IMU is the trusted
+    // heading source and planar range updates strip heading anyway.
+    loc.fusion.enableBoundaryReanchor = true;
+    loc.fusion.maxBoundaryCorrectionXY = 2.5f;
+    loc.fusion.maxBoundaryCorrectionTheta = lemlib::degToRad(1.0f);
     loc.fusion.initStdXY = 2.5f;
     loc.fusion.initStdTheta = lemlib::degToRad(6.0f);
     loc.fusion.sensorStaleMs = 300;

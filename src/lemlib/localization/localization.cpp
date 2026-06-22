@@ -59,6 +59,10 @@ LocalizationConfig config;
 bool configured = false;
 std::atomic<bool> running {false};
 std::atomic<bool> motionCorrectionSuppressed {false};
+// One-shot: set when a motion ends (robot idle between segments). The next gated
+// accept commits the trusted EKF pose to odom with the larger boundary cap, then
+// clears this. Cleared if a new motion suppresses corrections first (no idle gap).
+std::atomic<bool> boundaryReanchorPending {false};
 std::atomic<bool> taskExited {false};
 pros::Task* task = nullptr;
 
@@ -768,6 +772,9 @@ void localizationTask(void*) {
         const auto snapshot = lemlib::getOdomSnapshot();
         lemlib::Pose appliedPose = snapshot.pose;
         const bool motionCorrectionSuppressedForInjection = motionCorrectionSuppressed.load();
+        // A motion is (re)suppressing corrections: the idle window between segments
+        // closed without a commit, so drop any pending boundary request.
+        if (motionCorrectionSuppressedForInjection) boundaryReanchorPending.store(false);
         if (!resetQueued && !motionCorrectionSuppressedForInjection) {
             // Only write the correction back when the published odom snapshot is
             // exactly the state our fused pose was built from (seq == lastSeq). If
@@ -776,14 +783,29 @@ void localizationTask(void*) {
             // intentionally throttles correction cadence (a tuning/perf lever, not
             // a bug); EKF state persists, so correction authority is not lost.
             if (snapshot.seq == lastSeq) {
+                // One-shot boundary re-anchor: on the first fully-gated accept after
+                // a motion ends, apply the trusted EKF pose in a single bounded step
+                // (larger cap) so the next segment starts from truth. Gated on
+                // lastCorrectionAccepted, so it is the SAME NIS/confidence/geometry-
+                // validated correction -- just applied at a safe stopped moment and
+                // in one step instead of bled at maxCorrectionXY/loop. When it does
+                // not fire, behavior is byte-identical to the continuous path.
+                const bool boundaryCommit = config.fusion.enableBoundaryReanchor &&
+                                            boundaryReanchorPending.load() && lastCorrectionAccepted;
+                const float limitXY =
+                    boundaryCommit ? config.fusion.maxBoundaryCorrectionXY : config.fusion.maxCorrectionXY * dtScale;
+                const float limitTheta = boundaryCommit ? config.fusion.maxBoundaryCorrectionTheta
+                                                        : config.fusion.maxCorrectionTheta * dtScale;
                 const lemlib::Pose safe =
-                    applyCorrectionLimit(snapshot.pose, fused, config.fusion.maxCorrectionXY * dtScale,
-                                         config.fusion.maxCorrectionTheta * dtScale, config.fusion.blend);
+                    applyCorrectionLimit(snapshot.pose, fused, limitXY, limitTheta, config.fusion.blend);
                 // Commit only if odom has not advanced since the snapshot: the
                 // setter re-checks the seq under the odom lock, so a concurrent
                 // odom integration can't be clobbered (correction is simply
                 // deferred to the next loop instead).
-                if (lemlib::detail::setPoseSilentIfSeq(safe, snapshot.seq, true)) appliedPose = safe;
+                if (lemlib::detail::setPoseSilentIfSeq(safe, snapshot.seq, true)) {
+                    appliedPose = safe;
+                    if (boundaryCommit) boundaryReanchorPending.store(false);
+                }
             }
         }
 
@@ -879,6 +901,12 @@ void configure(const LocalizationConfig& cfg) {
     config.fusion.maxMeasurementDeltaTheta = std::fabs(config.fusion.maxMeasurementDeltaTheta);
     config.fusion.maxCorrectionXY = std::fabs(config.fusion.maxCorrectionXY);
     config.fusion.maxCorrectionTheta = std::fabs(config.fusion.maxCorrectionTheta);
+    // A boundary commit must never be a *smaller* step than a continuous one, or it
+    // would be pointless; clamp the floor to the per-update cap.
+    config.fusion.maxBoundaryCorrectionXY =
+        std::max(std::fabs(config.fusion.maxBoundaryCorrectionXY), config.fusion.maxCorrectionXY);
+    config.fusion.maxBoundaryCorrectionTheta =
+        std::max(std::fabs(config.fusion.maxBoundaryCorrectionTheta), config.fusion.maxCorrectionTheta);
     config.fusion.initStdXY = std::max(config.fusion.initStdXY, 1e-3f);
     config.fusion.initStdTheta = std::max(config.fusion.initStdTheta, 1e-3f);
     config.fusion.nisGate = std::max(config.fusion.nisGate, 0.0f);
@@ -897,6 +925,10 @@ void start() {
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) return;
     motionCorrectionSuppressed.store(false);
+    // One-shot boundary request must not survive a stop/start cycle: a stale
+    // pending flag from the previous session would otherwise commit on the very
+    // first accepted fix after restart.
+    boundaryReanchorPending.store(false);
     taskExited.store(false);
     resetMutex.take();
     pendingReset = false;
@@ -938,6 +970,8 @@ bool isRunning() { return running.load(); }
 void setMotionCorrectionSuppressed(bool suppressed) { motionCorrectionSuppressed.store(suppressed); }
 
 bool isMotionCorrectionSuppressed() { return motionCorrectionSuppressed.load(); }
+
+void requestBoundaryReanchor() { boundaryReanchorPending.store(true); }
 
 void syncPose(lemlib::Pose pose) { syncPose(pose, lemlib::getOdomSnapshot().seq); }
 

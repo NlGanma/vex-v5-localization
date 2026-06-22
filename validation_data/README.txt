@@ -1,5 +1,10 @@
 # Localization validation data collection files.
 # Keep src/tune.txt as the latest robot export, then paste each run's full exported log into the matching file below.
+# Provenance note: run1/run4 were recorded on the May 31 18:25/19:22 builds whose report header echoed a stale
+# default test_case (1, Turn center). The actual route is identified by checkpoint_count and path length:
+# checkpoint_count=0 with ~135 in of path = the wired normal sample route (kLocalizationTuneTest = 0).
+# src/tune.txt currently holds a May 24 pre-calibration sensor-angle sweep (test 5) kept as historical
+# evidence for the old two-sensor wall_direct accept and the sensor-angle calibration provenance.
 # The sample autonomous route is already wired into src/autonomous_control.cpp and records a full tune trace/report.
 # Set kLocalizationTuneTest = 0 to run it. Set kLocalizationTuneTest = 1..6 to run the built-in tune routes, which also record full tune traces/reports.
 # Since the air pump/PTO is not available, the normal route and score() path leave the robot in 4-motor mode.

@@ -23,6 +23,18 @@ struct FusionConfig { // TUNE
         float maxCorrectionXY = 0.5f; // inches per update
         float maxCorrectionTheta = 0.1f; // radians per update
         float blend = 1.0f; // 1 = no extra smoothing, <1 adds smoothing
+        // Boundary re-anchor. When a motion ends and the robot is momentarily idle
+        // between segments, the first fully-gated (NIS/confidence/geometry) accept
+        // commits the trusted EKF pose to odom in ONE bounded step (these caps)
+        // instead of bleeding maxCorrectionXY/loop. This is what lets validated
+        // localization actually beat odom over a long auton: every segment starts
+        // from truth, so cross-segment drift cannot accumulate. It never runs during
+        // a motion (no stutter) and only ever applies an already-accepted correction
+        // (never an ungated jump -> never worse than odom). Set false to restore the
+        // exact validated continuous-only behavior.
+        bool enableBoundaryReanchor = true;
+        float maxBoundaryCorrectionXY = 2.5f; // inches, one-shot cap at a motion boundary
+        float maxBoundaryCorrectionTheta = 0.0872665f; // radians (~5 deg), one-shot cap at a boundary
         float initStdXY = 3.0f; // inches
         float initStdTheta = 0.2f; // radians
         uint32_t sensorStaleMs = 500; // skip EKF correction if no fresh MCL sensor data for this long
@@ -117,6 +129,9 @@ void stop();
 bool isRunning();
 void setMotionCorrectionSuppressed(bool suppressed);
 bool isMotionCorrectionSuppressed();
+// Request a one-shot boundary re-anchor: the next fully-gated accept (while idle)
+// commits the trusted EKF pose in a single bounded step. Called when a motion ends.
+void requestBoundaryReanchor();
 void syncPose(lemlib::Pose pose);
 void syncPose(lemlib::Pose pose, uint32_t seq);
 
