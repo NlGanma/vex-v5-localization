@@ -41,7 +41,7 @@ Iteration procedure whenever I say "data ready"
 1. Verify the log is complete and report its detected test, row count, duration, coverage, active-sensor distribution, accepted corrections, dominant rejection reasons, and obvious occlusions or sequence gaps.
 2. State which parameters the data can constrain and which it cannot. Do not apply analyzer suggestions that are physically implausible, hit search bounds, depend on too few samples, or conflict with stronger evidence.
 3. Make the smallest evidence-backed code/configuration changes. Relevant locations are usually src/robot.cpp for odometry geometry, src/localization_config.cpp for sensor/MCL/EKF/fusion constants, and localization implementation files only when traces demonstrate a logic defect.
-4. Run make quick after every C++ change. Run the relevant Python checks. If the report inputs changed, regenerate the analysis and report data.
+4. Run make quick after every C++ change and run the relevant Python checks. The published report is a PDF artifact; do not recreate or commit LaTeX/report-generation files.
 5. Select the next most informative test by editing kLocalizationTuneTest yourself. Tell me exactly: "Next test: N - Name."
 6. Give concise physical instructions: start placement class, required clear footprint or wall views, whether to fixture the start, obstacles to remove or intentionally introduce, number of repetitions, and which comparisons must keep battery/configuration unchanged.
 7. Stop and wait for me to run the robot, dump the terminal log, put it at the agreed path, and say "data ready." Then repeat this procedure.

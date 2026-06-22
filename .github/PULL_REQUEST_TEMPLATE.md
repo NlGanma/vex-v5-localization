@@ -1,11 +1,18 @@
-#### Summary
-<!-- Provide a brief summary on the pull request -->
+## Summary
 
-#### Motivation
-<!-- Why are you making this pull request? -->
+<!-- What behavior or documentation changed? -->
 
-#### Test Plan
-<!-- How did you test / plan to test this pull request? -->
+## Evidence
 
-#### Additional Notes
-<!-- Add any other information you think is relevant -->
+<!-- What trace, issue, or design constraint supports this change? -->
+
+## Validation
+
+- [ ] `make quick`
+- [ ] Relevant Python analysis
+- [ ] Hardware test completed, or required hardware test documented
+- [ ] No generated build/cache/report-source files committed
+
+## Risk
+
+<!-- Describe localization, motion-control, task-lifecycle, or hardware risks. -->

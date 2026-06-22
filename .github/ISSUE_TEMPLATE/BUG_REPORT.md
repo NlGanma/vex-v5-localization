@@ -1,28 +1,38 @@
 ---
-name: Bug Report
-about: Report a bug in the project
-title: "[BUG]"
-labels: "needs confirmation"
+name: Bug report
+about: Report a reproducible localization, motion, or tooling defect
+title: "[Bug] "
+labels: "bug"
 assignees: ""
 ---
 
-#### Expected Behavior
-<!-- Concisely describe the behavior you expected -->
+## Summary
 
-#### Observed Behavior
-<!-- Concisely describe the behavior you observed -->
+Describe the observed behavior and why it is incorrect.
 
-#### Steps to Reproduce
-<!-- Provide a link to a live example, or an unambiguous set of steps to reproduce this bug. Include code to reproduce, if relevant -->
+## Reproduction
 
-#### Environment
-<!-- Please provide the following information -->
+List the exact test route, start condition, and steps required to reproduce it.
 
- - LemLib Version: <!-- (e.g. 0.4.5). Run "pros c info-project" to find version -->
- - PROS Kernel Version: <!-- (e.g. 3.8.0). Run "pros c info-project" to find version -->
- - PROS CLI Version: <!-- (e.g 3.4.1). Run "pros --version" to find version -->
- - Additional Templates: <!-- (e.g OkapiLib, EZ-Template). Run "pros c info-project" to find templates and versions -->
+## Expected Behavior
 
-#### Additional Information
-<!-- Add any other relevant information about the problem here -->
-<!-- This includes screenshots, code snippets, videos, anything you think is relevant -->
+Describe the expected robot or tooling behavior.
+
+## Evidence
+
+Attach or link the complete localization export when relevant. Include the active
+`kLocalizationTuneTest`, commit SHA, and whether the problem also occurs with range
+corrections disabled.
+
+## Environment
+
+- Robot/build commit:
+- PROS kernel version:
+- PROS CLI version:
+- Test route:
+- Hardware configuration changes:
+
+## Additional Context
+
+Include controller output, Brain-screen status, photos, or videos when useful. Remove
+private information before posting logs publicly.

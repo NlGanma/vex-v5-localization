@@ -1,4 +1,4 @@
-name: PROS Build Template
+name: PROS Build
 
 on:
   push:

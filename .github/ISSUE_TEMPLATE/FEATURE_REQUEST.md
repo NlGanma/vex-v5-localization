@@ -1,24 +1,24 @@
 ---
-name: Feature Request
-about: Suggest an idea for the project
-title: "[FEATURE]"
+name: Feature request
+about: Propose a focused improvement to the localization stack or tuning workflow
+title: "[Feature] "
 labels: "enhancement"
 assignees: ""
 ---
 
-#### Requested Feature
-<!-- Concisely describe the behavior you are requesting here -->
+## Problem
 
-<!-- Describe any details in point form here -->
- - a
- - b
- - c
+Describe the limitation or operator need.
 
-#### Current Implementation
-<!-- Describe the current implementation here -->
+## Proposed Behavior
 
-#### Motivation
-<!-- Explain why this feature would benefit users and/or maintainers -->
+Describe the desired behavior and its user-facing effect.
 
-#### (Optional) Possible Implementations and Alternatives
-<!-- Describe any possible implementations or alternatives you have considered -->
+## Safety And Validation
+
+Explain how the change preserves the odometry fallback and how it can be verified on
+the VEX V5 robot.
+
+## Alternatives
+
+List any simpler approaches or existing mechanisms considered.

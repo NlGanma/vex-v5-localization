@@ -525,7 +525,7 @@ Check, in order:
 - `localization_tune::kEnabled` is true.
 - `kLocalizationTuneTest` in `src/autonomous_control.cpp` is `0`, so autonomous currently runs the normal validation route.
 - `src/tune.txt` is a May 24 pre-calibration Test 5 sweep retained as historical evidence. Its analyzer output is location-specific, contains likely unmodeled occlusions, and is not sufficient by itself for new geometry changes.
-- `report/localization_report.tex` and the generated PDF summarize seven validation runs and the June audit. The boundary re-anchor and latest relocalization cleanup still require the physical protocol in `validation_data/field_test_protocol.md`.
+- `report/localization_report.pdf` summarizes seven validation runs and the June audit. LaTeX/report-generation sources are intentionally not published. The boundary re-anchor and latest relocalization cleanup still require the physical protocol in `validation_data/field_test_protocol.md`.
 - The `MCL + EKF + Odom Newly improved` subfolder has build artifacts but no source. Do source work in the parent root.
 - Re-run `make quick` after the current unpublished source changes; do not rely on the May build status.
 
