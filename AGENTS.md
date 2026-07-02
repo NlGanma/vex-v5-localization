@@ -277,13 +277,13 @@ From `src/localization_config.cpp`:
 - PROS distance confidence is only read when raw distance is at least `200 mm`; otherwise confidence remains unavailable and is accepted as true.
 - Active sensor gating checks distance range and min confidence when confidence is available.
 - Sensor likelihood blends Gaussian likelihood with uniform likelihood based on confidence scale.
-- Outliers multiply by `outlierWeight`; no-hit predictions multiply by `minWeight`.
+- Outliers multiply by `min(outlierWeight, blended likelihood at outlierThreshold)` -- capped so the likelihood is monotone in |error| and an outlier reading can never weight a particle better than an inlier; no-hit predictions multiply by `minWeight`. (Before 2026-07-02 the cap was missing, so the shipped `outlierWeight=0.22` beat the 0.133 Gaussian peak at `sensorStd=3` and inverted the ranking for clouds straddling the threshold.)
 - Weighted mean and covariance are computed before resampling.
 - Resampling is systematic when ESS falls below `resampleEssRatio * numParticles`.
 - Roughening adds local side/forward and theta noise after resampling.
 - `expectedDistance()` computes sensor position from pose and raycasts.
-- Current `raycastToField()` only uses perimeter walls for expected sensor distances. It intentionally does not let low-profile obstacle geometry occlude runtime distance rays. Obstacles are still used to reject invalid particle positions.
-- Do not casually re-enable obstacle occlusion in MCL; comments say logs showed side/back sensors return perimeter-wall distances where low-profile goal supports would otherwise block rays.
+- Current `raycastToField()` raycasts perimeter walls AND the configured obstacles (shipped config: one 6"x6" rect at field center) at raw extents; `obstacleMargin` is a particle keep-out buffer only and is never applied to rays. The fusion-side `expectedDistanceFromPose()`, the reloc scorer, and both Python analyzers model the same geometry, and the 2026-06 replay validated firmware-vs-analyzer agreement on logged expected distances.
+- Do not add low-profile field geometry to the obstacle list; earlier logs showed side/back sensors return perimeter-wall distances where low-profile goal supports would otherwise block rays. Only structure tall enough to reflect at sensor height belongs in `field.obstacles`.
 
 ## EKF Details
 

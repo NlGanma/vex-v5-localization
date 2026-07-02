@@ -359,6 +359,23 @@ MCLMeasurement MCL::update(const std::array<SensorObservation, 4>& observations)
 
     const float sigma = std::max(cfg_.sensorStd, 1e-3f);
     const float uniformLikelihood = 1.0f / (sigma * kSqrt2Pi);
+    // Per-sensor outlier multiplier: outlierWeight capped at the blended
+    // likelihood evaluated AT the outlier threshold, so the per-sensor
+    // likelihood is monotone non-increasing in |error| for any tuning. Uncapped,
+    // an outlierWeight above the in-threshold likelihood (e.g. 0.22 vs the
+    // 0.133 Gaussian peak at sensorStd=3) REWARDS particles whose prediction is
+    // grossly wrong over particles that match the reading perfectly. When every
+    // particle is an outlier on a sensor (blocked sensor), the multiplier is
+    // shared and cancels in normalization, so this changes nothing there; it
+    // only fixes the mixed inlier/outlier population, where the old floor
+    // inverted the ranking exactly when the cloud straddles real drift.
+    const float thresholdLikelihood = gaussianPdf(cfg_.outlierThreshold, sigma);
+    std::array<float, 4> outlierMultiplier {};
+    for (int k = 0; k < activeCount; ++k) {
+        const float confScale = active[k].confidenceScale;
+        const float boundaryLikelihood = confScale * thresholdLikelihood + (1.0f - confScale) * uniformLikelihood;
+        outlierMultiplier[static_cast<size_t>(k)] = std::min(cfg_.outlierWeight, boundaryLikelihood);
+    }
     float weights_sum = 0.0f;
 
     for (auto& p : particles_) {
@@ -376,7 +393,7 @@ MCLMeasurement MCL::update(const std::array<SensorObservation, 4>& observations)
             }
             const float error = predicted - active[k].measurement;
             if (std::fabs(error) > cfg_.outlierThreshold) {
-                w *= cfg_.outlierWeight;
+                w *= outlierMultiplier[static_cast<size_t>(k)];
             } else {
                 // Blend Gaussian likelihood toward uniform based on confidence
                 const float likelihood = gaussianPdf(error, sigma);

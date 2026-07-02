@@ -63,6 +63,9 @@ struct MCLConfig { // TUNE
         int numParticles = 500;
         float sensorStd = 2.0f; // inches
         float outlierThreshold = 6.0f; // inches
+        // Weight multiplier for readings beyond outlierThreshold. Applied as
+        // min(outlierWeight, blended likelihood at the threshold) so an outlier
+        // can never outweigh an inlier regardless of how this is tuned.
         float outlierWeight = 0.2f;
         float minWeight = 1e-9f;
         float resampleEssRatio = 0.5f;
