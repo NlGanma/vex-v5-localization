@@ -296,7 +296,6 @@ void lemlib::update() {
     const float dt = computeDt(nowMs);
     const float maxDeltaPerUpdate = computeMaxDelta(dt);
     const float maxHeadingDelta = computeMaxHeadingDelta(dt);
-    // TODO: add particle filter
     // get the current sensor values
     float vertical1Raw = 0;
     float vertical2Raw = 0;
