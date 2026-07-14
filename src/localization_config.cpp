@@ -65,7 +65,6 @@ lemlib::localization::LocalizationConfig buildLocalizationConfig() {
     loc.fusion.maxVarXY = 81.0f;
     loc.fusion.maxVarTheta = 0.10f;
     loc.fusion.maxMeasurementDeltaXY = 2.5f;
-    loc.fusion.maxMeasurementDeltaTheta = lemlib::degToRad(4.0f);
     loc.fusion.maxCorrectionXY = 0.015f;
     loc.fusion.maxCorrectionTheta = lemlib::degToRad(0.5f);
     // One-shot re-anchor applied only between motions (robot stopped) on a fully

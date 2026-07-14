@@ -9,10 +9,13 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
     params.earlyExitRange = fabs(params.earlyExitRange);
     this->requestMotionStart();
     // were all motions cancelled?
-    if (!this->motionRunning) {
+    if (!this->motionRunning.load()) {
         this->endMotion();
         return;
     }
+    // capture the motion generation: motionContinues() makes a cancelled loop
+    // exit even if a new motion re-raises motionRunning before this one re-checks
+    const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
         pros::Task task([=, this]() { moveToPoint(x, y, timeout, params, false); });
@@ -29,7 +32,7 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
 
     // initialize vars used between iterations
     Pose lastPose = getPose();
-    distTraveled = 0;
+    distTraveled.store(0.0f);
     Timer timer(timeout);
     bool close = false;
     float prevLateralOut = 0; // previous lateral power
@@ -42,12 +45,12 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
 
     // main loop
     while (!timer.isDone() && ((!lateralSmallExit.getExit() && !lateralLargeExit.getExit()) || !close) &&
-           this->motionRunning) {
+           this->motionContinues(motionGen)) {
         // update position
         const Pose pose = getPose(true, true);
 
         // update distance traveled
-        distTraveled += pose.distance(lastPose);
+        distTraveled.fetch_add(pose.distance(lastPose));
         lastPose = pose;
 
         // calculate distance to the target point
@@ -117,6 +120,7 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
         }
 
         // move the drivetrain
+        if (!motionContinues(motionGen)) break;
         moveDrive(leftPower, rightPower);
 
         // delay to save resources
@@ -126,6 +130,6 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
     // stop the drivetrain
     stopDrive();
     // set distTraveled to -1 to indicate that the function has finished
-    distTraveled = -1;
+    distTraveled.store(-1.0f);
     this->endMotion();
 }

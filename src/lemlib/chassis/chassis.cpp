@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <math.h>
+#include "pros/apix.h"
 #include "pros/imu.hpp"
 #include "pros/motors.h"
 #include "pros/rtos.h"
@@ -44,7 +45,12 @@ lemlib::Chassis::Chassis(Drivetrain drivetrain, ControllerSettings linearSetting
       lateralLargeExit(lateralSettings.largeError, lateralSettings.largeErrorTimeout),
       lateralSmallExit(lateralSettings.smallError, lateralSettings.smallErrorTimeout),
       angularLargeExit(angularSettings.largeError, angularSettings.largeErrorTimeout),
-      angularSmallExit(angularSettings.smallError, angularSettings.smallErrorTimeout) {}
+      angularSmallExit(angularSettings.smallError, angularSettings.smallErrorTimeout),
+      motionSemaphore(pros::c::sem_create(1, 1)) {}
+
+lemlib::Chassis::~Chassis() {
+    if (motionSemaphore != nullptr) pros::c::sem_delete(motionSemaphore);
+}
 
 void lemlib::Chassis::configurePto(PtoSettings settings) {
     pto = settings;
@@ -62,9 +68,11 @@ void lemlib::Chassis::engagePto(bool async) {
     for (int i = 0; i < 4; ++i) {
         if (pto.motorGroups[i].motors != nullptr) pto.motorGroups[i].motors->move(0);
     }
+    // Close the software gate before changing the piston/roles so no concurrent
+    // released-PTO command can race the physical engagement.
+    ptoEngaged.store(true);
     if (pto.piston != nullptr) pto.piston->set_value(pto.engagedValue);
 
-    ptoEngaged = true;
     for (int i = 0; i < 4; ++i) {
         ptoRoles[i] = PtoRole::DISABLED;
         if (pto.motorGroups[i].motors == nullptr) continue;
@@ -79,10 +87,10 @@ void lemlib::Chassis::disengagePto(PtoReleaseParams params, bool async) {
         return;
     }
 
-    if (pto.piston != nullptr) pto.piston->set_value(!pto.engagedValue);
-
-    ptoEngaged = false;
     for (int i = 0; i < 4; ++i) ptoRoles[i] = params.motorRoles[i];
+    if (pto.piston != nullptr) pto.piston->set_value(!pto.engagedValue);
+    // Publish the released state only after all roles are ready for readers.
+    ptoEngaged.store(false);
 
     if (!params.stopMotors) return;
     for (int i = 0; i < 4; ++i) {
@@ -91,18 +99,18 @@ void lemlib::Chassis::disengagePto(PtoReleaseParams params, bool async) {
 }
 
 void lemlib::Chassis::movePtoRole(PtoRole role, int power) {
-    if (ptoEngaged || role == PtoRole::DISABLED) return;
+    if (ptoEngaged.load() || role == PtoRole::DISABLED) return;
     for (int i = 0; i < 4; ++i) {
         if (pto.motorGroups[i].motors != nullptr && ptoRoles[i] == role) pto.motorGroups[i].motors->move(power);
     }
 }
 
 void lemlib::Chassis::movePtoGroup(int index, int power) {
-    if (ptoEngaged || index < 0 || index >= 4) return;
+    if (ptoEngaged.load() || index < 0 || index >= 4) return;
     if (pto.motorGroups[index].motors != nullptr) pto.motorGroups[index].motors->move(power);
 }
 
-bool lemlib::Chassis::isPtoEngaged() const { return ptoEngaged; }
+bool lemlib::Chassis::isPtoEngaged() const { return ptoEngaged.load(); }
 
 lemlib::PtoRole lemlib::Chassis::getPtoRole(int index) const {
     if (index < 0 || index >= 4) return PtoRole::DISABLED;
@@ -206,13 +214,16 @@ lemlib::Pose lemlib::Chassis::getPose(bool radians, bool standardPos) {
 
 void lemlib::Chassis::waitUntil(float dist) {
     // do while to give the thread time to start
-    do pros::delay(10);
-    while (distTraveled <= dist && distTraveled != -1);
+    while (true) {
+        pros::delay(10);
+        const float traveled = distTraveled.load();
+        if (traveled > dist || traveled == -1.0f) break;
+    }
 }
 
 void lemlib::Chassis::waitUntilDone() {
     do pros::delay(10);
-    while (distTraveled != -1);
+    while (distTraveled.load() != -1.0f);
 }
 
 void lemlib::Chassis::moveDrive(float left, float right) {
@@ -220,7 +231,7 @@ void lemlib::Chassis::moveDrive(float left, float right) {
     lastCommandedRightOutput = right;
     drivetrain.leftMotors->move(left);
     drivetrain.rightMotors->move(right);
-    if (!ptoEngaged) return;
+    if (!ptoEngaged.load()) return;
     for (int i = 0; i < 4; ++i) {
         if (pto.motorGroups[i].motors == nullptr) continue;
         pto.motorGroups[i].motors->move(pto.motorGroups[i].driveSide == DriveSide::LEFT ? left : right);
@@ -236,7 +247,7 @@ void lemlib::Chassis::moveDriveSide(DriveSide side, float power) {
         drivetrain.rightMotors->move(power);
     }
 
-    if (!ptoEngaged) return;
+    if (!ptoEngaged.load()) return;
     for (int i = 0; i < 4; ++i) {
         if (pto.motorGroups[i].motors == nullptr || pto.motorGroups[i].driveSide != side) continue;
         pto.motorGroups[i].motors->move(power);
@@ -252,7 +263,7 @@ void lemlib::Chassis::brakeDriveSide(DriveSide side) {
         drivetrain.rightMotors->brake();
     }
 
-    if (!ptoEngaged) return;
+    if (!ptoEngaged.load()) return;
     for (int i = 0; i < 4; ++i) {
         if (pto.motorGroups[i].motors == nullptr || pto.motorGroups[i].driveSide != side) continue;
         pto.motorGroups[i].motors->brake();
@@ -260,6 +271,11 @@ void lemlib::Chassis::brakeDriveSide(DriveSide side) {
 }
 
 void lemlib::Chassis::stopDrive() { moveDrive(0, 0); }
+
+void lemlib::Chassis::noteExternalDriveCommand(float left, float right) {
+    lastCommandedLeftOutput = left;
+    lastCommandedRightOutput = right;
+}
 
 float lemlib::Chassis::getLastCommandedLeftOutput() const { return lastCommandedLeftOutput.load(); }
 
@@ -274,7 +290,7 @@ void lemlib::Chassis::setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mo
     pros::MotorGroup* motors = side == DriveSide::LEFT ? drivetrain.leftMotors : drivetrain.rightMotors;
     motors->set_brake_mode_all(mode);
 
-    if (!ptoEngaged) return;
+    if (!ptoEngaged.load()) return;
     for (int i = 0; i < 4; ++i) {
         if (pto.motorGroups[i].motors == nullptr || pto.motorGroups[i].driveSide != side) continue;
         pto.motorGroups[i].motors->set_brake_mode_all(mode);
@@ -282,52 +298,126 @@ void lemlib::Chassis::setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mo
 }
 
 void lemlib::Chassis::requestMotionStart() {
+    const uint32_t queueCancelSnapshot = this->motionQueueCancelGeneration.load();
+    this->motionQueued.fetch_add(1);
     lemlib::localization::setMotionCorrectionSuppressed(true);
-    if (this->isInMotion()) this->motionQueued = true; // indicate a motion is queued
-    else this->motionRunning = true; // indicate a motion is running
+    const bool acquired = motionSemaphore != nullptr && pros::c::sem_wait(motionSemaphore, TIMEOUT_MAX);
+    this->motionQueued.fetch_sub(1);
+    if (acquired) this->motionOwner.store(pros::c::task_get_current());
 
-    // wait until this motion is at front of "queue"
-    this->mutex.take(TIMEOUT_MAX);
-
-    // this->motionRunning should be true
-    // and this->motionQueued should be false
-    // indicating this motion is running
+    // cancelAllMotions invalidates every request that was already waiting, while
+    // cancelMotion invalidates only the active loop. A cancelled waiter still
+    // owns the semaphore here so its normal endMotion path can release it.
+    const bool cancelledWhileQueued = queueCancelSnapshot != this->motionQueueCancelGeneration.load();
+    this->motionRunning.store(acquired && !cancelledWhileQueued);
+    this->motionBoundaryReanchorAllowed.store(acquired && !cancelledWhileQueued);
 }
 
 void lemlib::Chassis::endMotion() {
-    // move the "queue" forward 1
-    this->motionRunning = this->motionQueued;
-    this->motionQueued = false;
-    lemlib::localization::setMotionCorrectionSuppressed(this->motionRunning);
+    this->motionRunning.store(false);
+    const bool boundaryAllowed = this->motionBoundaryReanchorAllowed.exchange(false);
+    const bool nextMotionQueued = this->motionQueued.load() > 0;
 
-    // Robot just went fully idle between segments: ask localization to commit its
-    // trusted pose in one bounded step so the next motion starts from truth. No-op
-    // if no gated fix lands before the next motion suppresses corrections again.
-    if (!this->motionRunning) lemlib::localization::requestBoundaryReanchor();
+    if (nextMotionQueued) {
+        lemlib::localization::setMotionCorrectionSuppressed(true);
+    } else {
+        // The drivetrain has already been stopped and this task still owns the
+        // motion semaphore, so a staged, fully-gated correction can be committed here
+        // without a scheduler-dependent idle delay or any in-motion pose change.
+        const bool stagedCommit = boundaryAllowed && lemlib::localization::applyStagedBoundaryReanchor();
+        lemlib::localization::setMotionCorrectionSuppressed(false);
+        if (boundaryAllowed && !stagedCommit) lemlib::localization::requestBoundaryReanchor();
+    }
 
-    // permit queued motion to run
-    this->mutex.give();
+    // A request can arrive while this function is opening the idle window, so
+    // reassert suppression before waking it if a waiter appeared between the
+    // two queue reads. A later request sets suppression itself before waiting.
+    if (!nextMotionQueued && this->motionQueued.load() > 0) {
+        lemlib::localization::setMotionCorrectionSuppressed(true);
+    }
+    // Permit exactly one queued motion to run only after its pose-injection
+    // suppression is guaranteed active.
+    this->motionOwner.store(nullptr);
+    if (motionSemaphore != nullptr) pros::c::sem_post(motionSemaphore);
 }
 
 void lemlib::Chassis::cancelMotion() {
-    this->motionRunning = false;
+    // bump the generation FIRST: a motion tick-sliced mid-body re-checks
+    // motionContinues() and must lose even if a new motion re-raises
+    // motionRunning before it gets to run again
+    this->motionGeneration.fetch_add(1);
+    const bool wasRunning = this->motionRunning.load();
+    this->motionBoundaryReanchorAllowed.store(false);
     // cancelMotion only cancels the CURRENT motion, not a queued one. If a
     // motion is still queued it will run next, so keep corrections suppressed;
     // the queued motion's endMotion will recompute suppression from there.
-    lemlib::localization::setMotionCorrectionSuppressed(this->motionQueued);
-    if (!this->motionQueued) lemlib::localization::requestBoundaryReanchor();
+    lemlib::localization::setMotionCorrectionSuppressed(true);
+    stopDrive();
     pros::delay(10); // give time for motion to stop
+    if (!wasRunning && !this->motionRunning.load() && this->motionQueued.load() == 0) {
+        lemlib::localization::setMotionCorrectionSuppressed(false);
+        lemlib::localization::clearBoundaryReanchor();
+    }
 }
 
 void lemlib::Chassis::cancelAllMotions() {
-    this->motionRunning = false;
-    this->motionQueued = false;
-    lemlib::localization::setMotionCorrectionSuppressed(false);
-    lemlib::localization::requestBoundaryReanchor();
+    this->motionGeneration.fetch_add(1);
+    this->motionQueueCancelGeneration.fetch_add(1);
+    const bool wasRunning = this->motionRunning.load();
+    this->motionBoundaryReanchorAllowed.store(false);
+    // Keep injection suppressed until the live owner has observed cancellation,
+    // stopped the drivetrain, and released the motion semaphore in endMotion().
+    lemlib::localization::setMotionCorrectionSuppressed(true);
+    stopDrive();
     pros::delay(10); // give time for motion to stop
+    if (!wasRunning && !this->motionRunning.load() && this->motionQueued.load() == 0) {
+        lemlib::localization::setMotionCorrectionSuppressed(false);
+        lemlib::localization::clearBoundaryReanchor();
+    }
 }
 
-bool lemlib::Chassis::isInMotion() const { return this->motionRunning; }
+void lemlib::Chassis::recoverInterruptedMotion() {
+    if (motionSemaphore == nullptr) return;
+
+    const pros::task_t owner = this->motionOwner.load();
+    if (owner != nullptr) {
+        const pros::task_state_e_t state = pros::c::task_get_state(owner);
+        if (state != pros::E_TASK_STATE_DELETED && state != pros::E_TASK_STATE_INVALID) {
+            return;
+        }
+        this->motionOwner.store(nullptr);
+        this->motionRunning.store(false);
+        this->motionBoundaryReanchorAllowed.store(false);
+        pros::c::sem_post(motionSemaphore);
+    } else {
+        // A live cancelled motion normally releases within one control tick. Probe
+        // for 50 ms; if it remains unavailable and no motion is published, the PROS
+        // competition task died while owning it. Unlike a mutex, a semaphore can be
+        // released by lifecycle cleanup, and existing waiters remain attached.
+        if (pros::c::sem_wait(motionSemaphore, 50)) {
+            pros::c::sem_post(motionSemaphore);
+        } else if (!this->isInMotion()) {
+            // Covers the tiny acquire-to-owner-publication window if its task
+            // was killed there.
+            pros::c::sem_post(motionSemaphore);
+        } else {
+            return;
+        }
+    }
+
+    if (this->motionQueued.load() == 0) {
+        lemlib::localization::setMotionCorrectionSuppressed(false);
+        lemlib::localization::clearBoundaryReanchor();
+    }
+}
+
+bool lemlib::Chassis::isInMotion() const { return this->motionRunning.load(); }
+
+bool lemlib::Chassis::motionContinues(uint32_t generation) const {
+    return this->motionRunning.load() && generation == this->motionGeneration.load();
+}
+
+uint32_t lemlib::Chassis::motionGenerationSnapshot() const { return this->motionGeneration.load(); }
 
 void lemlib::Chassis::resetLocalPosition() {
     float theta = this->getPose().theta;
@@ -342,21 +432,22 @@ void lemlib::Chassis::setBrakeMode(pros::motor_brake_mode_e mode) {
 void lemlib::Chassis::drivePulse(float power, int timeout, bool async) {
     const int pulseTime = std::max(timeout, 0);
     if (pulseTime == 0) {
-        distTraveled = -1;
+        distTraveled.store(-1.0f);
         moveDrive(power, power);
         return;
     }
 
     requestMotionStart();
-    if (!this->motionRunning) {
-        // Mirror every other motion: release the mutex and restore the
+    if (!this->motionRunning.load()) {
+        // Mirror every other motion: release the semaphore and restore the
         // suppression flag on the cancelled-before-start path. Without this,
-        // a queued drivePulse cancelled before it ran would leak this->mutex
+        // a queued drivePulse cancelled before it ran would leak motion ownership
         // (deadlocking all future motions) and leave correction suppression
         // stuck true for the rest of the run.
         this->endMotion();
         return;
     }
+    const uint32_t motionGen = this->motionGenerationSnapshot();
 
     if (async) {
         pros::Task task([=, this]() { drivePulse(power, pulseTime, false); });
@@ -365,13 +456,13 @@ void lemlib::Chassis::drivePulse(float power, int timeout, bool async) {
         return;
     }
 
-    distTraveled = 0;
-    moveDrive(power, power);
+    distTraveled.store(0.0f);
+    if (motionContinues(motionGen)) moveDrive(power, power);
 
     lemlib::Timer timer(pulseTime);
-    while (!timer.isDone() && motionRunning) pros::delay(10);
+    while (!timer.isDone() && motionContinues(motionGen)) pros::delay(10);
 
     stopDrive();
-    distTraveled = -1;
+    distTraveled.store(-1.0f);
     endMotion();
 }

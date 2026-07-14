@@ -14,7 +14,7 @@ Examples:
 The reject-mask bit names match src/lemlib/localization/localization.cpp.
 """
 from __future__ import annotations
-import argparse, math
+import argparse, math, sys
 from pathlib import Path
 
 TRACE_MARKER = "=== LOCALIZATION TRACE CSV ==="
@@ -72,13 +72,26 @@ def main() -> int:
     if a.accepted:
         sel = [r for r in sel if r.get("correction_accepted") == "1"]
     if a.filter:
+        try:
+            filter_code = compile(a.filter, "--filter", "eval")
+        except (SyntaxError, ValueError) as exc:
+            print(f"error: invalid --filter: {exc}", file=sys.stderr)
+            return 2
+
         def ok(r):
             env = {k: num(v) for k, v in r.items()}
+            mask = int(env.get("correction_reject_mask", 0) or 0)
+            for bit, name in REJECT_BITS.items():
+                env[name] = 1.0 if mask & bit else 0.0
             try:
-                return bool(eval(a.filter, {"__builtins__": {}}, env))
-            except Exception:
-                return False
-        sel = [r for r in sel if ok(r)]
+                return bool(eval(filter_code, {"__builtins__": {}}, env))
+            except Exception as exc:
+                raise ValueError(str(exc)) from exc
+        try:
+            sel = [r for r in sel if ok(r)]
+        except ValueError as exc:
+            print(f"error: invalid --filter: {exc}", file=sys.stderr)
+            return 2
     print(f"# matched {len(sel)} rows")
 
     if a.reject_bits:

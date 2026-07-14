@@ -56,7 +56,13 @@ void Timer::reset() {
 }
 
 void Timer::pause() {
-    if (!paused) lastTime = pros::millis();
+    if (!paused) {
+        // fold the running interval since the last accessor into timeWaited
+        // before freezing, or that time is silently discarded
+        const uint32_t now = pros::millis();
+        timeWaited += now - lastTime;
+        lastTime = now;
+    }
     paused = true;
 }
 

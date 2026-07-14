@@ -163,8 +163,13 @@ void setPoseSilent(Pose pose, bool radians = false);
  * expectedSeq, holding the odom update lock (same order as the tracking task)
  * so a concurrent odom integration step cannot be silently overwritten.
  *
- * @return true if the write was applied, false if odom advanced (write skipped)
+ * @param abortIf optional predicate evaluated under the odom locks; if it
+ * returns true the write is skipped. Lets the caller re-check a condition
+ * (e.g. motion-correction suppression) that another task may have flipped
+ * between building the pose and committing it.
+ * @return true if the write was applied, false if odom advanced or the abort
+ * predicate fired (write skipped)
  */
-bool setPoseSilentIfSeq(Pose pose, uint32_t expectedSeq, bool radians = false);
+bool setPoseSilentIfSeq(Pose pose, uint32_t expectedSeq, bool radians = false, bool (*abortIf)() = nullptr);
 } // namespace detail
 } // namespace lemlib

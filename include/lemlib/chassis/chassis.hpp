@@ -391,6 +391,7 @@ class Chassis {
         Chassis(Drivetrain drivetrain, ControllerSettings linearSettings, ControllerSettings angularSettings,
                 OdomSensors sensors, DriveCurve* throttleCurve = &defaultDriveCurve,
                 DriveCurve* steerCurve = &defaultDriveCurve);
+        ~Chassis();
         /**
          * @brief Calibrate the chassis sensors. THis should be called in the initialize function
          *
@@ -982,6 +983,14 @@ class Chassis {
          */
         void cancelAllMotions();
         /**
+         * @brief Recover the motion semaphore after an interrupted motion.
+         *
+         * When a blocking motion's task is killed externally (PROS deletes the
+         * running competition task on a mode change), release the owner-independent
+         * motion semaphore after giving a live cancelled task time to exit.
+         */
+        void recoverInterruptedMotion();
+        /**
          * @return whether a motion is currently running
          *
          * @b Example
@@ -1030,6 +1039,13 @@ class Chassis {
          * @return the last commanded right drivetrain output
          */
         float getLastCommandedRightOutput() const;
+        /**
+         * @brief Record a drive command issued outside the chassis (e.g. the
+         * teleop loop driving MotorGroups directly), so consumers of the
+         * last-commanded outputs — the PTO shift FOLLOW phase in particular —
+         * see the live command instead of a stale zero.
+         */
+        void noteExternalDriveCommand(float left, float right);
     protected:
         /**
          * @brief Indicates that this motion is queued and blocks current task until this motion reaches front of queue
@@ -1039,6 +1055,22 @@ class Chassis {
          * @brief Dequeues this motion and permits queued task to run
          */
         void endMotion();
+        /**
+         * @brief Whether the motion that captured `generation` should keep running.
+         *
+         * Motion loops poll this instead of the raw motionRunning flag: a
+         * cancelled motion that was tick-sliced mid-body could otherwise observe
+         * motionRunning == true again after a NEW motion set it, and resume
+         * driving toward its stale target. cancelMotion/cancelAllMotions bump
+         * the generation, so the cancelled loop exits no matter how the flag
+         * looks by the time it re-checks.
+         */
+        bool motionContinues(uint32_t generation) const;
+        /**
+         * @brief Capture the current motion generation. Called once by a motion
+         * after requestMotionStart() returns.
+         */
+        uint32_t motionGenerationSnapshot() const;
         /**
          * @brief Move the drivetrain. If the PTO is engaged, the PTO motors mirror the drive output.
          */
@@ -1064,10 +1096,10 @@ class Chassis {
          */
         void setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mode_e mode);
 
-        bool motionRunning = false;
-        bool motionQueued = false;
+        std::atomic_bool motionRunning {false};
+        std::atomic<uint32_t> motionQueued {0};
 
-        float distTraveled = -1;
+        std::atomic<float> distTraveled {-1.0f};
 
         ControllerSettings lateralSettings;
         ControllerSettings angularSettings;
@@ -1082,10 +1114,14 @@ class Chassis {
         ExitCondition angularSmallExit;
     private:
         PtoSettings pto {};
-        bool ptoEngaged = false;
+        std::atomic_bool ptoEngaged {false};
         PtoRole ptoRoles[4] = {PtoRole::DISABLED, PtoRole::DISABLED, PtoRole::DISABLED, PtoRole::DISABLED};
         std::atomic<float> lastCommandedLeftOutput = 0.0f;
         std::atomic<float> lastCommandedRightOutput = 0.0f;
-        pros::Mutex mutex;
+        std::atomic<uint32_t> motionGeneration {0};
+        std::atomic<uint32_t> motionQueueCancelGeneration {0};
+        std::atomic<pros::task_t> motionOwner {nullptr};
+        std::atomic_bool motionBoundaryReanchorAllowed {false};
+        void* motionSemaphore = nullptr;
 };
 } // namespace lemlib

@@ -18,6 +18,14 @@ void opcontrol() {
     localization_tune::setDriverDriveLoopTicking(false);
     localization_tune::finalizeInterruptedRunIfNeeded("Interrupted", "Entered driver control");
     stopChassisMotion();
+    // Recover the motion semaphore if the autonomous task died while holding it
+    // (skipped autonomous->driver transitions bypass disabled()).
+    chassis.recoverInterruptedMotion();
+    // cancelAllMotions arms the boundary re-anchor one-shot, but in teleop no
+    // motion ever suppresses corrections, so it would stay armed and commit a
+    // bounded pose step while the driver is moving; the one-shot is documented
+    // as between-motions-while-stopped only, so drop it.
+    lemlib::localization::clearBoundaryReanchor();
 
     if (kSmokeTestMode) {
         bool rumbled = false;

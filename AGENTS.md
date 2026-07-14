@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Future Codex agents: read this first. This file was written on 2026-05-02 and updated on 2026-06-22 to preserve repo context for later chats. Source code and trace metadata override prose when tuning state changes.
+Future Codex agents: read this first. This file was written on 2026-05-02 and updated on 2026-07-13 to preserve repo context for later chats. Source code and trace metadata override prose when tuning state changes.
 
 ## Project Boundary
 
@@ -23,7 +23,7 @@ Future Codex agents: read this first. This file was written on 2026-05-02 and up
 
 - This is a PROS V5 project. `project.pros` says `project_name` is `MCL+EKF+`, target `v5`, kernel `4.2.1`, upload slot `1`, icon `robot`.
 - The top-level `Makefile` configures a LemLib library template: `IS_LIBRARY:=1`, `LIBNAME:=LemLib`, `VERSION:=0.5.6`, `USE_PACKAGE:=1`.
-- `README.md` is upstream-ish LemLib documentation and may mention older version badges. Trust the `Makefile` for the active library version.
+- `README.md` is this project's own repo introduction (localization overview, validation snapshot, built-in test-route table, log-collection workflow, safety contract) — treat its claims as current and authoritative. The `Makefile` remains authoritative for the LemLib library version (0.5.6).
 - C++ standard is `gnu++23` from `common.mk`; the VS Code config says `gnu++20`, but the build uses C++23.
 - Target flags include `arm-none-eabi`, Cortex-A9, `-mfpu=neon-fp16`, hard float, `-Os`, `-g`, `-mthumb`.
 - Preferred build command after C++ changes: `make quick` from the root.
@@ -242,14 +242,17 @@ From `src/localization_config.cpp`:
   - history of recent deltas and raw telemetry for localization replay.
 - Localization consumes every odom delta since its last sequence number. If it detects skipped history, it resets filters from the current odom snapshot.
 - `lemlib::setPose()` syncs odom and localization.
-- `lemlib::detail::setPoseSilent()` is only for the localization task to inject the fused pose into odom without recursively resetting filters.
+- `lemlib::detail::setPoseSilentIfSeq()` is only for the localization task to inject the fused pose into odom (seq-checked under the odom locks, with a suppression re-check, so a concurrent odom integration or a just-started motion defers the correction) without recursively resetting filters. The unchecked `setPoseSilent()` overload currently has no callers.
 - The localization task:
   - predicts EKF and MCL on odom deltas.
   - runs MCL at `fusion.mclPeriodMs`.
   - computes NIS against EKF.
   - accepts corrections only when sensors are live, geometry/confidence/variance/delta gates pass, candidate poses are stable, and turn-rate suppression is clear.
+  - never runs the local range-grid solver or injects a pose into driven odometry while chassis motion correction suppression is active.
+  - can stage a fully gated EKF correction while moving; `Chassis::endMotion()` commits a fresh staged correction, within boundary caps, only after the drivetrain has stopped and while the motion semaphore is still owned.
   - writes a trace sample every loop.
 - Trace capacity is `8192` samples.
+- Trace CSV includes `boundary_reanchor_applied`, which distinguishes a legal stopped-boundary step from continuous correction steps.
 - `lemlib::localization::getLatestTraceSample()` and `getTraceSamples()` can return radians or degrees.
 
 ## Odometry Details
@@ -259,9 +262,10 @@ From `src/localization_config.cpp`:
   1. horizontal tracking wheel pair if both exist.
   2. vertical tracking wheel pair if both exist and both are unpowered tracking wheels.
   3. IMU delta.
-  4. heading fallback/no change.
+  4. drivetrain fallback: vertical pair including powered (motor-encoder-substituted) wheels, only when the IMU is permanently absent (nulled after failed calibration). Heading is then slip-prone: relocalization's heading prior and the boundary re-anchor inherit that drift in this degraded mode, but the wall-solve residual gates and fusion accept gates still validate every commit, and the mode is loudly warned at boot ("IMU FAILED").
+  5. hold last heading (transient non-finite IMU delta).
 - Current robot has one vertical and one horizontal tracking wheel, so heading normally comes from IMU.
-- Odom clamps impossible encoder deltas based on a speed bound derived from drivetrain speed, with fallback max speed `120 ips` and margin `3`.
+- Odom rejects impossible encoder deltas outright and immediately re-baselines that sensor, preventing a reset-to-zero sensor from freezing until it reaccumulates its old reading. The speed bound is derived from drivetrain speed, with fallback max speed `120 ips` and margin `3`; the raw-reading sanitize gate is `1e5`, which also catches rotation-sensor `PROS_ERR`. Non-finite or impossible IMU jumps are rejected and re-baselined instead of being clamped into a fabricated heading step.
 - Minimum dt is `0.005 s`.
 - Odom history capacity is `256` deltas/telemetry samples.
 - Important sensor offsets in trace metadata:
@@ -409,6 +413,8 @@ Offline analyzer:
 - `moveReleasedPtoDriveOutputs()` uses last drive outputs while shifting from 8-motor drive to 4-motor drive so PTO motors follow briefly before creep.
 - `trySwitchToFourMotorDrive()` refuses to shift while a motion is active, unless already released. Blocking wrappers use `waitForShiftWindow()`.
 - `trySwitchToEightMotorDrive()` also refuses during motion, then engages PTO, creeps, stops, delays, and sets PTO controller gains.
+- PTO shift and autonomous manipulator tasks have tracked handles/generations and explicit cancellation paths, so disabled-mode cleanup cannot leave a stale creep or mechanism command running.
+- Eight-motor engagement creep uses a chassis motion pulse, preserving the same no-in-motion-pose-injection contract as autonomous moves.
 - Autonomous helpers often call `disableEightMotorPositionHold()` before moving mechanisms.
 - Do not start long-running manipulator tasks without a corresponding stop path; the code has explicit task handles and removes the autonomous manipulator task.
 - Color sort has a background task that is created once and controlled by atomics.
@@ -486,7 +492,7 @@ Offline analyzer:
 
 Check, in order:
 
-1. `src/localization_config.cpp` fusion gates: `minCorrectionSensors`, `minConfidence`, `maxMeasurementDeltaXY`, `maxMeasurementDeltaTheta`, `maxCorrectionXY`, `maxCorrectionTheta`, `sensorStaleMs`.
+1. `src/localization_config.cpp` fusion gates: `minCorrectionSensors`, `minConfidence`, `maxMeasurementDeltaXY`, `maxCorrectionXY`, `maxCorrectionTheta`, `sensorStaleMs`. (`maxMeasurementDeltaTheta` was removed 2026-07: heading never comes from range measurements, so the knob was provably inert.)
 2. `src/lemlib/localization/localization.cpp` correction gating/stability constants and turn suppression.
 3. Whether active sensors are 2 or 3+ in the trace.
 4. Whether the latest correction was accepted and NIS value.
@@ -527,7 +533,7 @@ Check, in order:
 - `src/tune.txt` is a May 24 pre-calibration Test 5 sweep retained as historical evidence. Its analyzer output is location-specific, contains likely unmodeled occlusions, and is not sufficient by itself for new geometry changes.
 - `report/localization_report.pdf` summarizes seven validation runs and the June audit. LaTeX/report-generation sources are intentionally not published. The boundary re-anchor and latest relocalization cleanup still require the physical protocol in `validation_data/field_test_protocol.md`.
 - The `MCL + EKF + Odom Newly improved` subfolder has build artifacts but no source. Do source work in the parent root.
-- Re-run `make quick` after the current unpublished source changes; do not rely on the May build status.
+- The 2026-07-13 audited source passed a from-scratch `make quick`; rebuild after any later source change.
 
 ## Verification Checklist
 

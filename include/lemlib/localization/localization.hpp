@@ -19,19 +19,13 @@ struct FusionConfig { // TUNE
         float maxVarXY = 36.0f; // inches^2
         float maxVarTheta = 0.12f; // rad^2
         float maxMeasurementDeltaXY = 3.0f; // inches, reject MCL poses this far from odom/EKF track
-        float maxMeasurementDeltaTheta = 0.0872665f; // radians (~5 deg)
         float maxCorrectionXY = 0.5f; // inches per update
         float maxCorrectionTheta = 0.1f; // radians per update
         float blend = 1.0f; // 1 = no extra smoothing, <1 adds smoothing
-        // Boundary re-anchor. When a motion ends and the robot is momentarily idle
-        // between segments, the first fully-gated (NIS/confidence/geometry) accept
-        // commits the trusted EKF pose to odom in ONE bounded step (these caps)
-        // instead of bleeding maxCorrectionXY/loop. This is what lets validated
-        // localization actually beat odom over a long auton: every segment starts
-        // from truth, so cross-segment drift cannot accumulate. It never runs during
-        // a motion (no stutter) and only ever applies an already-accepted correction
-        // (never an ungated jump -> never worse than odom). Set false to restore the
-        // exact validated continuous-only behavior.
+        // Boundary re-anchor. Fully-gated corrections may update the shadow EKF
+        // during a motion, but never the driven odom pose. When the drivetrain is
+        // stopped at the motion boundary, a fresh staged correction can be committed
+        // in ONE bounded step without adding an idle delay or changing pose in motion.
         bool enableBoundaryReanchor = true;
         float maxBoundaryCorrectionXY = 2.5f; // inches, one-shot cap at a motion boundary
         float maxBoundaryCorrectionTheta = 0.0872665f; // radians (~5 deg), one-shot cap at a boundary
@@ -104,6 +98,7 @@ struct TraceSample {
         bool mclValid = false;
         bool sensorsStale = false;
         bool correctionAccepted = false;
+        bool boundaryReanchorApplied = false;
         uint32_t correctionRejectMask = 0;
         float measurementPoseDelta = 0.0f;
         float measurementHeadingDelta = 0.0f;
@@ -129,9 +124,17 @@ void stop();
 bool isRunning();
 void setMotionCorrectionSuppressed(bool suppressed);
 bool isMotionCorrectionSuppressed();
+// Apply a fresh fully-gated correction staged during the current motion. Called
+// by Chassis::endMotion while the drivetrain is stopped and the motion semaphore is
+// still owned, before the next queued motion can read pose.
+bool applyStagedBoundaryReanchor();
 // Request a one-shot boundary re-anchor: the next fully-gated accept (while idle)
 // commits the trusted EKF pose in a single bounded step. Called when a motion ends.
 void requestBoundaryReanchor();
+// Drop any pending boundary re-anchor request. Called on teleop entry: no motion
+// ever suppresses corrections there, so a request armed by cancelAllMotions would
+// otherwise stay armed and commit a bounded step while the driver is moving.
+void clearBoundaryReanchor();
 void syncPose(lemlib::Pose pose);
 void syncPose(lemlib::Pose pose, uint32_t seq);
 

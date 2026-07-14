@@ -216,10 +216,13 @@ float findLookaheadCurvature(lemlib::Pose pose, float heading, lemlib::Pose look
 void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bool forwards, bool async) {
     this->requestMotionStart();
     // were all motions cancelled?
-    if (!this->motionRunning) {
+    if (!this->motionRunning.load()) {
         this->endMotion();
         return;
     }
+    // capture the motion generation: motionContinues() makes a cancelled loop
+    // exit even if a new motion re-raises motionRunning before this one re-checks
+    const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
         pros::Task task([=, this]() { follow(path, lookahead, timeout, forwards, false); });
@@ -232,7 +235,7 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
     if (pathPoints.size() == 0) {
         infoSink()->error("No points in path! Do you have the right format? Skipping motion");
         // set distTraveled to -1 to indicate that the function has finished
-        distTraveled = -1;
+        distTraveled.store(-1.0f);
         // give the mutex back
         this->endMotion();
         return;
@@ -249,16 +252,16 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
     int closestPoint;
     float prevVel = 0;
     int compState = pros::competition::get_status();
-    distTraveled = 0;
+    distTraveled.store(0.0f);
 
     // loop until the robot is within the end tolerance
-    for (int i = 0; i < timeout / 10 && pros::competition::get_status() == compState && this->motionRunning; i++) {
+    for (int i = 0; i < timeout / 10 && pros::competition::get_status() == compState && this->motionContinues(motionGen); i++) {
         // get the current position of the robot
         pose = this->getPose(true);
         if (!forwards) pose.theta -= M_PI;
 
         // update completion vars
-        distTraveled += pose.distance(lastPose);
+        distTraveled.fetch_add(pose.distance(lastPose));
         lastPose = pose;
 
         // find the closest point on the path to the robot
@@ -302,6 +305,7 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
         }
 
         // move the drivetrain
+        if (!motionContinues(motionGen)) break;
         if (forwards) {
             moveDrive(targetLeftVel, targetRightVel);
         } else {
@@ -314,7 +318,7 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
     // stop the robot
     stopDrive();
     // set distTraveled to -1 to indicate that the function has finished
-    distTraveled = -1;
+    distTraveled.store(-1.0f);
     // give the mutex back
     this->endMotion();
 }

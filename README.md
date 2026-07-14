@@ -40,7 +40,7 @@ This project treats odometry as the baseline and localization as gated evidence:
 - **EKF** propagates odometry uncertainty and evaluates MCL measurements.
 - **Start relocalization** anchors the autonomous frame while the robot is stationary.
 - **Strict fusion gates** reject implausible, unstable, or poorly observed corrections.
-- **Boundary re-anchors** apply trusted corrections only while the chassis is idle.
+- **Boundary re-anchors** stage trusted evidence during motion and apply it only after the drivetrain stops.
 - **Deep-dive telemetry** exports every relevant pose, sensor, covariance, and gate state.
 - **Reusable PTO control** switches shared motors safely between 4-motor mechanisms
   and an 8-motor drivetrain.
@@ -53,8 +53,9 @@ flowchart LR
     D["Four distance sensors"] --> M["MCL<br/>450 particles"]
     M --> G["Geometry, confidence,<br/>NIS, stability, freshness"]
     G --> E
-    E --> C["Bounded idle-only correction"]
-    C --> P
+    E --> C["Staged correction"]
+    C --> B["Bounded stopped-boundary commit"]
+    B --> P
     S["Stationary start wall solve"] --> P
 ```
 
@@ -80,7 +81,8 @@ tuned.
 
 The localization layer is designed to be no worse than the odometry baseline:
 
-- Corrections are suppressed while a chassis motion is active.
+- Localization may update its shadow estimate during motion, but it never changes the
+  driven odometry pose or motor command while a chassis motion is active.
 - Continuous corrections and motion-boundary re-anchors are bounded.
 - Evidence must pass sensor-count, confidence, covariance, NIS, residual, stability,
   freshness, and pose-delta checks.

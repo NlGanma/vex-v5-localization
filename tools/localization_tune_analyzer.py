@@ -291,10 +291,16 @@ def parse_traces(
     for trace_index, path in enumerate(paths):
         trace_field, trace_odom, trace_sensors, trace_rows = parse_trace(path)
         if trace_field is not None:
+            if field is not None and trace_field != field:
+                raise ValueError(f"field metadata differs in {path}; analyze incompatible configurations separately")
             field = trace_field
         if trace_odom is not None:
+            if odom is not None and trace_odom != odom:
+                raise ValueError(f"odom metadata differs in {path}; analyze incompatible configurations separately")
             odom = trace_odom
         if trace_sensors:
+            if sensors and trace_sensors != sensors:
+                raise ValueError(f"sensor metadata differs in {path}; analyze incompatible configurations separately")
             sensors = trace_sensors
         if (
             trace_field is not None
@@ -378,6 +384,8 @@ def pair_is_reliable(prev_row: dict[str, float | int], row: dict[str, float | in
 def build_odom_pairs(rows: list[dict[str, float | int]], pose_source: str) -> list[OdomPair]:
     pairs: list[OdomPair] = []
     for prev_row, row in zip(rows, rows[1:]):
+        if int(prev_row.get("_trace_index", 0)) != int(row.get("_trace_index", 0)):
+            continue
         if not pair_is_reliable(prev_row, row):
             continue
         prev_pose = pose_from_row(prev_row, pose_source)
@@ -416,10 +424,18 @@ def robust_offset_estimate(pairs: list[OdomPair], axis: str) -> tuple[float | No
     return median(estimates), len(estimates)
 
 
-def robust_scale_estimate(pairs: list[OdomPair], axis: str) -> tuple[float | None, int]:
+def robust_scale_estimate(pairs: list[OdomPair], axis: str, offset: float = 0.0) -> tuple[float | None, int]:
+    # Inverts the same arc model odom.cpp applies for |dtheta| >= 1e-6:
+    #   local = 2*sin(dtheta/2) * (scale*raw/dtheta + offset)
+    # The naive truth/raw ratio omits the yaw-induced offset term, which at the
+    # 1-degree gate limit is up to ~0.12 in for the shipped -6.75 in horizontal
+    # offset — 50-60% of the minimum accepted raw delta — so slow-turn ticks
+    # dominated the ratio and produced grossly wrong scale suggestions
+    # (~0.52 on every shipped log; the arc-corrected inversion gives 1.0000).
     estimates: list[float] = []
     for pair in pairs:
-        if abs(pair.odom_delta_theta) > math.radians(1.0):
+        delta_theta = pair.odom_delta_theta
+        if abs(delta_theta) > math.radians(1.0):
             continue
         if axis == "horizontal":
             truth_local = pair.truth_local_x
@@ -429,7 +445,15 @@ def robust_scale_estimate(pairs: list[OdomPair], axis: str) -> tuple[float | Non
             raw_delta = pair.raw_delta_vertical
         if abs(raw_delta) < 0.2:
             continue
-        estimates.append(truth_local / raw_delta)
+        if abs(delta_theta) >= 1e-6:
+            turn_factor = 2.0 * math.sin(delta_theta / 2.0)
+            denom = turn_factor * raw_delta
+            if abs(denom) < 1e-9:
+                continue
+            estimates.append((truth_local - turn_factor * offset) * delta_theta / denom)
+        else:
+            # matches odom.cpp's straight-line (kMinTurn) branch
+            estimates.append(truth_local / raw_delta)
     return median(estimates), len(estimates)
 
 
@@ -707,7 +731,7 @@ def sensor_measurements(
     sample_limit: int,
 ) -> list[tuple[Pose, float]]:
     usable: list[dict[str, float | int]] = []
-    last_reading_key: tuple[float, int, int] | None = None
+    last_reading_key: tuple[int, float, int, int] | None = None
     for row in rows:
         changed_key = f"{sensor_name}_changed"
         if changed_key in row and int(row[changed_key]) == 0:
@@ -717,6 +741,7 @@ def sensor_measurements(
         # rows where this sensor's reading changed so a held sample is not fitted
         # against several different turn headings.
         reading_key = (
+            int(row.get("_trace_index", 0)),
             float(row[f"{sensor_name}_dist"]),
             int(row[f"{sensor_name}_conf"]),
             int(row[f"{sensor_name}_used"]),
@@ -1157,7 +1182,7 @@ def summarize_calibration_coverage(rows: list[dict[str, float | int]]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Analyze a localization tune trace and suggest odom / sensor updates.")
+    parser = argparse.ArgumentParser(description="Analyze localization traces and report odom diagnostics / sensor fits.")
     parser.add_argument("trace", nargs="+", type=Path, help="Path(s) to localization_tune_latest.txt logs")
     parser.add_argument(
         "--pose-source",
@@ -1179,7 +1204,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    field, odom_model, sensors, rows = parse_traces(args.trace)
+    try:
+        field, odom_model, sensors, rows = parse_traces(args.trace)
+    except ValueError as exc:
+        parser.error(str(exc))
     print(f"Trace files: {len(args.trace)}")
     print(f"Trace rows: {len(rows)}")
     print(f"Pose source: {args.pose_source}")
@@ -1204,8 +1232,14 @@ def main() -> int:
     if odom_model is not None and odom_pairs:
         vertical_offset, vertical_offset_count = robust_offset_estimate(odom_pairs, "vertical")
         horizontal_offset, horizontal_offset_count = robust_offset_estimate(odom_pairs, "horizontal")
-        vertical_scale, vertical_scale_count = robust_scale_estimate(odom_pairs, "vertical")
-        horizontal_scale, horizontal_scale_count = robust_scale_estimate(odom_pairs, "horizontal")
+        vertical_scale, vertical_scale_count = robust_scale_estimate(
+            odom_pairs, "vertical",
+            vertical_offset if vertical_offset is not None else odom_model.vertical_offset,
+        )
+        horizontal_scale, horizontal_scale_count = robust_scale_estimate(
+            odom_pairs, "horizontal",
+            horizontal_offset if horizontal_offset is not None else odom_model.horizontal_offset,
+        )
         turn_scale, turn_scale_count = robust_turn_scale_estimate(odom_pairs)
 
         vertical_scale = 1.0 if vertical_scale is None else vertical_scale
@@ -1219,47 +1253,44 @@ def main() -> int:
         suggested_vertical_offset = vertical_offset if vertical_offset is not None else odom_model.vertical_offset
         suggested_horizontal_offset = horizontal_offset if horizontal_offset is not None else odom_model.horizontal_offset
 
-        print("Odom suggestions")
+        print("Odom model self-consistency diagnostics")
         print(
-            f"  vertical offset:    current {odom_model.vertical_offset:.4f} -> suggested {suggested_vertical_offset:.4f}"
+            "  Reference poses come from this localization stack, not independent ground truth;"
+            " these fits cannot calibrate physical offsets, scales, or wheel diameters."
+        )
+        print(
+            f"  vertical offset:    configured {odom_model.vertical_offset:.4f}, reconstructed {suggested_vertical_offset:.4f}"
             f"  (turn samples {vertical_offset_count})"
         )
         print(
-            f"  horizontal offset:  current {odom_model.horizontal_offset:.4f} -> suggested {suggested_horizontal_offset:.4f}"
+            f"  horizontal offset:  configured {odom_model.horizontal_offset:.4f}, reconstructed {suggested_horizontal_offset:.4f}"
             f"  (turn samples {horizontal_offset_count})"
         )
         print(
-            f"  vertical scale:     current 1.0000 -> suggested {vertical_scale:.4f}"
+            f"  vertical scale:     configured 1.0000, reconstructed {vertical_scale:.4f}"
             f"  (straight samples {vertical_scale_count})"
         )
         print(
-            f"  horizontal scale:   current 1.0000 -> suggested {horizontal_scale:.4f}"
+            f"  horizontal scale:   configured 1.0000, reconstructed {horizontal_scale:.4f}"
             f"  (straight samples {horizontal_scale_count})"
         )
         print(
-            f"  turn scale:         current 1.0000 -> suggested {format_optional(turn_scale)}"
+            f"  turn scale:         configured 1.0000, reconstructed {format_optional(turn_scale)}"
             f"  (turn samples {turn_scale_count})"
         )
         print(
-            f"  lateral bias/rad:   current 0.0000 -> suggested {format_optional(lateral_bias_per_rad)}"
+            f"  lateral bias/rad:   configured 0.0000, reconstructed {format_optional(lateral_bias_per_rad)}"
             f"  (fit samples {lateral_bias_count})"
         )
         print(
-            f"  lateral bias/in*rad current 0.0000 -> suggested {format_optional(lateral_bias_per_in_rad)}"
+            f"  lateral bias/in*rad configured 0.0000, reconstructed {format_optional(lateral_bias_per_in_rad)}"
             f"  (fit samples {lateral_bias_count})"
         )
-        print(
-            f"  vertical wheel dia: current {odom_model.vertical_wheel_diameter:.4f}"
-            f" -> suggested {odom_model.vertical_wheel_diameter * vertical_scale:.4f}"
-        )
-        print(
-            f"  horizontal wheel dia: current {odom_model.horizontal_wheel_diameter:.4f}"
-            f" -> suggested {odom_model.horizontal_wheel_diameter * horizontal_scale:.4f}"
-        )
+        print("  physical odom constants: unconstrained by these traces; leave unchanged")
         print()
     elif odom_model is None:
-        print("Odom suggestions")
-        print("  Missing odom metadata in the trace; re-run with the v2 logger to fit physical offsets.")
+        print("Odom model self-consistency diagnostics")
+        print("  Missing odom metadata in the trace; re-run with the v2 logger to inspect the recorded model.")
         print()
 
     if field is None or not sensors:

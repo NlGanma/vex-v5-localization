@@ -1,4 +1,5 @@
 #include <cmath>
+#include <optional>
 #include "lemlib/chassis/chassis.hpp"
 #include "lemlib/logger/logger.hpp"
 #include "lemlib/timer.hpp"
@@ -9,10 +10,13 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
     // take the mutex
     this->requestMotionStart();
     // were all motions cancelled?
-    if (!this->motionRunning) {
+    if (!this->motionRunning.load()) {
         this->endMotion();
         return;
     }
+    // capture the motion generation: motionContinues() makes a cancelled loop
+    // exit even if a new motion re-raises motionRunning before this one re-checks
+    const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
         pros::Task task([=, this]() { moveToPose(x, y, theta, timeout, params, false); });
@@ -38,23 +42,23 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
 
     // initialize vars used between iterations
     Pose lastPose = getPose();
-    distTraveled = 0;
+    distTraveled.store(0.0f);
     Timer timer(timeout);
     bool close = false;
     bool lateralSettled = false;
-    bool prevSameSide = false;
+    std::optional<bool> prevRobotSide = std::nullopt;
     float prevLateralOut = 0; // previous lateral power
     float prevAngularOut = 0; // previous angular power
 
     // main loop
     while (!timer.isDone() &&
            ((!lateralSettled || (!angularLargeExit.getExit() && !angularSmallExit.getExit())) || !close) &&
-           this->motionRunning) {
+           this->motionContinues(motionGen)) {
         // update position
         const Pose pose = getPose(true, true);
 
         // update distance traveled
-        distTraveled += pose.distance(lastPose);
+        distTraveled.fetch_add(pose.distance(lastPose));
         lastPose = pose;
 
         // calculate distance to the target point
@@ -73,15 +77,18 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
         Pose carrot = target - Pose(cos(target.theta), sin(target.theta)) * params.lead * distTarget;
         if (close) carrot = target; // settling behavior
 
-        // calculate if the robot is on the same side as the carrot point
+        // motion chaining: exit when the robot itself crosses the half-plane
+        // earlyExitRange before the target, mirroring moveToPoint's crossing
+        // check. The old robot-vs-carrot sameSide comparison broke at the close
+        // latch: teleporting the carrot to the target flipped carrotSide there,
+        // firing the exit at the fixed 7.5" latch instead of at earlyExitRange.
         const bool robotSide =
             (pose.y - target.y) * -sin(target.theta) <= (pose.x - target.x) * cos(target.theta) + params.earlyExitRange;
-        const bool carrotSide = (carrot.y - target.y) * -sin(target.theta) <=
-                                (carrot.x - target.x) * cos(target.theta) + params.earlyExitRange;
-        const bool sameSide = robotSide == carrotSide;
-        // exit if close
-        if (!sameSide && prevSameSide && close && params.minSpeed != 0) break;
-        prevSameSide = sameSide;
+        if (prevRobotSide == std::nullopt) prevRobotSide = robotSide;
+        // Exit on the configured crossing. This may intentionally occur before
+        // the fixed 7.5-inch settling latch when earlyExitRange is larger.
+        if (robotSide != prevRobotSide && params.minSpeed != 0) break;
+        prevRobotSide = robotSide;
 
         // calculate error
         const float adjustedRobotTheta = params.forwards ? pose.theta : pose.theta + M_PI;
@@ -113,8 +120,13 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
         // per-loop kick that pushes the heading into a divergent oscillation.
         // Guarded by >20 deg (same threshold turnToHeading uses) so fine
         // small-angle settling keeps full PID authority.
+        // Re-clamp after the slew: slew() also rate-limits DECREASES, so when the
+        // close latch shrinks params.maxSpeed the slewed value can sit above the
+        // new cap for a few ticks, and the overturn subtraction below would then
+        // exceed |lateralOut| and briefly reverse the drive.
         if (fabs(radToDeg(angularError)) > 20)
-            angularOut = slew(angularOut, prevAngularOut, angularSettings.slew);
+            angularOut =
+                std::clamp(slew(angularOut, prevAngularOut, angularSettings.slew), -params.maxSpeed, params.maxSpeed);
         prevAngularOut = angularOut;
 
         // apply restrictions on lateral speed
@@ -156,6 +168,7 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
         }
 
         // move the drivetrain
+        if (!motionContinues(motionGen)) break;
         moveDrive(leftPower, rightPower);
 
         // delay to save resources
@@ -165,6 +178,6 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
     // stop the drivetrain
     stopDrive();
     // set distTraveled to -1 to indicate that the function has finished
-    distTraveled = -1;
+    distTraveled.store(-1.0f);
     this->endMotion();
 }

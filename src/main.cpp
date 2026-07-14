@@ -63,6 +63,9 @@ void disabled() {
     localization_tune::finalizeInterruptedRunIfNeeded("Interrupted", "Autonomous period ended");
     stopAutonomousManipulatorControl();
     stopChassisMotion();
+    // If PROS killed the autonomous task mid-blocking-motion, release the
+    // owner-independent motion semaphore after live cancellation has settled.
+    chassis.recoverInterruptedMotion();
 
     if (kSmokeTestMode) {
         pros::screen::erase();

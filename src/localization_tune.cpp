@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
@@ -180,13 +181,13 @@ std::string pendingTuneTerminalLog;
 bool pendingTuneTerminalReplay = false;
 bool pendingTuneTerminalStreaming = false;
 bool pendingTuneTerminalDumpRequested = false;
-volatile bool driverControlLoopActive = false;
-volatile bool driverDriveLoopTicking = false;
-volatile bool manualDriveFallbackActive = false;
+std::atomic_bool driverControlLoopActive {false};
+std::atomic_bool driverDriveLoopTicking {false};
+std::atomic_bool manualDriveFallbackActive {false};
 const char* tuneExportFeedback = nullptr;
 std::uint32_t tuneExportFeedbackUntilMs = 0;
-volatile std::uint32_t tuneExportTapSequence = 0;
-volatile std::uint32_t tuneExportTapLastMs = 0;
+std::atomic<std::uint32_t> tuneExportTapSequence {0};
+std::uint32_t tuneExportTapLastMs = 0;
 
 void overlayControlTaskFn();
 void manualDriveFallbackTaskFn();
@@ -225,7 +226,7 @@ void handleTuneExportTap() {
     if (now - tuneExportTapLastMs < 200) return;
 
     tuneExportTapLastMs = now;
-    ++tuneExportTapSequence;
+    tuneExportTapSequence.fetch_add(1);
 }
 
 void appendFormat(std::string& out, const char* format, ...) {
@@ -408,10 +409,9 @@ void appendLocalizationConfig(std::string& out) {
                  static_cast<unsigned long>(config.fusion.mclPeriodMs), config.fusion.nisGate,
                  config.fusion.minCorrectionSensors, config.fusion.minConfidence,
                  static_cast<unsigned long>(config.fusion.sensorStaleMs), config.fusion.blend);
-    appendFormat(out, "fusion max_var_xy=%.3f max_var_th=%.5f max_meas_xy=%.3f max_meas_th=%.3f max_corr_xy=%.3f max_corr_th=%.5f\n",
+    appendFormat(out, "fusion max_var_xy=%.3f max_var_th=%.5f max_meas_xy=%.3f max_corr_xy=%.3f max_corr_th=%.5f\n",
                  config.fusion.maxVarXY, config.fusion.maxVarTheta, config.fusion.maxMeasurementDeltaXY,
-                 lemlib::radToDeg(config.fusion.maxMeasurementDeltaTheta), config.fusion.maxCorrectionXY,
-                 config.fusion.maxCorrectionTheta);
+                 config.fusion.maxCorrectionXY, config.fusion.maxCorrectionTheta);
     appendFormat(out, "mcl particles=%d sensor_std=%.3f outlier_th=%.3f outlier_weight=%.3f min_active=%d\n",
                  config.mcl.numParticles, config.mcl.sensorStd, config.mcl.outlierThreshold,
                  config.mcl.outlierWeight, config.mcl.minActiveSensors);
@@ -578,11 +578,13 @@ std::string buildTuneTraceCsv() {
                  static_cast<unsigned long>(config.fusion.ekfPeriodMs),
                  static_cast<unsigned long>(config.fusion.mclPeriodMs), config.fusion.nisGate,
                  config.fusion.minCorrectionSensors, config.fusion.minConfidence, config.fusion.blend);
-    appendFormat(csv, "# max_var_xy=%.3f,max_var_theta=%.5f,max_meas_xy=%.3f,max_meas_theta_deg=%.3f,max_corr_xy=%.3f,max_corr_theta_deg=%.3f,stale_ms=%lu\n",
+    appendFormat(csv, "# max_var_xy=%.3f,max_var_theta=%.5f,max_meas_xy=%.3f,max_corr_xy=%.3f,max_corr_theta_deg=%.3f,stale_ms=%lu\n",
                  config.fusion.maxVarXY, config.fusion.maxVarTheta, config.fusion.maxMeasurementDeltaXY,
-                 lemlib::radToDeg(config.fusion.maxMeasurementDeltaTheta), config.fusion.maxCorrectionXY,
-                 lemlib::radToDeg(config.fusion.maxCorrectionTheta),
+                 config.fusion.maxCorrectionXY, lemlib::radToDeg(config.fusion.maxCorrectionTheta),
                  static_cast<unsigned long>(config.fusion.sensorStaleMs));
+    appendFormat(csv, "# boundary_reanchor=%d,max_boundary_corr_xy=%.3f,max_boundary_corr_theta_deg=%.3f\n",
+                 config.fusion.enableBoundaryReanchor, config.fusion.maxBoundaryCorrectionXY,
+                 lemlib::radToDeg(config.fusion.maxBoundaryCorrectionTheta));
     appendFormat(csv, "# field_bounds,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", config.field.minX, config.field.maxX,
                  config.field.minY, config.field.maxY, config.field.fieldMargin, config.field.obstacleMargin);
     appendFormat(csv, "# odom_model,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", vertical.getOffset(),
@@ -603,7 +605,7 @@ std::string buildTuneTraceCsv() {
     }
     appendFormat(
         csv,
-        "time_ms,odom_seq,odom_x,odom_y,odom_theta_deg,odom_only_x,odom_only_y,odom_only_theta_deg,odom_local_x,odom_local_y,odom_delta_theta_deg,odom_tel_seq,odom_tel_dt,odom_heading_before_deg,odom_heading_after_deg,odom_delta_heading_deg,odom_heading_horizontal_pair,odom_heading_vertical_pair,odom_heading_imu,odom_heading_fallback,odom_vertical1_raw,odom_vertical2_raw,odom_horizontal1_raw,odom_horizontal2_raw,odom_imu_raw_deg,odom_delta_vertical1,odom_delta_vertical2,odom_delta_horizontal1,odom_delta_horizontal2,odom_delta_imu_deg,odom_selected_vertical_raw,odom_selected_horizontal_raw,odom_selected_delta_vertical,odom_selected_delta_horizontal,odom_selected_vertical_offset,odom_selected_horizontal_offset,ekf_x,ekf_y,ekf_theta_deg,applied_x,applied_y,applied_theta_deg,target_corr_x,target_corr_y,target_corr_theta_deg,applied_corr_x,applied_corr_y,applied_corr_theta_deg,mcl_x,mcl_y,mcl_theta_deg,mcl_conf,mcl_ess,last_nis,mcl_var_x,mcl_var_y,mcl_var_theta,active_sensors,mcl_valid,sensors_stale,correction_accepted,correction_reject_mask,meas_delta_xy,meas_delta_theta_deg,candidate_inlier_sensors,candidate_mean_residual,candidate_max_residual,candidate_stable_scans,required_stable_scans");
+        "time_ms,odom_seq,odom_x,odom_y,odom_theta_deg,odom_only_x,odom_only_y,odom_only_theta_deg,odom_local_x,odom_local_y,odom_delta_theta_deg,odom_tel_seq,odom_tel_dt,odom_heading_before_deg,odom_heading_after_deg,odom_delta_heading_deg,odom_heading_horizontal_pair,odom_heading_vertical_pair,odom_heading_imu,odom_heading_fallback,odom_vertical1_raw,odom_vertical2_raw,odom_horizontal1_raw,odom_horizontal2_raw,odom_imu_raw_deg,odom_delta_vertical1,odom_delta_vertical2,odom_delta_horizontal1,odom_delta_horizontal2,odom_delta_imu_deg,odom_selected_vertical_raw,odom_selected_horizontal_raw,odom_selected_delta_vertical,odom_selected_delta_horizontal,odom_selected_vertical_offset,odom_selected_horizontal_offset,ekf_x,ekf_y,ekf_theta_deg,applied_x,applied_y,applied_theta_deg,target_corr_x,target_corr_y,target_corr_theta_deg,applied_corr_x,applied_corr_y,applied_corr_theta_deg,mcl_x,mcl_y,mcl_theta_deg,mcl_conf,mcl_ess,last_nis,mcl_var_x,mcl_var_y,mcl_var_theta,active_sensors,mcl_valid,sensors_stale,correction_accepted,boundary_reanchor_applied,correction_reject_mask,meas_delta_xy,meas_delta_theta_deg,candidate_inlier_sensors,candidate_mean_residual,candidate_max_residual,candidate_stable_scans,required_stable_scans");
     for (const char* sensorName : kTraceSensorNames) {
         appendFormat(csv,
                      ",%s_dist,%s_conf,%s_in_range,%s_conf_ok,%s_used,%s_size,%s_velocity,%s_expected,%s_residual,%s_age_ms,%s_reading_seq,%s_changed",
@@ -615,7 +617,7 @@ std::string buildTuneTraceCsv() {
     for (const auto& sample : traceSamples) {
         appendFormat(
             csv,
-            "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%d,%d,%d,%d,%lu,%.4f,%.4f,%d,%.4f,%.4f,%d,%d",
+            "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%d,%d,%d,%d,%d,%lu,%.4f,%.4f,%d,%.4f,%.4f,%d,%d",
             static_cast<unsigned long>(sample.timeMs), static_cast<unsigned long>(sample.odomSeq),
             sample.odomPose.x, sample.odomPose.y, sample.odomPose.theta, sample.odomOnlyPose.x,
             sample.odomOnlyPose.y, sample.odomOnlyPose.theta, sample.odomDelta.localX, sample.odomDelta.localY,
@@ -638,7 +640,7 @@ std::string buildTuneTraceCsv() {
             sample.appliedCorrectionX, sample.appliedCorrectionY, sample.appliedCorrectionTheta,
             sample.mclPose.x, sample.mclPose.y, sample.mclPose.theta, sample.mclConfidence, sample.mclEss,
             sample.lastNis, sample.mclVarX, sample.mclVarY, sample.mclVarTheta, sample.activeSensors,
-            sample.mclValid, sample.sensorsStale, sample.correctionAccepted,
+            sample.mclValid, sample.sensorsStale, sample.correctionAccepted, sample.boundaryReanchorApplied,
             static_cast<unsigned long>(sample.correctionRejectMask), sample.measurementPoseDelta,
             sample.measurementHeadingDelta, sample.correctionInlierSensors, sample.correctionMeanResidual,
             sample.correctionMaxResidual, sample.candidateStableScans, sample.requiredStableScans);
@@ -830,8 +832,7 @@ void emitTuneReport() {
         persistTuneLogInternal(fullLog);
         setTuneExportFeedback("Log cached in RAM", 0);
         lemlib::bufferedStdout().print(
-            "No SD card detected; cached tune log in RAM. After plugging in later, press Y or tap the brain to "
-            "dump it\n");
+            "No SD card detected; cached tune log in RAM. Tap the lower-right of the brain screen to dump it\n");
         return;
     }
     if (!writeTextFile(kTuneLogPath, fullLog)) {
@@ -839,7 +840,8 @@ void emitTuneReport() {
         persistTuneLogInternal(fullLog);
         setTuneExportFeedback("Log cached in RAM", 0);
         lemlib::bufferedStdout().print(
-            "Tune report write failed: {}; cached tune log in RAM. Press Y or tap the brain to dump it\n",
+            "Tune report write failed: {}; cached tune log in RAM. Tap the lower-right of the brain screen to dump "
+            "it\n",
             kTuneLogPath);
     } else {
         clearPendingTuneTerminalLog();
@@ -903,20 +905,28 @@ void storeTuneCheckpoint(const char* name, const lemlib::Pose& expected) {
     const float errorX = checkpoint.reported.x - expected.x;
     const float errorY = checkpoint.reported.y - expected.y;
     const float errorTheta = wrapDegrees(lemlib::radToDeg(checkpoint.reported.theta - expected.theta));
-    lemlib::telemetrySink()->info(
-        "Tune checkpoint {} expected={} reported={} err=({:.2f}, {:.2f}, {:.2f} deg) active={} conf={:.2f} accept={}",
-        name, expected, checkpoint.reported, errorX, errorY, errorTheta, checkpoint.debug.activeSensors,
-        checkpoint.debug.mclConfidence, checkpoint.debug.correctionAccepted);
+    // bufferedStdout, not telemetrySink: the sink default level is WARN and
+    // nothing raises it, so an info() here would never reach the terminal
+    lemlib::bufferedStdout().print(
+        "Tune checkpoint {} expected=({:.2f}, {:.2f}, {:.2f} deg) reported=({:.2f}, {:.2f}, {:.2f} deg) "
+        "err=({:.2f}, {:.2f}, {:.2f} deg) active={} conf={:.2f} accept={}\n",
+        name, expected.x, expected.y, wrapDegrees(lemlib::radToDeg(expected.theta)), checkpoint.reported.x,
+        checkpoint.reported.y, wrapDegrees(lemlib::radToDeg(checkpoint.reported.theta)), errorX, errorY, errorTheta,
+        checkpoint.debug.activeSensors, checkpoint.debug.mclConfidence, checkpoint.debug.correctionAccepted);
 }
 
 bool waitForTuneMotionCompletion(TuneMotionKind kind, const lemlib::Pose& expected, int timeoutMs, bool allowAbort) {
-    (void)allowAbort;
     (void)kind;
     (void)expected;
     const std::uint32_t startedAt = pros::millis();
     bool sawMotionRunning = false;
 
     while (pros::millis() - startedAt < static_cast<std::uint32_t>(std::max(timeoutMs, 0))) {
+        if (allowAbort && pros::c::controller_get_digital(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_B)) {
+            chassis.cancelAllMotions();
+            chassis.tank(0, 0, true);
+            return false;
+        }
         const bool motionRunning = chassis.isInMotion();
         sawMotionRunning = sawMotionRunning || motionRunning;
 
@@ -932,18 +942,25 @@ bool waitForTuneMotionCompletion(TuneMotionKind kind, const lemlib::Pose& expect
 }
 
 bool settleAndCapture(const char* name, const lemlib::Pose& expected, bool allowAbort) {
-    (void)allowAbort;
+    if (allowAbort && pros::c::controller_get_digital(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_B)) {
+        return false;
+    }
     setState("Settling", name, true);
     pros::delay(kTuneSettleMs);
+    if (allowAbort && pros::c::controller_get_digital(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_B)) {
+        return false;
+    }
     storeTuneCheckpoint(name, expected);
     return true;
 }
 
 bool waitForPostMoveLocalizationUpdate(bool allowAbort) {
-    (void)allowAbort;
     const std::uint32_t startedAt = pros::millis();
 
     while (pros::millis() - startedAt < kTunePostMoveCorrectionWindowMs) {
+        if (allowAbort && pros::c::controller_get_digital(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_B)) {
+            return false;
+        }
         const auto debug = lemlib::localization::getDebugInfo(true);
         const auto sample = lemlib::localization::getLatestTraceSample(true);
         const bool freshAfterMotion = sample.timeMs >= startedAt &&
@@ -986,14 +1003,9 @@ bool runDriveProbeStep(const char* name, const lemlib::Pose& expected, int durat
     // Open-loop: equal raw power to both sides, drive curve disabled, no PID. The
     // expected heading is the start heading, so the captured heading error is the
     // pure drivetrain veer over this segment.
-    chassis.cancelMotion();
     const int command = static_cast<int>(forwards ? power : -power);
-    const std::uint32_t startedAt = pros::millis();
-    while (pros::millis() - startedAt < static_cast<std::uint32_t>(durationMs)) {
-        chassis.tank(command, command, true);
-        pros::delay(10);
-    }
-    chassis.tank(0, 0, true);
+    chassis.drivePulse(command, durationMs, true);
+    if (!waitForTuneMotionCompletion(TuneMotionKind::Drive, expected, durationMs + 100, allowAbort)) return false;
     pros::delay(150); // let the robot fully stop and odom settle before capture
     return settleAndCapture(name, expected, allowAbort);
 }
@@ -1053,7 +1065,9 @@ void printCheckpointPage(const TuneCheckpoint& checkpoint, int index, int count,
         pros::screen::print(TEXT_MEDIUM, 7, "ThVar %.3f Stale%d", checkpoint.debug.mclVarTheta,
                             checkpoint.debug.sensorsStale);
         if (exportFeedback != nullptr) pros::screen::print(TEXT_MEDIUM, 8, "%s", exportFeedback);
-        else pros::screen::print(TEXT_MEDIUM, 8, logReady ? "LOG READY tap LR dump" : "Pg2 Up toggle X clr");
+        // no checkpoint-review / page navigation exists; the only live affordance
+        // is the brain-screen tap that dumps the log
+        else pros::screen::print(TEXT_MEDIUM, 8, logReady ? "LOG READY tap lower-right" : "Log pending");
     }
 }
 
@@ -1090,15 +1104,18 @@ void screenTaskFn() {
         const bool disabledActive = pros::competition::is_disabled() != 0;
         const char* modeLabel =
             autonomousActive ? "AUTO" :
-            (driverControlLoopActive ? "DRIVER" :
-            (manualDriveFallbackActive ? "MANUAL" :
+            (driverControlLoopActive.load() ? "DRIVER" :
+            (manualDriveFallbackActive.load() ? "MANUAL" :
             (disabledActive ? "DISABLED" : "IDLE")));
         const int controllerConnected = pros::c::controller_is_connected(pros::E_CONTROLLER_MASTER);
         const int leftY = pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_LEFT_Y);
         const int rightX =
             pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_RIGHT_X);
-        const bool exportTapCallback = tuneExportTapSequence != lastTapSequenceHandled;
-        lastTapSequenceHandled = tuneExportTapSequence;
+        // single read: the touch-callback task increments the counter, so reading
+        // it twice could swallow a tap that lands between the reads
+        const std::uint32_t tapSequenceSeen = tuneExportTapSequence.load();
+        const bool exportTapCallback = tapSequenceSeen != lastTapSequenceHandled;
+        lastTapSequenceHandled = tapSequenceSeen;
         if (exportTapCallback) {
             if (logReady) {
                 if (exportTuneDataToTerminalNow()) {
@@ -1122,7 +1139,7 @@ void screenTaskFn() {
             pros::screen::print(TEXT_MEDIUM, 2, "Tune %s", status);
             pros::screen::print(TEXT_MEDIUM, 3, "%s", step);
             pros::screen::print(TEXT_MEDIUM, 4, "LY %d RX %d DL %d MF %d", leftY, rightX,
-                                driverDriveLoopTicking ? 1 : 0, manualDriveFallbackActive ? 1 : 0);
+                                driverDriveLoopTicking.load() ? 1 : 0, manualDriveFallbackActive.load() ? 1 : 0);
             pros::screen::print(TEXT_MEDIUM, 5, "Start %.1f %.1f %.0f", startPose.x, startPose.y, startHeading);
             pros::screen::print(TEXT_MEDIUM, 6, "Pose %.1f %.1f %.1f", pose.x, pose.y, pose.theta);
             pros::screen::print(TEXT_MEDIUM, 7, "F %.1f/%d R %.1f/%d", distances.front.distance,
@@ -1178,11 +1195,12 @@ void manualDriveFallbackTaskFn() {
         const bool autonomousActive = pros::competition::is_autonomous() != 0;
         const bool competitionConnected = pros::competition::is_connected() != 0;
         const bool controllerConnected = pros::c::controller_is_connected(pros::E_CONTROLLER_MASTER) > 0;
-        const bool shouldDrive = !competitionConnected && !driverControlLoopActive && !autonomousActive &&
+        const bool shouldDrive = !competitionConnected && !driverControlLoopActive.load() && !autonomousActive &&
                                  !tuneRunning && !overlayActive && controllerConnected;
 
-        manualDriveFallbackActive = shouldDrive;
+        manualDriveFallbackActive.store(shouldDrive);
         if (shouldDrive) {
+            if (!wasActive) lemlib::localization::clearBoundaryReanchor();
             const int leftY =
                 pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_LEFT_Y);
             const int rightX =
@@ -1236,9 +1254,9 @@ void setStartPose(const lemlib::Pose& pose) {
     tuneMutex.give();
 }
 
-void setDriverControlLoopActive(bool active) { driverControlLoopActive = active; }
+void setDriverControlLoopActive(bool active) { driverControlLoopActive.store(active); }
 
-void setDriverDriveLoopTicking(bool active) { driverDriveLoopTicking = active; }
+void setDriverDriveLoopTicking(bool active) { driverDriveLoopTicking.store(active); }
 
 void prepareAutonomousRelocalizedRun(const lemlib::Pose& currentPose) {
     clearTuneResults();
@@ -1356,7 +1374,7 @@ void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbo
         }
     }
 
-    finalizeRun("Complete", "Use left/right to review", "--");
+    finalizeRun("Complete", "Tap lower-right to dump log", "--");
 }
 
 void runAutonomousRoute(const lemlib::Pose& start, bool allowAbort) {

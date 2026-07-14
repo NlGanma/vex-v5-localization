@@ -52,13 +52,20 @@ std::atomic<std::uint32_t> colorSortClearStartTimeMs {0};
 std::atomic<std::uint32_t> colorSortCycleEndTimeMs {0};
 std::atomic<std::uint32_t> rightPtoMotor1BlockStartTimeMs {0};
 
-pros::task_t autonomousManipulatorTaskHandle = nullptr;
+std::atomic<pros::task_t> autonomousManipulatorTaskHandle {nullptr};
+pros::Mutex autonomousManipulatorLifecycleMutex;
+std::atomic<std::uint32_t> autonomousManipulatorGeneration {0};
+std::atomic_bool autonomousManipulatorHandlePublished {false};
 std::atomic_bool autonomousIntakeActive {false};
 std::atomic<std::uint32_t> autonomousIntakeEndTimeMs {0};
 std::atomic_bool eightMotorPositionHoldEnabled {false};
 
 enum class FourMotorShiftState : std::uint8_t { IDLE, FOLLOW, CREEP };
 std::atomic<FourMotorShiftState> fourMotorShiftState {FourMotorShiftState::IDLE};
+std::atomic_bool eightMotorControllerProfileActive {false};
+std::atomic<std::uint32_t> fourMotorShiftGeneration {0};
+std::atomic<pros::task_t> fourMotorShiftTaskHandle {nullptr};
+pros::Mutex fourMotorShiftLifecycleMutex;
 
 std::array<pros::MotorGroup*, 6> eightMotorHoldGroups() {
     return {&leftDriveMotors, &rightDriveMotors, &leftPtoMotor1, &leftPtoMotor2, &rightPtoMotor1, &rightPtoMotor2};
@@ -174,6 +181,26 @@ int applyColorSortSlowPower(int power) {
 
 bool isFourMotorShiftActive() { return fourMotorShiftState.load() != FourMotorShiftState::IDLE; }
 
+void hardStopReleasedPtoGroups() {
+    leftPtoMotor1.move(0);
+    leftPtoMotor2.move(0);
+    rightPtoMotor1.move(0);
+    rightPtoMotor2.move(0);
+}
+
+void cancelFourMotorShiftTask() {
+    fourMotorShiftLifecycleMutex.take();
+    fourMotorShiftGeneration.fetch_add(1);
+    fourMotorShiftState.store(FourMotorShiftState::IDLE);
+    const pros::task_t handle = fourMotorShiftTaskHandle.exchange(nullptr);
+    if (handle != nullptr) {
+        pros::Task task(handle);
+        task.remove();
+    }
+    fourMotorShiftLifecycleMutex.give();
+    hardStopReleasedPtoGroups();
+}
+
 void commandReleasedPto(int leftRollerPower, int leftIntakePower, int rightIntakePower, int rightIntakePower2) {
     if (chassis.isPtoEngaged() || isFourMotorShiftActive()) return;
 
@@ -218,8 +245,7 @@ void waitForFourMotorShiftComplete() {
     const std::uint32_t startTimeMs = pros::millis();
     while (isFourMotorShiftActive()) {
         if (pros::millis() - startTimeMs >= kFourMotorShiftTimeoutMs) {
-            fourMotorShiftState = FourMotorShiftState::IDLE;
-            moveAllReleasedPtoGroupsSameDirection(0);
+            cancelFourMotorShiftTask();
             break;
         }
         pros::delay(10);
@@ -227,22 +253,52 @@ void waitForFourMotorShiftComplete() {
 }
 
 void startFourMotorShiftTask() {
-    pros::Task::create(
-        []() {
+    fourMotorShiftLifecycleMutex.take();
+    if (fourMotorShiftState.load() != FourMotorShiftState::FOLLOW) {
+        fourMotorShiftLifecycleMutex.give();
+        return;
+    }
+    const std::uint32_t generation = fourMotorShiftGeneration.fetch_add(1) + 1;
+    const pros::task_t handle = pros::Task::create(
+        [generation]() {
             const std::uint32_t followEndTimeMs = pros::millis() + kPtoShiftDelayMs;
-            while (pros::millis() < followEndTimeMs) {
+            while (fourMotorShiftGeneration.load() == generation && pros::millis() < followEndTimeMs) {
+                fourMotorShiftLifecycleMutex.take();
+                if (fourMotorShiftGeneration.load() != generation) {
+                    fourMotorShiftLifecycleMutex.give();
+                    return;
+                }
                 moveReleasedPtoDriveOutputs(chassis.getLastCommandedLeftOutput(), chassis.getLastCommandedRightOutput());
+                fourMotorShiftLifecycleMutex.give();
                 pros::delay(10);
             }
 
+            fourMotorShiftLifecycleMutex.take();
+            if (fourMotorShiftGeneration.load() != generation) {
+                fourMotorShiftLifecycleMutex.give();
+                return;
+            }
             fourMotorShiftState = FourMotorShiftState::CREEP;
             moveAllReleasedPtoGroupsSameDirection(kPtoCreepPower4Motor);
+            fourMotorShiftLifecycleMutex.give();
             pros::delay(kPtoCreepDelayMs);
+
+            fourMotorShiftLifecycleMutex.take();
+            if (fourMotorShiftGeneration.load() != generation) {
+                fourMotorShiftLifecycleMutex.give();
+                return;
+            }
             moveAllReleasedPtoGroupsSameDirection(0);
             chassis.setControllerSettings(fourMotorLinearController, fourMotorAngularController);
+            eightMotorControllerProfileActive.store(false);
+            pros::task_t self = pros::c::task_get_current();
+            fourMotorShiftTaskHandle.compare_exchange_strong(self, nullptr);
             fourMotorShiftState = FourMotorShiftState::IDLE;
+            fourMotorShiftLifecycleMutex.give();
         },
         "4M PTO Shift");
+    fourMotorShiftTaskHandle.store(handle);
+    fourMotorShiftLifecycleMutex.give();
 }
 
 bool rightPtoMotor1Blocked() {
@@ -270,8 +326,10 @@ bool rightPtoMotor1Blocked() {
 bool trySwitchToFourMotorDrive() {
     if (isFourMotorShiftActive()) return false;
     if (!chassis.isPtoEngaged()) {
-        chassis.disengagePto(releasedPtoRoles(), false);
+        if (!eightMotorControllerProfileActive.load()) return true;
+        if (chassis.isInMotion()) return false;
         chassis.setControllerSettings(fourMotorLinearController, fourMotorAngularController);
+        eightMotorControllerProfileActive.store(false);
         return true;
     }
     if (chassis.isInMotion()) return false;
@@ -288,18 +346,20 @@ bool trySwitchToFourMotorDrive() {
 bool trySwitchToEightMotorDrive() {
     if (isFourMotorShiftActive()) return false;
     if (chassis.isPtoEngaged()) {
+        if (eightMotorControllerProfileActive.load()) return true;
+        if (chassis.isInMotion()) return false;
         chassis.setControllerSettings(ptoLinearController, ptoAngularController);
+        eightMotorControllerProfileActive.store(true);
         return true;
     }
     if (chassis.isInMotion()) return false;
 
     stopReleasedPtoControls();
     chassis.engagePto(false);
-    chassis.tank(kPtoCreepPower8Motor, kPtoCreepPower8Motor, true);
-    pros::delay(kPtoCreepDelayMs);
-    chassis.tank(0, 0, true);
+    chassis.drivePulse(kPtoCreepPower8Motor, kPtoCreepDelayMs, false);
     pros::delay(kPtoShiftDelayMs);
     chassis.setControllerSettings(ptoLinearController, ptoAngularController);
+    eightMotorControllerProfileActive.store(true);
     return true;
 }
 
@@ -316,12 +376,22 @@ void waitForShiftWindow() {
     }
 }
 
-void startAutonomousManipulatorControl() {
-    if (autonomousManipulatorTaskHandle != nullptr) return;
+void startAutonomousManipulatorControlLocked() {
+    if (autonomousManipulatorTaskHandle.load() != nullptr) return;
 
-    autonomousManipulatorTaskHandle = pros::Task::create(
-        []() {
-            while (true) {
+    const std::uint32_t generation = autonomousManipulatorGeneration.fetch_add(1) + 1;
+    autonomousManipulatorHandlePublished.store(false);
+    const pros::task_t handle = pros::Task::create(
+        [generation]() {
+            // A newly scheduled child can run before Task::create returns to the
+            // parent. Do not let it clear a still-null handle and then have the
+            // parent publish a stale exited-task handle.
+            while (!autonomousManipulatorHandlePublished.load() &&
+                   autonomousManipulatorGeneration.load() == generation) {
+                pros::delay(1);
+            }
+            while (autonomousManipulatorGeneration.load() == generation &&
+                   !pros::competition::is_disabled()) {
                 if (!autonomousIntakeActive.load()) {
                     stopReleasedPtoControls();
                     pros::delay(10);
@@ -331,8 +401,7 @@ void startAutonomousManipulatorControl() {
                 if (pros::millis() >= autonomousIntakeEndTimeMs.load()) {
                     autonomousIntakeActive = false;
                     stopReleasedPtoControls();
-                    pros::delay(10);
-                    continue;
+                    break;
                 }
 
                 if (trySwitchToFourMotorDrive()) {
@@ -342,8 +411,29 @@ void startAutonomousManipulatorControl() {
 
                 pros::delay(10);
             }
+
+            autonomousIntakeActive = false;
+            pros::task_t self = pros::c::task_get_current();
+            autonomousManipulatorTaskHandle.compare_exchange_strong(self, nullptr);
         },
         "Auto Manipulator");
+    autonomousManipulatorTaskHandle.store(handle);
+    autonomousManipulatorHandlePublished.store(true);
+}
+
+void stopAutonomousManipulatorControlLocked() {
+    autonomousIntakeActive = false;
+    autonomousIntakeEndTimeMs = 0;
+    autonomousManipulatorGeneration.fetch_add(1);
+
+    // The task never takes this lifecycle mutex. Let it leave any PTO helper
+    // cooperatively instead of deleting it while it might own the separate
+    // shift mutex. Its loop and every PTO wait are bounded; normally this is a
+    // single 10 ms scheduler tick.
+    const std::uint32_t waitStartMs = pros::millis();
+    while (autonomousManipulatorTaskHandle.load() != nullptr && pros::millis() - waitStartMs < 100) {
+        pros::delay(5);
+    }
 }
 } // namespace
 
@@ -362,6 +452,7 @@ void initializeRobotControlState() {
     autonomousIntakeActive = false;
     autonomousIntakeEndTimeMs = 0;
     eightMotorPositionHoldEnabled = false;
+    eightMotorControllerProfileActive = false;
 }
 
 void setAllMotorBrakeModes() {
@@ -376,6 +467,10 @@ void setAllMotorBrakeModes() {
 void commandTeleopDriveOutputs(int left, int right) {
     leftDriveMotors.move(left);
     rightDriveMotors.move(right);
+    // keep the chassis last-commanded outputs live: the 4-motor PTO shift's
+    // FOLLOW phase reads them, and without this a teleop mid-drive shift would
+    // command the still-meshed PTO motors 0 for the disengage window
+    chassis.noteExternalDriveCommand(static_cast<float>(left), static_cast<float>(right));
     if (!chassis.isPtoEngaged()) return;
 
     leftPtoMotor1.move(left);
@@ -397,7 +492,7 @@ void enableEightMotorPositionHold() {
 }
 
 void disableEightMotorPositionHold() {
-    eightMotorPositionHoldEnabled = false;
+    if (!eightMotorPositionHoldEnabled.exchange(false)) return;
     commandZeroToAllDriveGroups();
     setAllMotorBrakeModes();
 }
@@ -405,10 +500,11 @@ void disableEightMotorPositionHold() {
 bool isEightMotorPositionHoldEnabled() { return eightMotorPositionHoldEnabled.load(); }
 
 void stopReleasedPtoControls() {
+    cancelFourMotorShiftTask();
     colorSortMonitoringEnabled = false;
     resetColorSortState();
     resetRightPtoMotor1BlockState();
-    commandReleasedPto(0, 0);
+    hardStopReleasedPtoGroups();
 }
 
 void requestSwitchToFourMotorDrive() {
@@ -426,7 +522,7 @@ void switchToFourMotorDrive() {
 }
 
 void switchToEightMotorDrive() {
-    if (isFourMotorShiftActive()) return;
+    if (isFourMotorShiftActive()) waitForFourMotorShiftComplete();
     waitForShiftWindow();
     trySwitchToEightMotorDrive();
 }
@@ -504,44 +600,42 @@ void runDriverReleasedPto(bool l1Pressed, bool r1Pressed, bool r2Pressed) {
 void intake(std::uint32_t durationMs) {
     disableEightMotorPositionHold();
 
+    autonomousManipulatorLifecycleMutex.take();
     if (durationMs == 0) {
-        autonomousIntakeActive = false;
+        stopAutonomousManipulatorControlLocked();
+        autonomousManipulatorLifecycleMutex.give();
         stopReleasedPtoControls();
         return;
     }
 
-    startAutonomousManipulatorControl();
+    if (pros::competition::is_disabled()) {
+        autonomousManipulatorLifecycleMutex.give();
+        return;
+    }
+    startAutonomousManipulatorControlLocked();
     autonomousIntakeEndTimeMs = pros::millis() + durationMs;
     autonomousIntakeActive = true;
+    autonomousManipulatorLifecycleMutex.give();
 }
 
 void stopAutonomousManipulatorControl() {
-    autonomousIntakeActive = false;
-    autonomousIntakeEndTimeMs = 0;
+    autonomousManipulatorLifecycleMutex.take();
+    stopAutonomousManipulatorControlLocked();
+    autonomousManipulatorLifecycleMutex.give();
 
-    // Remove the task FIRST, then zero. Zeroing before the task is gone left a
-    // window where the task (having already read autonomousIntakeActive==true)
-    // could re-issue intake/roller power AFTER the zero and then be frozen by
-    // task.remove() with the released PTO motors still running -- and nothing on
-    // the disabled()/opcontrol-entry path re-zeros those motors.
-    if (autonomousManipulatorTaskHandle != nullptr) {
-        pros::Task task(autonomousManipulatorTaskHandle);
-        task.remove();
-        autonomousManipulatorTaskHandle = nullptr;
-    }
-
+    // Zero only after the generation has been invalidated and the task has had
+    // a chance to leave, so it cannot re-issue a stale mechanism command later.
     stopReleasedPtoControls();
 }
 
 void score(std::uint32_t durationMs, int direction) {
     const int normalizedDirection = direction >= 0 ? 1 : -1;
     const int scorePower = -127 * normalizedDirection;
-    const std::uint32_t scoreEndTimeMs = pros::millis() + durationMs;
-
     disableEightMotorPositionHold();
     stopAutonomousManipulatorControl();
     switchToFourMotorDrive();
 
+    const std::uint32_t scoreEndTimeMs = pros::millis() + durationMs;
     while (pros::millis() < scoreEndTimeMs) {
         commandReleasedPto(scorePower, scorePower);
         pros::delay(10);

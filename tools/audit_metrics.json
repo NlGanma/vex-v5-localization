@@ -57,6 +57,8 @@
   "max_applied_step_in": 0.0,
   "applied_total_in": 0.0,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.0,
   "end_ekf_minus_odom_in": 0.0,
   "sensor_stats": {
@@ -87,7 +89,7 @@
   },
   "model_err_max": 0.0005,
   "model_err_med": 0.0,
-  "wall_repro_err": 0.0512
+  "wall_repro_err": 0.0806
  },
  "run2": {
   "name": "run2",
@@ -171,6 +173,8 @@
   "max_applied_step_in": 0.0255,
   "applied_total_in": 0.94,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.926,
   "end_ekf_minus_odom_in": 1.269,
   "sensor_stats": {
@@ -411,7 +415,7 @@
     "nis": 0.21
    }
   ],
-  "wall_repro_err": 0.1113
+  "wall_repro_err": 0.1461
  },
  "run3": {
   "name": "run3",
@@ -532,6 +536,8 @@
   "max_applied_step_in": 0.024,
   "applied_total_in": 2.13,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 2.086,
   "end_ekf_minus_odom_in": 1.824,
   "sensor_stats": {
@@ -980,7 +986,7 @@
     "nis": 1.6
    }
   ],
-  "wall_repro_err": 0.0665
+  "wall_repro_err": 0.0832
  },
  "run4": {
   "name": "run4",
@@ -1040,6 +1046,8 @@
   "max_applied_step_in": 0.0,
   "applied_total_in": 0.0,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.0,
   "end_ekf_minus_odom_in": 0.0,
   "sensor_stats": {
@@ -1070,7 +1078,7 @@
   },
   "model_err_max": 0.0002,
   "model_err_med": 0.0,
-  "wall_repro_err": 0.0247
+  "wall_repro_err": 0.017
  },
  "run5": {
   "name": "run5",
@@ -1131,6 +1139,8 @@
   "max_applied_step_in": 0.0,
   "applied_total_in": 0.0,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.0,
   "end_ekf_minus_odom_in": 0.0,
   "sensor_stats": {
@@ -1161,7 +1171,7 @@
   },
   "model_err_max": 0.0014,
   "model_err_med": 0.0,
-  "wall_repro_err": 0.0359
+  "wall_repro_err": 0.0178
  },
  "run6": {
   "name": "run6",
@@ -1221,6 +1231,8 @@
   "max_applied_step_in": 0.0,
   "applied_total_in": 0.0,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.0,
   "end_ekf_minus_odom_in": 0.0,
   "sensor_stats": {
@@ -1316,6 +1328,8 @@
   "max_applied_step_in": 0.0,
   "applied_total_in": 0.0,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.0,
   "end_ekf_minus_odom_in": 0.0,
   "sensor_stats": {
@@ -1346,7 +1360,7 @@
   },
   "model_err_max": 0.0012,
   "model_err_med": 0.0,
-  "wall_repro_err": 0.0581
+  "wall_repro_err": 0.0298
  },
  "tune": {
   "name": "tune",
@@ -1404,6 +1418,8 @@
   "max_applied_step_in": 0.0,
   "applied_total_in": 0.0,
   "cap_violations": 0,
+  "boundary_steps": 0,
+  "max_boundary_step_in": 0.0,
   "end_net_applied_in": 0.0,
   "end_ekf_minus_odom_in": 0.0,
   "sensor_stats": {
@@ -1670,6 +1686,6 @@
     "nis": 10.6
    }
   ],
-  "wall_repro_err": 0.0631
+  "wall_repro_err": 0.0685
  }
 }

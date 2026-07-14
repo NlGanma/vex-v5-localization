@@ -32,23 +32,31 @@ inline float expNegApprox(float x) {
             float upper;
             float center;
             float expCenter;
+            // Value of the PREVIOUS segment's polynomial at the shared boundary.
+            // Each segment's truncated Taylor series underestimates e^-x more at
+            // its right edge than the next segment does at its left edge, so the
+            // raw approximation jumps UP at every seam (~0.07-0.15%), making the
+            // likelihood locally non-monotone in |error|. Ceiling each segment at
+            // its left neighbor's endpoint value keeps the whole approximation
+            // monotone non-increasing for any tuning.
+            float maxValue;
     };
 
     constexpr Segment kSegments[] = {
-        {0.8f, 0.4f, 0.670320046f},
-        {1.6f, 1.2f, 0.301194212f},
-        {2.4f, 2.0f, 0.135335283f},
-        {3.2f, 2.8f, 0.060810063f},
+        {0.8f, 0.4f, 0.670320046f, 1.0f},
+        {1.6f, 1.2f, 0.301194212f, 0.448667551f},
+        {2.4f, 2.0f, 0.135335283f, 0.201599326f},
+        {3.2f, 2.8f, 0.060810063f, 0.090584416f},
     };
 
     for (const auto& segment : kSegments) {
         if (x > segment.upper) continue;
         const float d = x - segment.center;
         const float poly = 1.0f - d + 0.5f * d * d - (d * d * d) / 6.0f;
-        return std::max(0.0f, segment.expCenter * poly);
+        return std::min(segment.maxValue, std::max(0.0f, segment.expCenter * poly));
     }
 
-    return std::exp(-x);
+    return std::min(std::exp(-x), 0.040702202f);
 }
 
 inline float gaussianPdf(float error, float sigma) {

@@ -51,7 +51,10 @@ constexpr float kMaxSpeedMargin = 3.0f;
 constexpr size_t kOdomDeltaHistorySize = 256;
 
 float sanitizeReading(float reading, float previous) {
-    if (std::isfinite(reading) && std::fabs(reading) < 1e6f) return reading;
+    // 1e5 catches rotation-sensor PROS_ERR (INT32_MAX centidegrees -> ~4e5 in
+    // for a 2.125" wheel at gearRatio 1, which a 1e6 gate let straight through)
+    // while staying ~12x above the largest accumulable match distance (~8e3 in).
+    if (std::isfinite(reading) && std::fabs(reading) < 1e5f) return reading;
     return previous;
 }
 
@@ -151,7 +154,7 @@ lemlib::Pose lemlib::getPose(bool radians) {
 namespace {
 void setPoseImpl(lemlib::Pose pose, bool radians, bool syncLocalization, bool resetOdomDelta) {
     const lemlib::Pose poseRad = radians ? pose : lemlib::Pose(pose.x, pose.y, lemlib::degToRad(pose.theta));
-    uint32_t newSeq = odomPoseSeq;
+    uint32_t newSeq = 0;
 
     if (resetOdomDelta) odomUpdateMutex.take();
 
@@ -195,13 +198,19 @@ void lemlib::setPose(lemlib::Pose pose, bool radians) { setPoseImpl(pose, radian
 
 void lemlib::detail::setPoseSilent(lemlib::Pose pose, bool radians) { setPoseImpl(pose, radians, false, false); }
 
-bool lemlib::detail::setPoseSilentIfSeq(lemlib::Pose pose, uint32_t expectedSeq, bool radians) {
+bool lemlib::detail::setPoseSilentIfSeq(lemlib::Pose pose, uint32_t expectedSeq, bool radians, bool (*abortIf)()) {
     const lemlib::Pose poseRad = radians ? pose : lemlib::Pose(pose.x, pose.y, lemlib::degToRad(pose.theta));
     // Same lock order as lemlib::update() (odomUpdateMutex -> odomStateMutex) so
     // no odom integration can interleave between the seq check and the write.
     odomUpdateMutex.take();
     odomStateMutex.take();
-    const bool seqMatches = (odomPoseSeq == expectedSeq);
+    // The abort predicate is evaluated under the odom locks: callers use it to
+    // re-check a condition (e.g. motion-correction suppression) that another
+    // task may have changed between building the pose and committing it. A
+    // motion's first getPose also takes odomStateMutex, so a write that passes
+    // this check is ordered before any pose read of the motion that suppressed.
+    const bool aborted = (abortIf != nullptr) && abortIf();
+    const bool seqMatches = !aborted && (odomPoseSeq == expectedSeq);
     if (seqMatches) odomPose = poseRad;
     odomStateMutex.give();
     odomUpdateMutex.give();
@@ -258,7 +267,7 @@ lemlib::OdomTelemetry lemlib::getOdomTelemetry() {
 
 lemlib::OdomTelemetry lemlib::getOdomTelemetryForSeq(uint32_t seq) {
     odomDeltaMutex.take();
-    OdomTelemetry copy = odomTelemetry;
+    OdomTelemetry copy {};
     for (const OdomTelemetry& telemetry : odomTelemetryHistory) {
         if (telemetry.seq == seq) {
             copy = telemetry;
@@ -302,6 +311,7 @@ void lemlib::update() {
     float horizontal1Raw = 0;
     float horizontal2Raw = 0;
     float imuRaw = 0;
+    bool imuReadingValid = false;
     if (odomSensors.vertical1 != nullptr)
         vertical1Raw = sanitizeReading(odomSensors.vertical1->getDistanceTraveled(), prevVertical1);
     if (odomSensors.vertical2 != nullptr)
@@ -310,7 +320,11 @@ void lemlib::update() {
         horizontal1Raw = sanitizeReading(odomSensors.horizontal1->getDistanceTraveled(), prevHorizontal1);
     if (odomSensors.horizontal2 != nullptr)
         horizontal2Raw = sanitizeReading(odomSensors.horizontal2->getDistanceTraveled(), prevHorizontal2);
-    if (odomSensors.imu != nullptr) imuRaw = sanitizeReading(degToRad(odomSensors.imu->get_rotation()), prevImu);
+    if (odomSensors.imu != nullptr) {
+        const float candidate = degToRad(odomSensors.imu->get_rotation());
+        imuReadingValid = std::isfinite(candidate) && std::fabs(candidate) < 1e5f;
+        imuRaw = imuReadingValid ? candidate : prevImu;
+    }
 
     // calculate the change in sensor values
     float deltaVertical1 = vertical1Raw - prevVertical1;
@@ -318,20 +332,26 @@ void lemlib::update() {
     float deltaHorizontal1 = horizontal1Raw - prevHorizontal1;
     float deltaHorizontal2 = horizontal2Raw - prevHorizontal2;
     float deltaImu = imuRaw - prevImu;
+    const bool imuDeltaRejected = odomSensors.imu != nullptr &&
+                                  (!imuReadingValid || std::fabs(deltaImu) > maxHeadingDelta);
 
-    // Encoder sanity check: reject deltas that are impossibly large
-    // (e.g. from a disconnected sensor returning 0 or PROS_ERR)
-    deltaVertical1 = clampMagnitude(deltaVertical1, maxDeltaPerUpdate);
-    deltaVertical2 = clampMagnitude(deltaVertical2, maxDeltaPerUpdate);
-    deltaHorizontal1 = clampMagnitude(deltaHorizontal1, maxDeltaPerUpdate);
-    deltaHorizontal2 = clampMagnitude(deltaHorizontal2, maxDeltaPerUpdate);
-
-    // update the previous sensor values
+    // Encoder sanity check: reject impossibly large deltas outright (e.g. from a
+    // disconnected sensor returning 0 or a glitch below the sanitize gate).
+    // Clamping instead of rejecting would inject the clamp magnitude into the
+    // pose as a fabricated step. Rebaselining after rejection lets a sensor that
+    // reset its accumulated position resume on the next tick.
+    if (std::fabs(deltaVertical1) > maxDeltaPerUpdate) deltaVertical1 = 0;
+    if (std::fabs(deltaVertical2) > maxDeltaPerUpdate) deltaVertical2 = 0;
+    if (std::fabs(deltaHorizontal1) > maxDeltaPerUpdate) deltaHorizontal1 = 0;
+    if (std::fabs(deltaHorizontal2) > maxDeltaPerUpdate) deltaHorizontal2 = 0;
+    // Rebaseline even after a rejected finite jump. Otherwise a sensor that
+    // reset to zero stays frozen until it re-accumulates its entire old reading.
     prevVertical1 = vertical1Raw;
     prevVertical2 = vertical2Raw;
     prevHorizontal1 = horizontal1Raw;
     prevHorizontal2 = horizontal2Raw;
-    prevImu = imuRaw;
+    if (imuReadingValid) prevImu = imuRaw;
+    if (imuDeltaRejected) deltaImu = 0.0f;
 
     const uint32_t newSeq = odomDeltaSeq.fetch_add(1) + 1;
 
@@ -339,10 +359,12 @@ void lemlib::update() {
 
     // calculate the heading of the robot
     // Priority:
-    // 1. Horizontal tracking wheels
-    // 2. Vertical tracking wheels
+    // 1. Horizontal tracking wheel pair
+    // 2. Vertical tracking wheel pair (both non-powered)
     // 3. Inertial Sensor
-    // 4. Drivetrain
+    // 4. Drivetrain (vertical pair incl. powered wheels; only when the IMU is
+    //    permanently absent, i.e. calibration failed and it was nulled out)
+    // 5. Hold last heading (transient non-finite IMU delta)
     const float headingBefore = odomPose.theta;
     float heading = odomPose.theta;
     const bool usedHorizontalHeading = tryHeadingFromPair(deltaHorizontal1, deltaHorizontal2, odomSensors.horizontal1,
@@ -357,9 +379,19 @@ void lemlib::update() {
             canUseVerticalHeading &&
             tryHeadingFromPair(deltaVertical1, deltaVertical2, odomSensors.vertical1, odomSensors.vertical2, heading);
         if (!usedVerticalHeading) {
-            if (odomSensors.imu != nullptr && std::isfinite(deltaImu)) {
+            if (odomSensors.imu != nullptr && !imuDeltaRejected) {
                 heading += deltaImu;
                 usedImuHeading = true;
+            } else if (odomSensors.imu == nullptr &&
+                       tryHeadingFromPair(deltaVertical1, deltaVertical2, odomSensors.vertical1,
+                                          odomSensors.vertical2, heading)) {
+                // Drivetrain fallback: the IMU failed calibration and was nulled,
+                // so the slip-prone powered vertical pair (vertical2 is substituted
+                // from drive motors at calibrate()) is the only heading source
+                // left. Freezing heading here instead would keep integrating
+                // translation against a dead heading and manufacture ~|offset|
+                // inches of phantom motion per radian of real rotation.
+                usedVerticalHeading = true;
             } else {
                 heading = odomPose.theta;
                 usedHeadingFallback = true;
@@ -396,8 +428,11 @@ void lemlib::update() {
     float deltaY = 0;
     if (verticalWheel != nullptr) deltaY = rawVertical - prevVertical;
     if (horizontalWheel != nullptr) deltaX = rawHorizontal - prevHorizontal;
-    deltaX = clampMagnitude(deltaX, maxDeltaPerUpdate);
-    deltaY = clampMagnitude(deltaY, maxDeltaPerUpdate);
+    // Same reject-don't-clamp policy as the per-wheel deltas above: a fabricated
+    // clamp-magnitude step would poison the pose; rebaseline so a reset sensor
+    // resumes from its new accumulated-position origin.
+    if (std::fabs(deltaY) > maxDeltaPerUpdate) deltaY = 0;
+    if (std::fabs(deltaX) > maxDeltaPerUpdate) deltaX = 0;
     prevVertical = rawVertical;
     prevHorizontal = rawHorizontal;
 

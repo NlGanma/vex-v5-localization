@@ -101,6 +101,20 @@ def parse_log(path: Path):
     fb = re.search(r"^# field_bounds,([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)$", text, re.M)
     if fb:
         meta["field"] = [float(fb.group(k)) for k in range(1, 7)]
+    fusion_caps = re.search(
+        r"^# max_var_xy=[-\d.]+,max_var_theta=[-\d.]+,max_meas_xy=[-\d.]+,"
+        r"max_corr_xy=([-\d.]+),max_corr_theta_deg=[-\d.]+,stale_ms=\d+$",
+        text, re.M,
+    )
+    if fusion_caps:
+        meta["max_corr_xy"] = float(fusion_caps.group(1))
+    boundary_caps = re.search(
+        r"^# boundary_reanchor=(\d+),max_boundary_corr_xy=([-\d.]+),max_boundary_corr_theta_deg=[-\d.]+$",
+        text, re.M,
+    )
+    if boundary_caps:
+        meta["boundary_reanchor_enabled"] = int(boundary_caps.group(1))
+        meta["max_boundary_corr_xy"] = float(boundary_caps.group(2))
     obstacles = []
     for om in re.finditer(r"^# obstacle,(\d+),(\w+),([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)$", text, re.M):
         obstacles.append(dict(type=om.group(2), x=float(om.group(3)), y=float(om.group(4)),
@@ -277,6 +291,10 @@ def analyze_run(name, meta, rows):
     max_applied = 0.0
     applied_total = 0.0
     cap_viol = 0
+    boundary_steps = 0
+    max_boundary = 0.0
+    continuous_cap = 2.0 * float(meta.get("max_corr_xy", 0.015))
+    boundary_cap = float(meta.get("max_boundary_corr_xy", 2.5))
     div_series = []
     for k, r in enumerate(rows):
         ox, oy = fnum(r["odom_only_x"]), fnum(r["odom_only_y"])
@@ -310,9 +328,14 @@ def analyze_run(name, meta, rows):
         prev_acc = acc
         ap = math.hypot(fnum(r["applied_corr_x"]), fnum(r["applied_corr_y"]))
         applied_total += ap
-        max_applied = max(max_applied, ap)
-        if ap > 0.0301:  # maxCorrectionXY * dtScale_max = 0.015*2 with float slop
+        boundary_applied = r.get("boundary_reanchor_applied") == "1"
+        if ap > continuous_cap + 0.0001 and boundary_applied and ap <= boundary_cap + 0.0001:
+            boundary_steps += 1
+            max_boundary = max(max_boundary, ap)
+        elif ap > continuous_cap + 0.0001:
             cap_viol += 1
+        else:
+            max_applied = max(max_applied, ap)
 
     booked = div_series[-1][1]
     rate = booked / path if path > 1e-6 else 0.0
@@ -401,6 +424,7 @@ def analyze_run(name, meta, rows):
         seq_gaps=seq_gaps[:5], n_seq_gaps=len(seq_gaps),
         max_applied_step_in=round(max_applied, 4), applied_total_in=round(applied_total, 2),
         cap_violations=cap_viol,
+        boundary_steps=boundary_steps, max_boundary_step_in=round(max_boundary, 4),
         end_net_applied_in=round(end_odom_vs_only, 3), end_ekf_minus_odom_in=round(end_ekf_vs_odom, 3),
         sensor_stats=sensor_stats,
         model_err_max=round(model_err[-1], 4) if model_err else None,
@@ -437,6 +461,7 @@ def main():
               f"max_seg={res['max_seg_in']} factor={res['factor']} stair_viol={res['staircase_violation_in']}")
         print(f"  nis med/p90/max={res['nis_med']}/{res['nis_p90']}/{res['nis_max']} "
               f"max_applied_step={res['max_applied_step_in']} capViol={res['cap_violations']} "
+              f"boundary_steps={res['boundary_steps']} max_boundary_step={res['max_boundary_step_in']} "
               f"net_applied_end={res['end_net_applied_in']} ekf-odom_end={res['end_ekf_minus_odom_in']}")
         print(f"  seq_gaps={res['n_seq_gaps']} {res['seq_gaps']}")
         print(f"  reject_hist={res['reject_hist']}")
@@ -462,16 +487,13 @@ def main():
             if field and smodel and sens:
                 sensors = [smodel[i] for i in range(4)]
                 imu = math.radians(meta.get("imu_heading_deg", 0.0))
-                best = None
-                for hd in (0.0, math.pi / 2, math.pi, -math.pi / 2):
-                    sol = solve_wall(field, sensors, sens, hd)
-                    if sol is None:
-                        continue
-                    pen = abs(math.remainder(hd - imu, 2 * math.pi))
-                    if best is None or pen < best[1]:
-                        best = (sol, pen)
-                if best:
-                    sol = best[0]
+                # mirror the post-June-11 firmware: a SINGLE solve at the logged
+                # field-frame IMU heading, never snapped to cardinals (the old
+                # cardinal enumeration quantized the heading and inflated the
+                # reproduction error; imu_heading_deg is logged at %.1f, which
+                # bounds the residual reproduction error instead)
+                sol = solve_wall(field, sensors, sens, imu)
+                if sol is not None:
                     want = [float(x) for x in m["relocalize_pose"].split()]
                     res["wall_repro_err"] = round(math.hypot(sol[0] - want[0], sol[1] - want[1]), 4)
                     print(f"  wall-solve repro: ({sol[0]:.2f},{sol[1]:.2f}) used={sol[3]} "
@@ -530,7 +552,12 @@ def emit_report_data(results):
         mac("AuditWallMaxErr", f"{wall_max:.2f}")
         mac("AuditStairMax", f"{stair_max:.4f}")
         mac("AuditCapObserved", f"{cap_obs:.4f}")
-        mac("AuditCapBound", "0.030")
+        cap_bound = max(2.0 * float(results[k].get("meta", {}).get("max_corr_xy", 0.015)) for k in results)
+        mac("AuditCapBound", f"{cap_bound:.3f}")
+        boundary_obs = max((results[k].get("max_boundary_step_in") or 0.0) for k in results)
+        mac("AuditBoundaryObserved", f"{boundary_obs:.4f}")
+        boundary_bound = max(float(results[k].get("meta", {}).get("max_boundary_corr_xy", 2.5)) for k in results)
+        mac("AuditBoundaryBound", f"{boundary_bound:.3f}")
         mac("nValidatedFixes", f"{len(accepts)}")
         mac("AcceptMagMin", f"{min(mags):.2f}")
         mac("AcceptMagMax", f"{max(mags):.2f}")

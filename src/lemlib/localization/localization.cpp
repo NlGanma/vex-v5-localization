@@ -59,10 +59,15 @@ LocalizationConfig config;
 bool configured = false;
 std::atomic<bool> running {false};
 std::atomic<bool> motionCorrectionSuppressed {false};
+std::atomic<uint32_t> motionCorrectionEpoch {0};
 // One-shot: set when a motion ends (robot idle between segments). The next gated
 // accept commits the trusted EKF pose to odom with the larger boundary cap, then
 // clears this. Cleared if a new motion suppresses corrections first (no idle gap).
 std::atomic<bool> boundaryReanchorPending {false};
+std::atomic<bool> boundaryReanchorAppliedSinceTrace {false};
+std::atomic<float> boundaryReanchorAppliedX {0.0f};
+std::atomic<float> boundaryReanchorAppliedY {0.0f};
+std::atomic<float> boundaryReanchorAppliedTheta {0.0f};
 std::atomic<bool> taskExited {false};
 pros::Task* task = nullptr;
 
@@ -82,6 +87,29 @@ pros::Mutex traceMutex;
 std::deque<TraceSample> traceSamples;
 TraceSample latestTraceSample {};
 bool traceEnabled = false;
+
+struct StagedCorrection {
+    lemlib::Pose delta {0, 0, 0};
+    uint32_t acceptedAtMs = 0;
+    uint32_t epoch = 0;
+    bool valid = false;
+};
+pros::Mutex stagedCorrectionMutex;
+StagedCorrection stagedCorrection {};
+
+void clearStagedCorrection() {
+    stagedCorrectionMutex.take();
+    stagedCorrection = {};
+    stagedCorrectionMutex.give();
+}
+
+void recordBoundaryReanchor(float dx, float dy, float dtheta) {
+    boundaryReanchorAppliedX.store(dx);
+    boundaryReanchorAppliedY.store(dy);
+    boundaryReanchorAppliedTheta.store(dtheta);
+    // Publish the event only after all components are available to the trace task.
+    boundaryReanchorAppliedSinceTrace.store(true);
+}
 
 Mat3 makeInitialCovariance() {
     Mat3 P0 = Mat3::identity(1.0f);
@@ -219,6 +247,33 @@ float raycastRect(float sx, float sy, float dirX, float dirY, const FieldConfig:
     return -1.0f;
 }
 
+bool isValidCorrectionPose(const lemlib::Pose& pose) {
+    const float minX = std::min(config.field.minX + config.field.fieldMargin,
+                                config.field.maxX - config.field.fieldMargin);
+    const float maxX = std::max(config.field.minX + config.field.fieldMargin,
+                                config.field.maxX - config.field.fieldMargin);
+    const float minY = std::min(config.field.minY + config.field.fieldMargin,
+                                config.field.maxY - config.field.fieldMargin);
+    const float maxY = std::max(config.field.minY + config.field.fieldMargin,
+                                config.field.maxY - config.field.fieldMargin);
+    if (!std::isfinite(pose.x) || !std::isfinite(pose.y) || pose.x < minX || pose.x > maxX ||
+        pose.y < minY || pose.y > maxY) {
+        return false;
+    }
+
+    for (const auto& obstacle : config.field.obstacles) {
+        if (obstacle.type == FieldConfig::Obstacle::Type::Circle) {
+            const float radius = obstacle.radius + config.field.obstacleMargin;
+            if (std::hypot(pose.x - obstacle.x, pose.y - obstacle.y) <= radius) return false;
+        } else {
+            const float halfW = obstacle.halfW + config.field.obstacleMargin;
+            const float halfH = obstacle.halfH + config.field.obstacleMargin;
+            if (std::fabs(pose.x - obstacle.x) <= halfW && std::fabs(pose.y - obstacle.y) <= halfH) return false;
+        }
+    }
+    return true;
+}
+
 float expectedDistanceFromPose(const lemlib::Pose& pose, const SensorConfig& sensor) {
     const float sinTheta = std::sin(pose.theta);
     const float cosTheta = std::cos(pose.theta);
@@ -304,6 +359,7 @@ struct LocalRangeCorrection {
 
 float localRangeSolveScore(const lemlib::Pose& pose, const MCLMeasurement& measurement,
                            const lemlib::Pose& anchor, CandidateSensorFit& fit) {
+    if (!isValidCorrectionPose(pose)) return 1.0e9f;
     fit = evaluateCandidateSensorFit(pose, measurement);
     if (fit.inlierSensors < 2) return 1.0e9f;
 
@@ -354,7 +410,7 @@ LocalRangeCorrection solveLocalRangeCorrection(const lemlib::Pose& anchor, const
     }
 
     const float delta = bestPose.distance(anchor);
-    if (bestFit.inlierSensors < 2 || delta > kLocalRangeCorrectionMaxPoseDeltaIn ||
+    if (!isValidCorrectionPose(bestPose) || bestFit.inlierSensors < 2 || delta > kLocalRangeCorrectionMaxPoseDeltaIn ||
         bestFit.inlierMeanResidual > kLocalRangeCorrectionMaxInlierMeanResidual ||
         bestFit.inlierMaxResidual > kLocalRangeCorrectionMaxInlierResidual) {
         return out;
@@ -418,6 +474,8 @@ void localizationTask(void*) {
     bool lastSensorsStale = false;
     bool lastCorrectionAccepted = false;
     uint32_t lastCorrectionRejectMask = 0;
+    uint32_t lastCorrectionAcceptedMs = 0;
+    uint32_t lastCorrectionAcceptedEpoch = 0;
     float lastNis = -1.0f;
     float lastMeasurementPoseDelta = 0.0f;
     float lastMeasurementHeadingDelta = 0.0f;
@@ -429,6 +487,7 @@ void localizationTask(void*) {
     lemlib::Pose lastCandidatePose {0, 0, 0};
     int candidateStableScans = 0;
     bool haveCandidatePose = false;
+    bool lastCandidateUsedLocalRange = false;
     std::array<float, 4> lastSensorDistance {};
     std::array<int, 4> lastSensorConfidence {};
     std::array<int, 4> lastSensorObjectSize {};
@@ -455,12 +514,16 @@ void localizationTask(void*) {
         pendingReset = false;
         resetMutex.give();
         if (applyReset) {
+            // Invalidate any correction staged against the pre-reset odom frame.
+            clearStagedCorrection();
             resetFilters(resetPose);
             lastSeq = resetSeq;
             lastMeasurement = {};
             lastSensorsStale = false;
             lastCorrectionAccepted = false;
             lastCorrectionRejectMask = 0;
+            lastCorrectionAcceptedMs = 0;
+            lastCorrectionAcceptedEpoch = 0;
             lastNis = -1.0f;
             lastMeasurementPoseDelta = 0.0f;
             lastMeasurementHeadingDelta = 0.0f;
@@ -471,6 +534,7 @@ void localizationTask(void*) {
             lastRequiredStableScans = 0;
             candidateStableScans = 0;
             haveCandidatePose = false;
+            lastCandidateUsedLocalRange = false;
             maxAngularRateSinceMcl = 0.0f;
             haveSensorReading.fill(false);
             sensorReadingSeq.fill(0);
@@ -493,6 +557,8 @@ void localizationTask(void*) {
                 lastSensorsStale = false;
                 lastCorrectionAccepted = false;
                 lastCorrectionRejectMask = 0;
+                lastCorrectionAcceptedMs = 0;
+                lastCorrectionAcceptedEpoch = 0;
                 lastNis = -1.0f;
                 lastMeasurementPoseDelta = 0.0f;
                 lastMeasurementHeadingDelta = 0.0f;
@@ -503,7 +569,9 @@ void localizationTask(void*) {
                 lastRequiredStableScans = 0;
                 candidateStableScans = 0;
                 haveCandidatePose = false;
+                lastCandidateUsedLocalRange = false;
                 maxAngularRateSinceMcl = 0.0f;
+                clearStagedCorrection();
             } else {
                 for (const auto& delta : deltas) {
                     ekf.predict(delta);
@@ -558,6 +626,7 @@ void localizationTask(void*) {
             lemlib::Pose correctionCandidatePose = rawMeas.pose;
             Mat3 correctionCandidateCovariance = rawMeas.covariance;
             bool usingLocalRangeCorrection = false;
+            const bool motionCorrectionSuppressedForUpdate = motionCorrectionSuppressed.load();
             float rawMclConsistencyNis = -1.0f;
             float rawMclPoseDelta = 0.0f;
             float rawMclHeadingDelta = 0.0f;
@@ -578,7 +647,13 @@ void localizationTask(void*) {
                 measurementHeadingDelta =
                     std::fabs(lemlib::radToDeg(lemlib::angleError(correctionCandidatePose.theta, ekfPose.theta)));
 
-                localRangeCorrection = solveLocalRangeCorrection(ekfPose, rawMeas);
+                // The local grid solve is correction-only work and is more
+                // expensive than the particle update. During motion, stage only
+                // fully-gated raw MCL fixes and leave this robust-outlier refinement
+                // for an idle scan so it cannot add scheduler load to drive control.
+                if (!motionCorrectionSuppressedForUpdate) {
+                    localRangeCorrection = solveLocalRangeCorrection(ekfPose, rawMeas);
+                }
                 if (localRangeCorrection.valid) {
                     correctionCandidatePose = localRangeCorrection.pose;
                     correctionCandidateCovariance = localRangeCorrection.covariance;
@@ -591,23 +666,22 @@ void localizationTask(void*) {
                 }
             }
             if (rawMeas.valid || usingLocalRangeCorrection) {
-                // Track stability on a single consistent estimator (the raw MCL
-                // weighted mean) regardless of whether the local-range refinement
-                // is active this scan. Mixing the two sources let a toggle of
-                // usingLocalRangeCorrection masquerade as candidate instability,
-                // spuriously resetting candidateStableScans and starving the
-                // accept gate.
-                const lemlib::Pose stableCandidatePose = rawMeas.pose;
+                // Stability must be measured on the pose that will actually be
+                // applied, and a raw-MCL/local-range source change starts a new run.
+                const lemlib::Pose stableCandidatePose = correctionCandidatePose;
                 const bool candidateAgrees =
-                    haveCandidatePose && stableCandidatePose.distance(lastCandidatePose) <= kMclCandidateAgreementXY &&
+                    haveCandidatePose && usingLocalRangeCorrection == lastCandidateUsedLocalRange &&
+                    stableCandidatePose.distance(lastCandidatePose) <= kMclCandidateAgreementXY &&
                     std::fabs(lemlib::radToDeg(lemlib::angleError(stableCandidatePose.theta, lastCandidatePose.theta))) <=
                         kMclCandidateAgreementHeadingDeg;
                 candidateStableScans = candidateAgrees ? candidateStableScans + 1 : 1;
                 lastCandidatePose = stableCandidatePose;
+                lastCandidateUsedLocalRange = usingLocalRangeCorrection;
                 haveCandidatePose = true;
             } else {
                 candidateStableScans = 0;
                 haveCandidatePose = false;
+                lastCandidateUsedLocalRange = false;
             }
             const bool candidateHasThreeInliers =
                 candidateSensorFit.inlierSensors >= config.fusion.minCorrectionSensors;
@@ -637,7 +711,12 @@ void localizationTask(void*) {
                                                   maxAngularRateSinceMcl <= kTwoSensorCorrectionMaxTurnRate &&
                                                   (twoSensorTightReady || twoSensorRelaxedReady);
             const bool localRangeCorrectionReady =
-                usingLocalRangeCorrection && localRangeCorrection.confidence >= kTwoSensorCorrectionRelaxedMinConfidence &&
+                usingLocalRangeCorrection && rawMeas.activeSensors >= config.fusion.minCorrectionSensors &&
+                rawMeas.confidence >= config.fusion.minConfidence &&
+                localRangeCorrection.confidence >= config.fusion.minConfidence &&
+                rawMeas.covariance.m[0][0] <= config.fusion.maxVarXY &&
+                rawMeas.covariance.m[1][1] <= config.fusion.maxVarXY &&
+                rawMeas.covariance.m[2][2] <= config.fusion.maxVarTheta &&
                 maxAngularRateSinceMcl <= kTwoSensorCorrectionMaxTurnRate;
             const int requiredStableScans =
                 candidateSensorFit.inlierSensors >= 3 ? kMclThreeSensorStableScans : kMclTwoSensorStableScans;
@@ -645,12 +724,12 @@ void localizationTask(void*) {
                 candidateHasThreeInliers || twoSensorCorrectionReady || localRangeCorrectionReady;
             const bool correctionStable = candidateStableScans >= requiredStableScans;
             const bool planarRangeCorrection = rawMeas.valid && rawMeas.activeSensors >= 2;
-            const float maxMeasurementDelta =
-                localRangeCorrectionReady ? kLocalRangeCorrectionMaxPoseDeltaIn : config.fusion.maxMeasurementDeltaXY;
+            // Heading is never sourced from range measurements (planar corrections
+            // strip it, local-range solves zero it), so the pose-delta gate is
+            // XY-only by construction; a heading clause here was provably inert.
             const bool correctionCloseToTrack =
-                measurementPoseDelta <= maxMeasurementDelta &&
-                (planarRangeCorrection ||
-                 measurementHeadingDelta <= lemlib::radToDeg(config.fusion.maxMeasurementDeltaTheta));
+                measurementPoseDelta <= config.fusion.maxMeasurementDeltaXY &&
+                isValidCorrectionPose(correctionCandidatePose);
             const bool correctionReady = threeSensorCorrectionReady || twoSensorCorrectionReady || localRangeCorrectionReady;
             // Full NIS gate only for genuine 3-inlier geometry; a 2-inlier
             // local-range solve is two-sensor-class and gets the tightened gate,
@@ -664,7 +743,6 @@ void localizationTask(void*) {
             if (!rawMeas.valid || rawMeas.activeSensors < 2) correctionRejectMask |= kRejectNoMeasurement;
             if (turnCorrectionSuppressed) correctionRejectMask |= kRejectTurnSuppressed;
             if (sensorsStale) correctionRejectMask |= kRejectSensorsStale;
-            const bool motionCorrectionSuppressedForUpdate = motionCorrectionSuppressed.load();
             if (motionCorrectionSuppressedForUpdate) correctionRejectMask |= kRejectMotionSuppressed;
             if (!correctionGeometryReady) correctionRejectMask |= kRejectNotEnoughSensors;
             // Distinct residual-quality signal: enough sensors are live but too
@@ -680,7 +758,7 @@ void localizationTask(void*) {
             if (!correctionReady) correctionRejectMask |= kRejectReadiness;
             if (correctionReady && nis > activeNisGate) correctionRejectMask |= kRejectNis;
 
-            if (!motionCorrectionSuppressedForUpdate && !turnCorrectionSuppressed && !sensorsStale && correctionGeometryReady &&
+            if (!turnCorrectionSuppressed && !sensorsStale && correctionGeometryReady &&
                 correctionStable && correctionCloseToTrack && correctionReady && nis <= activeNisGate) {
                 lemlib::Pose correctionPose = correctionCandidatePose;
                 Mat3 correctionCovariance = correctionCandidateCovariance;
@@ -703,7 +781,9 @@ void localizationTask(void*) {
                     ekf.reset(planarState, planarCovariance);
                 }
                 correctionAccepted = true;
-                correctionRejectMask = 0;
+                correctionRejectMask = motionCorrectionSuppressedForUpdate ? kRejectMotionSuppressed : 0;
+                lastCorrectionAcceptedMs = now;
+                lastCorrectionAcceptedEpoch = motionCorrectionEpoch.load();
             }
 
             if (!correctionAccepted && rawMeas.valid && rawMeas.activeSensors >= 2 &&
@@ -724,6 +804,7 @@ void localizationTask(void*) {
                 meas.valid = false;
                 candidateStableScans = 0;
                 haveCandidatePose = false;
+                lastCandidateUsedLocalRange = false;
             }
             lastMeasurement = meas;
             lastSensorsStale = sensorsStale;
@@ -771,10 +852,20 @@ void localizationTask(void*) {
         resetMutex.give();
         const auto snapshot = lemlib::getOdomSnapshot();
         lemlib::Pose appliedPose = snapshot.pose;
+        // Pending boundary requests are dropped by setMotionCorrectionSuppressed(true)
+        // itself (writer-side, ordered with the motion lifecycle) — clearing here from
+        // a stale snapshot could wipe a request whose idle window just opened.
         const bool motionCorrectionSuppressedForInjection = motionCorrectionSuppressed.load();
-        // A motion is (re)suppressing corrections: the idle window between segments
-        // closed without a commit, so drop any pending boundary request.
-        if (motionCorrectionSuppressedForInjection) boundaryReanchorPending.store(false);
+        if (motionCorrectionSuppressedForInjection && lastCorrectionAccepted && snapshot.seq == lastSeq &&
+            lastCorrectionAcceptedEpoch == motionCorrectionEpoch.load()) {
+            stagedCorrectionMutex.take();
+            stagedCorrection.delta = {fused.x - snapshot.pose.x, fused.y - snapshot.pose.y,
+                                      wrapAngle(fused.theta - snapshot.pose.theta)};
+            stagedCorrection.acceptedAtMs = lastCorrectionAcceptedMs;
+            stagedCorrection.epoch = lastCorrectionAcceptedEpoch;
+            stagedCorrection.valid = true;
+            stagedCorrectionMutex.give();
+        }
         if (!resetQueued && !motionCorrectionSuppressedForInjection) {
             // Only write the correction back when the published odom snapshot is
             // exactly the state our fused pose was built from (seq == lastSeq). If
@@ -791,20 +882,33 @@ void localizationTask(void*) {
                 // in one step instead of bled at maxCorrectionXY/loop. When it does
                 // not fire, behavior is byte-identical to the continuous path.
                 const bool boundaryCommit = config.fusion.enableBoundaryReanchor &&
-                                            boundaryReanchorPending.load() && lastCorrectionAccepted;
+                                            boundaryReanchorPending.load() && lastCorrectionAccepted &&
+                                            lastCorrectionAcceptedEpoch == motionCorrectionEpoch.load();
                 const float limitXY =
                     boundaryCommit ? config.fusion.maxBoundaryCorrectionXY : config.fusion.maxCorrectionXY * dtScale;
                 const float limitTheta = boundaryCommit ? config.fusion.maxBoundaryCorrectionTheta
                                                         : config.fusion.maxCorrectionTheta * dtScale;
+                // A boundary commit is documented as ONE bounded step; blend < 1
+                // would silently scale it into a partial commit that still
+                // consumes the one-shot, so it applies to continuous corrections only.
+                const float commitBlend = boundaryCommit ? 1.0f : config.fusion.blend;
                 const lemlib::Pose safe =
-                    applyCorrectionLimit(snapshot.pose, fused, limitXY, limitTheta, config.fusion.blend);
+                    applyCorrectionLimit(snapshot.pose, fused, limitXY, limitTheta, commitBlend);
                 // Commit only if odom has not advanced since the snapshot: the
                 // setter re-checks the seq under the odom lock, so a concurrent
                 // odom integration can't be clobbered (correction is simply
-                // deferred to the next loop instead).
-                if (lemlib::detail::setPoseSilentIfSeq(safe, snapshot.seq, true)) {
+                // deferred to the next loop instead). The suppression re-check
+                // under the same lock closes the tick-wide race where a motion
+                // starts between our suppression load above and this write —
+                // every motion suppresses corrections before its first getPose,
+                // so a write that passes the re-check is invisible to it.
+                if (lemlib::detail::setPoseSilentIfSeq(safe, snapshot.seq, true, &isMotionCorrectionSuppressed)) {
                     appliedPose = safe;
-                    if (boundaryCommit) boundaryReanchorPending.store(false);
+                    if (boundaryCommit) {
+                        boundaryReanchorPending.store(false);
+                        recordBoundaryReanchor(safe.x - snapshot.pose.x, safe.y - snapshot.pose.y,
+                                               wrapAngle(safe.theta - snapshot.pose.theta));
+                    }
                 }
             }
         }
@@ -835,6 +939,15 @@ void localizationTask(void*) {
         sample.mclValid = lastMeasurement.valid;
         sample.sensorsStale = lastSensorsStale;
         sample.correctionAccepted = lastCorrectionAccepted;
+        sample.boundaryReanchorApplied = boundaryReanchorAppliedSinceTrace.exchange(false);
+        if (sample.boundaryReanchorApplied) {
+            // A synchronous boundary commit occurs between localization loops,
+            // so the next snapshot already contains it. Preserve the real event
+            // delta instead of logging a misleading zero pre/post difference.
+            sample.appliedCorrectionX = boundaryReanchorAppliedX.load();
+            sample.appliedCorrectionY = boundaryReanchorAppliedY.load();
+            sample.appliedCorrectionTheta = boundaryReanchorAppliedTheta.load();
+        }
         sample.correctionRejectMask = lastCorrectionRejectMask;
         sample.measurementPoseDelta = lastMeasurementPoseDelta;
         sample.measurementHeadingDelta = lastMeasurementHeadingDelta;
@@ -898,7 +1011,6 @@ void configure(const LocalizationConfig& cfg) {
     config.fusion.maxVarXY = std::max(config.fusion.maxVarXY, 1e-6f);
     config.fusion.maxVarTheta = std::max(config.fusion.maxVarTheta, 1e-6f);
     config.fusion.maxMeasurementDeltaXY = std::fabs(config.fusion.maxMeasurementDeltaXY);
-    config.fusion.maxMeasurementDeltaTheta = std::fabs(config.fusion.maxMeasurementDeltaTheta);
     config.fusion.maxCorrectionXY = std::fabs(config.fusion.maxCorrectionXY);
     config.fusion.maxCorrectionTheta = std::fabs(config.fusion.maxCorrectionTheta);
     // A boundary commit must never be a *smaller* step than a continuous one, or it
@@ -929,6 +1041,12 @@ void start() {
     // pending flag from the previous session would otherwise commit on the very
     // first accepted fix after restart.
     boundaryReanchorPending.store(false);
+    boundaryReanchorAppliedSinceTrace.store(false);
+    boundaryReanchorAppliedX.store(0.0f);
+    boundaryReanchorAppliedY.store(0.0f);
+    boundaryReanchorAppliedTheta.store(0.0f);
+    motionCorrectionEpoch.store(0);
+    clearStagedCorrection();
     taskExited.store(false);
     resetMutex.take();
     pendingReset = false;
@@ -946,6 +1064,8 @@ void stop() {
     if (!running.load()) return;
     running.store(false);
     motionCorrectionSuppressed.store(false);
+    boundaryReanchorPending.store(false);
+    clearStagedCorrection();
     resetMutex.take();
     pendingReset = false;
     pendingResetSeq = 0;
@@ -967,16 +1087,65 @@ void stop() {
 
 bool isRunning() { return running.load(); }
 
-void setMotionCorrectionSuppressed(bool suppressed) { motionCorrectionSuppressed.store(suppressed); }
+void setMotionCorrectionSuppressed(bool suppressed) {
+    const bool wasSuppressed = motionCorrectionSuppressed.exchange(suppressed);
+    // Clearing the pending one-shot lives HERE, on the writer side, so the
+    // suppress/clear pair is totally ordered by the motion lifecycle. If the
+    // localization loop cleared it from its own (stale) snapshot of the
+    // suppression flag, a request issued by endMotion right after the loop's
+    // load could be wiped even though its idle window had just opened.
+    if (suppressed) {
+        boundaryReanchorPending.store(false);
+        if (!wasSuppressed) {
+            motionCorrectionEpoch.fetch_add(1);
+            clearStagedCorrection();
+        }
+    }
+}
 
 bool isMotionCorrectionSuppressed() { return motionCorrectionSuppressed.load(); }
 
+bool applyStagedBoundaryReanchor() {
+    if (!config.fusion.enableBoundaryReanchor || !motionCorrectionSuppressed.load()) return false;
+
+    stagedCorrectionMutex.take();
+    const StagedCorrection staged = stagedCorrection;
+    stagedCorrectionMutex.give();
+    if (!staged.valid || staged.epoch != motionCorrectionEpoch.load() ||
+        pros::millis() - staged.acceptedAtMs > config.fusion.sensorStaleMs) {
+        return false;
+    }
+
+    const auto snapshot = lemlib::getOdomSnapshot();
+    const lemlib::Pose target {snapshot.pose.x + staged.delta.x, snapshot.pose.y + staged.delta.y,
+                              snapshot.pose.theta + staged.delta.theta};
+    if (!isValidCorrectionPose(target)) return false;
+    const lemlib::Pose safe =
+        applyCorrectionLimit(snapshot.pose, target, config.fusion.maxBoundaryCorrectionXY,
+                             config.fusion.maxBoundaryCorrectionTheta, 1.0f);
+    if (!lemlib::detail::setPoseSilentIfSeq(safe, snapshot.seq, true)) return false;
+
+    clearStagedCorrection();
+    boundaryReanchorPending.store(false);
+    recordBoundaryReanchor(safe.x - snapshot.pose.x, safe.y - snapshot.pose.y,
+                           wrapAngle(safe.theta - snapshot.pose.theta));
+    return true;
+}
+
 void requestBoundaryReanchor() { boundaryReanchorPending.store(true); }
+
+void clearBoundaryReanchor() { boundaryReanchorPending.store(false); }
 
 void syncPose(lemlib::Pose pose) { syncPose(pose, lemlib::getOdomSnapshot().seq); }
 
 void syncPose(lemlib::Pose pose, uint32_t seq) {
     if (!configured) return;
+
+    // An accepted correction from the old frame must not be staged after this
+    // call clears it but before the localization task consumes the reset.
+    motionCorrectionEpoch.fetch_add(1);
+    clearStagedCorrection();
+    boundaryReanchorPending.store(false);
 
     if (!running.load()) {
         initialSeq = seq;

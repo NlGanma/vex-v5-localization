@@ -10,10 +10,13 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
     params.minSpeed = fabs(params.minSpeed);
     this->requestMotionStart();
     // were all motions cancelled?
-    if (!this->motionRunning) {
+    if (!this->motionRunning.load()) {
         this->endMotion();
         return;
     }
+    // capture the motion generation: motionContinues() makes a cancelled loop
+    // exit even if a new motion re-raises motionRunning before this one re-checks
+    const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
         pros::Task task([=, this]() { swingToHeading(theta, lockedSide, timeout, params, false); });
@@ -29,7 +32,7 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
     bool settling = false;
     std::optional<float> prevRawDeltaTheta = std::nullopt;
     std::optional<float> prevDeltaTheta = std::nullopt;
-    distTraveled = 0;
+    distTraveled.store(0.0f);
     Timer timer(timeout);
     angularLargeExit.reset();
     angularSmallExit.reset();
@@ -39,13 +42,13 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
     setDriveSideBrakeMode(lockedSide, pros::E_MOTOR_BRAKE_HOLD);
 
     // main loop
-    while (!timer.isDone() && !angularLargeExit.getExit() && !angularSmallExit.getExit() && this->motionRunning) {
+    while (!timer.isDone() && !angularLargeExit.getExit() && !angularSmallExit.getExit() && this->motionContinues(motionGen)) {
         // update variables
         Pose pose = getPose();
         pose.theta = fmod(pose.theta, 360);
 
         // update completion vars
-        distTraveled = fabs(angleError(pose.theta, startTheta, false));
+        distTraveled.store(fabs(angleError(pose.theta, startTheta, false)));
         targetTheta = theta;
 
         // check if settling
@@ -79,6 +82,7 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
         infoSink()->debug("Turn Motor Power: {} ", motorPower);
 
         // move the drivetrain
+        if (!motionContinues(motionGen)) break;
         if (lockedSide == DriveSide::LEFT) {
             moveDriveSide(DriveSide::RIGHT, -motorPower);
             brakeDriveSide(DriveSide::LEFT);
@@ -97,6 +101,6 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
     // stop the drivetrain
     stopDrive();
     // set distTraveled to -1 to indicate that the function has finished
-    distTraveled = -1;
+    distTraveled.store(-1.0f);
     this->endMotion();
 }

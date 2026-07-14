@@ -9,10 +9,13 @@ void lemlib::Chassis::turnToHeading(float theta, int timeout, TurnToHeadingParam
     params.minSpeed = std::abs(params.minSpeed);
     this->requestMotionStart();
     // were all motions cancelled?
-    if (!this->motionRunning) {
+    if (!this->motionRunning.load()) {
         this->endMotion();
         return;
     }
+    // capture the motion generation: motionContinues() makes a cancelled loop
+    // exit even if a new motion re-raises motionRunning before this one re-checks
+    const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
         pros::Task task([=, this]() { turnToHeading(theta, timeout, params, false); });
@@ -28,19 +31,19 @@ void lemlib::Chassis::turnToHeading(float theta, int timeout, TurnToHeadingParam
     bool settling = false;
     std::optional<float> prevRawDeltaTheta = std::nullopt;
     std::optional<float> prevDeltaTheta = std::nullopt;
-    distTraveled = 0;
+    distTraveled.store(0.0f);
     Timer timer(timeout);
     angularLargeExit.reset();
     angularSmallExit.reset();
     angularPID.reset();
 
     // main loop
-    while (!timer.isDone() && !angularLargeExit.getExit() && !angularSmallExit.getExit() && this->motionRunning) {
+    while (!timer.isDone() && !angularLargeExit.getExit() && !angularSmallExit.getExit() && this->motionContinues(motionGen)) {
         // update variables
         Pose pose = getPose();
 
         // update completion vars
-        distTraveled = fabs(angleError(pose.theta, startTheta, false));
+        distTraveled.store(fabs(angleError(pose.theta, startTheta, false)));
 
         targetTheta = theta;
 
@@ -75,6 +78,7 @@ void lemlib::Chassis::turnToHeading(float theta, int timeout, TurnToHeadingParam
         infoSink()->debug("Turn Motor Power: {} ", motorPower);
 
         // move the drivetrain
+        if (!motionContinues(motionGen)) break;
         moveDrive(motorPower, -motorPower);
 
         pros::delay(10);
@@ -83,6 +87,6 @@ void lemlib::Chassis::turnToHeading(float theta, int timeout, TurnToHeadingParam
     // stop the drivetrain
     stopDrive();
     // set distTraveled to -1 to indicate that the function has finished
-    distTraveled = -1;
+    distTraveled.store(-1.0f);
     this->endMotion();
 }

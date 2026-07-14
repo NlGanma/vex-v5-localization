@@ -34,14 +34,18 @@ LIBNAME:=LemLib
 VERSION:=0.5.6
 
 # EXCLUDE_SRC_FROM_LIB= $(SRCDIR)/unpublishedfile.c
-# this line excludes opcontrol.c and similar files
-EXCLUDE_SRC_FROM_LIB+=$(foreach file, $(SRCDIR)/main,$(foreach cext,$(CEXTS),$(file).$(cext)) $(foreach cxxext,$(CXXEXTS),$(file).$(cxxext)))
+# Keep robot/application objects in the hot project, not in the reusable
+# LemLib archive distributed by `make template`.
+APP_SRCS=$(SRCDIR)/main $(SRCDIR)/autonomous_control $(SRCDIR)/autonomous_localization \
+	$(SRCDIR)/driver_control $(SRCDIR)/localization_config $(SRCDIR)/localization_tune \
+	$(SRCDIR)/robot $(SRCDIR)/robot_control
+EXCLUDE_SRC_FROM_LIB+=$(foreach file,$(APP_SRCS),$(foreach cext,$(CEXTS),$(file).$(cext)) $(foreach cxxext,$(CXXEXTS),$(file).$(cxxext)))
 
 # files that get distributed to every user (beyond your source archive) - add
 # whatever files you want here. This line is configured to add all header files
 # that are in the the include directory get exported
 
-TEMPLATE_FILES=$(INCDIR)/lemlib/*.hpp $(INCDIR)/lemlib/logger/*.hpp $(INCDIR)/lemlib/chassis/*.hpp $(INCDIR)/fmt/*.h $(INCDIR)/fmt/LICENSE $(FWDIR)/hot-cold-asset.mk $(ROOT)/static/example.txt $(INCDIR)/lemlib/LICENSE $(INCDIR)/lemlib/README.md $(INCDIR)/lemlib/VERSION
+TEMPLATE_FILES=$(INCDIR)/lemlib/*.hpp $(INCDIR)/lemlib/logger/*.hpp $(INCDIR)/lemlib/chassis/*.hpp $(INCDIR)/lemlib/localization/*.hpp $(INCDIR)/fmt/*.h $(INCDIR)/fmt/LICENSE $(FWDIR)/hot-cold-asset.mk $(ROOT)/static/example.txt
 
 .DEFAULT_GOAL=quick
 
