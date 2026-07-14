@@ -10,7 +10,7 @@
   <img alt="Platform" src="https://img.shields.io/badge/platform-PROS%20V5-2F80ED?style=flat-square">
   <img alt="Language" src="https://img.shields.io/badge/C%2B%2B-23-00599C?style=flat-square">
   <img alt="Localization" src="https://img.shields.io/badge/localization-MCL%20%2B%20EKF%20%2B%20Odometry-0F766E?style=flat-square">
-  <a href="https://github.com/NlGanma/localization/actions/workflows/pros-build.yml"><img alt="PROS Build" src="https://github.com/NlGanma/localization/actions/workflows/pros-build.yml/badge.svg"></a>
+  <a href="https://github.com/NlGanma/vex-v5-localization/actions/workflows/pros-build.yml"><img alt="PROS Build" src="https://github.com/NlGanma/vex-v5-localization/actions/workflows/pros-build.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-111827?style=flat-square"></a>
 </p>
 
@@ -120,8 +120,8 @@ them on hardware.
 ### Build
 
 ```sh
-git clone https://github.com/NlGanma/localization.git
-cd localization
+git clone https://github.com/NlGanma/vex-v5-localization.git
+cd vex-v5-localization
 make quick
 ```
 
