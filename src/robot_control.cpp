@@ -52,19 +52,19 @@ std::atomic<std::uint32_t> colorSortClearStartTimeMs {0};
 std::atomic<std::uint32_t> colorSortCycleEndTimeMs {0};
 std::atomic<std::uint32_t> rightPtoMotor1BlockStartTimeMs {0};
 
-std::atomic<pros::task_t> autonomousManipulatorTaskHandle {nullptr};
-pros::Mutex autonomousManipulatorLifecycleMutex;
+// The autonomous manipulator is lock-free: its start/stop paths run on PROS
+// competition tasks, which are deleted on every mode change without releasing
+// any mutex they own. Each task serves exactly one generation.
 std::atomic<std::uint32_t> autonomousManipulatorGeneration {0};
-std::atomic_bool autonomousManipulatorHandlePublished {false};
-std::atomic_bool autonomousIntakeActive {false};
-std::atomic<std::uint32_t> autonomousIntakeEndTimeMs {0};
+std::atomic<std::uint32_t> autonomousManipulatorTasksAlive {0};
 std::atomic_bool eightMotorPositionHoldEnabled {false};
 
 enum class FourMotorShiftState : std::uint8_t { IDLE, FOLLOW, CREEP };
 std::atomic<FourMotorShiftState> fourMotorShiftState {FourMotorShiftState::IDLE};
 std::atomic_bool eightMotorControllerProfileActive {false};
 std::atomic<std::uint32_t> fourMotorShiftGeneration {0};
-std::atomic<pros::task_t> fourMotorShiftTaskHandle {nullptr};
+// Competition tasks hold this only around atomics (never a delay or a kernel task
+// create/delete), so a mode-change kill cannot orphan it across a long window.
 pros::Mutex fourMotorShiftLifecycleMutex;
 
 std::array<pros::MotorGroup*, 6> eightMotorHoldGroups() {
@@ -182,6 +182,9 @@ int applyColorSortSlowPower(int power) {
 bool isFourMotorShiftActive() { return fourMotorShiftState.load() != FourMotorShiftState::IDLE; }
 
 void hardStopReleasedPtoGroups() {
+    // Engaged PTO motors are drive motors owned by moveDrive/engage/disengage.
+    if (chassis.isPtoEngaged()) return;
+
     leftPtoMotor1.move(0);
     leftPtoMotor2.move(0);
     rightPtoMotor1.move(0);
@@ -189,14 +192,11 @@ void hardStopReleasedPtoGroups() {
 }
 
 void cancelFourMotorShiftTask() {
+    // The shift task is never deleted: it re-checks the generation under this lock
+    // before every write, so it leaves on its own and cannot overwrite the stop.
     fourMotorShiftLifecycleMutex.take();
     fourMotorShiftGeneration.fetch_add(1);
     fourMotorShiftState.store(FourMotorShiftState::IDLE);
-    const pros::task_t handle = fourMotorShiftTaskHandle.exchange(nullptr);
-    if (handle != nullptr) {
-        pros::Task task(handle);
-        task.remove();
-    }
     fourMotorShiftLifecycleMutex.give();
     hardStopReleasedPtoGroups();
 }
@@ -259,7 +259,11 @@ void startFourMotorShiftTask() {
         return;
     }
     const std::uint32_t generation = fourMotorShiftGeneration.fetch_add(1) + 1;
-    const pros::task_t handle = pros::Task::create(
+    fourMotorShiftLifecycleMutex.give();
+
+    // Created outside the lock. A cancel that lands before this task first runs
+    // bumps the generation, so the task returns without a single write.
+    pros::Task::create(
         [generation]() {
             const std::uint32_t followEndTimeMs = pros::millis() + kPtoShiftDelayMs;
             while (fourMotorShiftGeneration.load() == generation && pros::millis() < followEndTimeMs) {
@@ -289,16 +293,16 @@ void startFourMotorShiftTask() {
                 return;
             }
             moveAllReleasedPtoGroupsSameDirection(0);
-            chassis.setControllerSettings(fourMotorLinearController, fourMotorAngularController);
-            eightMotorControllerProfileActive.store(false);
-            pros::task_t self = pros::c::task_get_current();
-            fourMotorShiftTaskHandle.compare_exchange_strong(self, nullptr);
+            // Never retune (and reset PID/exit state) under a running motion; the
+            // released branch of trySwitchToFourMotorDrive applies it at a boundary.
+            if (!chassis.isInMotion()) {
+                chassis.setControllerSettings(fourMotorLinearController, fourMotorAngularController);
+                eightMotorControllerProfileActive.store(false);
+            }
             fourMotorShiftState = FourMotorShiftState::IDLE;
             fourMotorShiftLifecycleMutex.give();
         },
         "4M PTO Shift");
-    fourMotorShiftTaskHandle.store(handle);
-    fourMotorShiftLifecycleMutex.give();
 }
 
 bool rightPtoMotor1Blocked() {
@@ -326,10 +330,12 @@ bool rightPtoMotor1Blocked() {
 bool trySwitchToFourMotorDrive() {
     if (isFourMotorShiftActive()) return false;
     if (!chassis.isPtoEngaged()) {
-        if (!eightMotorControllerProfileActive.load()) return true;
-        if (chassis.isInMotion()) return false;
-        chassis.setControllerSettings(fourMotorLinearController, fourMotorAngularController);
-        eightMotorControllerProfileActive.store(false);
+        // Mechanism permission follows the physical PTO state; a deferred or
+        // aborted-shift 4-motor gain swap waits for a motion-free call.
+        if (eightMotorControllerProfileActive.load() && !chassis.isInMotion()) {
+            chassis.setControllerSettings(fourMotorLinearController, fourMotorAngularController);
+            eightMotorControllerProfileActive.store(false);
+        }
         return true;
     }
     if (chassis.isInMotion()) return false;
@@ -376,30 +382,16 @@ void waitForShiftWindow() {
     }
 }
 
-void startAutonomousManipulatorControlLocked() {
-    if (autonomousManipulatorTaskHandle.load() != nullptr) return;
-
-    const std::uint32_t generation = autonomousManipulatorGeneration.fetch_add(1) + 1;
-    autonomousManipulatorHandlePublished.store(false);
-    const pros::task_t handle = pros::Task::create(
-        [generation]() {
-            // A newly scheduled child can run before Task::create returns to the
-            // parent. Do not let it clear a still-null handle and then have the
-            // parent publish a stale exited-task handle.
-            while (!autonomousManipulatorHandlePublished.load() &&
-                   autonomousManipulatorGeneration.load() == generation) {
-                pros::delay(1);
-            }
+void startAutonomousManipulatorTask(std::uint32_t generation, std::uint32_t endTimeMs) {
+    pros::Task::create(
+        [generation, endTimeMs]() {
+            // Count in before the first generation check: a caller that bumps the
+            // generation and then reads zero here is guaranteed this task sees the
+            // new generation and leaves without commanding anything.
+            autonomousManipulatorTasksAlive.fetch_add(1);
             while (autonomousManipulatorGeneration.load() == generation &&
                    !pros::competition::is_disabled()) {
-                if (!autonomousIntakeActive.load()) {
-                    stopReleasedPtoControls();
-                    pros::delay(10);
-                    continue;
-                }
-
-                if (pros::millis() >= autonomousIntakeEndTimeMs.load()) {
-                    autonomousIntakeActive = false;
+                if (pros::millis() >= endTimeMs) {
                     stopReleasedPtoControls();
                     break;
                 }
@@ -411,27 +403,18 @@ void startAutonomousManipulatorControlLocked() {
 
                 pros::delay(10);
             }
-
-            autonomousIntakeActive = false;
-            pros::task_t self = pros::c::task_get_current();
-            autonomousManipulatorTaskHandle.compare_exchange_strong(self, nullptr);
+            autonomousManipulatorTasksAlive.fetch_sub(1);
         },
         "Auto Manipulator");
-    autonomousManipulatorTaskHandle.store(handle);
-    autonomousManipulatorHandlePublished.store(true);
 }
 
-void stopAutonomousManipulatorControlLocked() {
-    autonomousIntakeActive = false;
-    autonomousIntakeEndTimeMs = 0;
-    autonomousManipulatorGeneration.fetch_add(1);
-
-    // The task never takes this lifecycle mutex. Let it leave any PTO helper
-    // cooperatively instead of deleting it while it might own the separate
-    // shift mutex. Its loop and every PTO wait are bounded; normally this is a
-    // single 10 ms scheduler tick.
+// Call after bumping autonomousManipulatorGeneration. Let any older task leave
+// its PTO helpers cooperatively instead of deleting it while it might own the
+// shift mutex. Its loop and every PTO wait are bounded; normally this is a single
+// 10 ms scheduler tick.
+void waitForAutonomousManipulatorExit() {
     const std::uint32_t waitStartMs = pros::millis();
-    while (autonomousManipulatorTaskHandle.load() != nullptr && pros::millis() - waitStartMs < 100) {
+    while (autonomousManipulatorTasksAlive.load() != 0 && pros::millis() - waitStartMs < 100) {
         pros::delay(5);
     }
 }
@@ -449,8 +432,6 @@ void initializeRobotControlState() {
     resetRightPtoMotor1BlockState();
     optical16.set_led_pwm(100);
     startColorSortControl();
-    autonomousIntakeActive = false;
-    autonomousIntakeEndTimeMs = 0;
     eightMotorPositionHoldEnabled = false;
     eightMotorControllerProfileActive = false;
 }
@@ -600,28 +581,22 @@ void runDriverReleasedPto(bool l1Pressed, bool r1Pressed, bool r2Pressed) {
 void intake(std::uint32_t durationMs) {
     disableEightMotorPositionHold();
 
-    autonomousManipulatorLifecycleMutex.take();
     if (durationMs == 0) {
-        stopAutonomousManipulatorControlLocked();
-        autonomousManipulatorLifecycleMutex.give();
-        stopReleasedPtoControls();
+        stopAutonomousManipulatorControl();
         return;
     }
+    if (pros::competition::is_disabled()) return;
 
-    if (pros::competition::is_disabled()) {
-        autonomousManipulatorLifecycleMutex.give();
-        return;
-    }
-    startAutonomousManipulatorControlLocked();
-    autonomousIntakeEndTimeMs = pros::millis() + durationMs;
-    autonomousIntakeActive = true;
-    autonomousManipulatorLifecycleMutex.give();
+    // Retire any running task (it may already be on its expiry exit path) and
+    // start a fresh one, so this request can never be swallowed by that exit.
+    const std::uint32_t generation = autonomousManipulatorGeneration.fetch_add(1) + 1;
+    waitForAutonomousManipulatorExit();
+    startAutonomousManipulatorTask(generation, pros::millis() + durationMs);
 }
 
 void stopAutonomousManipulatorControl() {
-    autonomousManipulatorLifecycleMutex.take();
-    stopAutonomousManipulatorControlLocked();
-    autonomousManipulatorLifecycleMutex.give();
+    autonomousManipulatorGeneration.fetch_add(1);
+    waitForAutonomousManipulatorExit();
 
     // Zero only after the generation has been invalidated and the task has had
     // a chance to leave, so it cannot re-issue a stale mechanism command later.

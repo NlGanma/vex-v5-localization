@@ -23,7 +23,7 @@ chassis.turnToHeading(270, 4000); // turns the robot to face 270 degrees,
                                   // with a timeout of 4000 ms
 ```
 
-`lemlib::Chassis::turnToHeading()` also has to more optional arguments, which can be used to customize the behavior of the movement.
+`lemlib::Chassis::turnToHeading()` also has two more optional arguments, which can be used to customize the behavior of the movement.
 
 The first is `params` which is a `struct` containing named settings, and `async`, which controls whether the movement blocks execution or not.
 
@@ -33,7 +33,7 @@ Here's an example of the same function call from above, but with all of the defa
 chassis.turnToHeading(
     270,
     4000,
-    {.maxSpeed = 120}, // will never exceed 120
+    {.direction = lemlib::AngularDirection::AUTO, .maxSpeed = 127, .minSpeed = 0, .earlyExitRange = 0}, // the default params
     true // this motion will not block execution
 ); 
 ```
@@ -54,7 +54,7 @@ Here's an example of how you'd use it:
 
 ```cpp
 // turn to the point (53, 53) with a timeout of 1000 ms
-chassis.turnTo(53, 53, 1000);
+chassis.turnToPoint(53, 53, 1000);
 ```
 
 Similar to `turnToHeading`, the motion also takes two optional arguments, `params` and `async`. 
@@ -65,13 +65,13 @@ Similar to `turnToHeading`, the motion also takes two optional arguments, `param
 {cpp:func}`swingToHeading <lemlib::Chassis::swingToHeading>` and {cpp:class}`SwingToHeadingParams <lemlib::SwingToHeadingParams>` API references.
 ```
 
-Swing motions are unique in that they only use half the drivetrain to move.
+Swing motions are unique in that they only use half the drivetrain to move. Swing motions take a required `lockedSide` argument (`lemlib::DriveSide::LEFT` or `lemlib::DriveSide::RIGHT`) right before the timeout: it is the side of the drivetrain that is held still while the other side drives the swing.
 
 Here's an example of how you'd use a swing turn:
 
 ```cpp
 chassis.setPose(0,0,0); // the robot now things that its at (0,0) with heading of 0 degrees
-chassis.swingToHeading(45, 4000); // swing to face 45 degrees, with a timeout of 4000 ms
+chassis.swingToHeading(45, lemlib::DriveSide::RIGHT, 4000); // lock the right side and swing to face 45 degrees, with a timeout of 4000 ms
 ```
 
 The following illustration shows that this motion looks like if everything worked successfully:
@@ -92,6 +92,6 @@ As with all the other turn motions `swingToHeading` also takes a `params` and `a
 `swingToPoint` works exactly like `swingToHeading`, except it turns to face a point rather than a heading.
 
 ```cpp
-chassis.swingToPoint(53, 53, 4000); // swing to face the point (53, 53) degrees, with a timeout of 4000 ms
+chassis.swingToPoint(53, 53, lemlib::DriveSide::RIGHT, 4000); // lock the right side and swing to face the point (53, 53), with a timeout of 4000 ms
 ```
 As with all the other turn motions `swingToPoint` also takes a `params` and `async` argument, which works exactly like the others do.

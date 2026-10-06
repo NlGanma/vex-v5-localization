@@ -9,6 +9,7 @@
 #include "lemlib/pid.hpp"
 #include "lemlib/exitcondition.hpp"
 #include "lemlib/driveCurve.hpp"
+#include <array>
 #include <atomic>
 
 namespace lemlib {
@@ -65,7 +66,8 @@ class ControllerSettings {
          * @param kP proportional gain
          * @param kI integral gain
          * @param kD derivative gain
-         * @param antiWindup integral anti windup range. If error is within this range, integral is set to 0
+         * @param windupRange integral anti windup range. The integral only accumulates while |error| is within this
+         * range; it is reset to 0 whenever |error| exceeds it. Set to 0 to disable
          * @param smallError range of error at which the chassis controller will exit if the error is within this range
          * for an amount of time determined by smallErrorTimeout
          * @param smallErrorTimeout the time the chassis controller will wait before exiting if error is within a
@@ -134,17 +136,9 @@ class Drivetrain {
          *
          * @b Example
          * @code {.cpp}
-         * // drive motors
-         * pros::Motor lF(-5, pros::E_MOTOR_GEARSET_06); // left front motor. port 5, reversed
-         * pros::Motor lM(4, pros::E_MOTOR_GEARSET_06); // left middle motor. port 4
-         * pros::Motor lB(-3, pros::E_MOTOR_GEARSET_06); // left back motor. port 3, reversed
-         * pros::Motor rF(6, pros::E_MOTOR_GEARSET_06); // right front motor. port 6
-         * pros::Motor rM(-9, pros::E_MOTOR_GEARSET_06); // right middle motor. port 9, reversed
-         * pros::Motor rB(7, pros::E_MOTOR_GEARSET_06); // right back motor. port 7
-         *
-         * // motor groups
-         * pros::MotorGroup leftMotors({lF, lM, lB}); // left motor group
-         * pros::MotorGroup rightMotors({rF, rM, rB}); // right motor group
+         * // drive motor groups (negative port = reversed), blue 600rpm cartridges
+         * pros::MotorGroup leftMotors({-5, 4, -3}, pros::MotorGearset::blue); // left front (rev), middle, back (rev)
+         * pros::MotorGroup rightMotors({6, -9, 7}, pros::MotorGearset::blue); // right front, middle (rev), back
          *
          * lemlib::Drivetrain drivetrain(&leftMotors, // left motor group
          *                               &rightMotors, // right motor group
@@ -987,7 +981,13 @@ class Chassis {
          *
          * When a blocking motion's task is killed externally (PROS deletes the
          * running competition task on a mode change), release the owner-independent
-         * motion semaphore after giving a live cancelled task time to exit.
+         * motion semaphore after giving a live cancelled task time to exit, and
+         * drop the queue entry of a task killed while waiting for it.
+         *
+         * Call only at a competition-callback entry (disabled/opcontrol/autonomous),
+         * before the calling task starts any motion: PROS recreates every
+         * competition task in one static TCB, so an owner or waiter handle equal to
+         * the caller's is treated as the killed predecessor.
          */
         void recoverInterruptedMotion();
         /**
@@ -1067,8 +1067,9 @@ class Chassis {
          */
         bool motionContinues(uint32_t generation) const;
         /**
-         * @brief Capture the current motion generation. Called once by a motion
-         * after requestMotionStart() returns.
+         * @brief The motion generation captured inside requestMotionStart(), before
+         * motionRunning was published. Called once by a motion after
+         * requestMotionStart() returns, while it still owns the motion semaphore.
          */
         uint32_t motionGenerationSnapshot() const;
         /**
@@ -1097,7 +1098,6 @@ class Chassis {
         void setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mode_e mode);
 
         std::atomic_bool motionRunning {false};
-        std::atomic<uint32_t> motionQueued {0};
 
         std::atomic<float> distTraveled {-1.0f};
 
@@ -1120,8 +1120,28 @@ class Chassis {
         std::atomic<float> lastCommandedRightOutput = 0.0f;
         std::atomic<uint32_t> motionGeneration {0};
         std::atomic<uint32_t> motionQueueCancelGeneration {0};
+        // written only by the motion-semaphore owner inside requestMotionStart()
+        std::atomic<uint32_t> motionStartGeneration {0};
         std::atomic<pros::task_t> motionOwner {nullptr};
+        // Tasks waiting in requestMotionStart(), keyed by handle so the entry of a
+        // waiter PROS deletes mid-wait (the competition task on a mode change) can
+        // be reclaimed instead of leaking a queued count. Each slot changes in one
+        // atomic step, so no kill point leaves a half-updated record. Realistic
+        // concurrent requesters number one or two; overflow keeps counter semantics.
+        static constexpr int kMaxMotionWaiters = 8;
+        std::array<std::atomic<pros::task_t>, kMaxMotionWaiters> motionWaiters {};
+        std::atomic<uint32_t> motionWaiterOverflow {0};
         std::atomic_bool motionBoundaryReanchorAllowed {false};
         void* motionSemaphore = nullptr;
+        /**
+         * @brief Whether any task is waiting in requestMotionStart() for the motion semaphore.
+         */
+        bool hasQueuedMotion() const;
+        /**
+         * @brief Drop the waiter entries holding `task`. Only valid for the calling
+         * task's own handle: a running task cannot be blocked waiting, so such an
+         * entry was left by a deleted task whose TCB the caller now reuses.
+         */
+        void releaseStaleMotionWaiters(pros::task_t task);
 };
 } // namespace lemlib

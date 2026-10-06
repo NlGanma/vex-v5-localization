@@ -23,8 +23,8 @@ Motors should be created outside of a function, near the top of the file.
 ```
 
 ```cpp
-pros::MotorGroup left_motors({1, 2, 3}); // left motors on ports 1, 2, 3
-pros::MotorGroup right_motors({4, 5, 6}); // right motors on ports 4, 5, 6
+pros::MotorGroup left_motor_group({1, 2, 3}); // left motors on ports 1, 2, 3
+pros::MotorGroup right_motor_group({4, 5, 6}); // right motors on ports 4, 5, 6
 ```
 
 ```{tip}
@@ -45,8 +45,8 @@ This needs to be done for all motors on the drivetrain
 Now, let's update our configuration. If a motor is reversed, it has a negative port. If its forwards (not reversed), it has a positive port:
 
 ```cpp
-pros::MotorGroup left_motors({-1, 2, -3}); // left motors on ports 1 (reversed), 2 (forwards), and 3 (reversed)
-pros::MotorGroup right_motors({4, -5, 6}); // right motors on ports 4 (forwards), 5 (reversed), and 6 (forwards)
+pros::MotorGroup left_motor_group({-1, 2, -3}); // left motors on ports 1 (reversed), 2 (forwards), and 3 (reversed)
+pros::MotorGroup right_motor_group({4, -5, 6}); // right motors on ports 4 (forwards), 5 (reversed), and 6 (forwards)
 ```
 
 Now, we need to specify what cartridge is used by every motor. The cartridge can be checked by looking at the area below the shaft of the motor. A motor can have one of three cartridges:
@@ -60,8 +60,8 @@ Now, we need to specify what cartridge is used by every motor. The cartridge can
 We need to specify the cartridge configuration in code as well:
 
 ```cpp
-pros::MotorGroup left_motors({-1, 2, -3}, pros::MotorGearset::blue); // left motors use 600 RPM cartridges
-pros::MotorGroup right_motors({4, -5, 6}, pros::MotorGearset::green); // right motors use 200 RPM cartridges
+pros::MotorGroup left_motor_group({-1, 2, -3}, pros::MotorGearset::blue); // left motors use 600 RPM cartridges
+pros::MotorGroup right_motor_group({4, -5, 6}, pros::MotorGearset::green); // right motors use 200 RPM cartridges
 ```
 
 Now that our motors are fully configured, we need to pass them to LemLib. We can do this through a helper class: `Drivetrain`. It needs the following information:
@@ -236,10 +236,10 @@ pros::Rotation horizontal_sensor(1);
 void initialize() {
     pros::lcd::initialize(); // initialize brain screen
     while (true) { // infinite loop
-        // print measurements from the adi encoder
-        pros::lcd::print(0, "ADI Encoder: %i", adi_encoder.get_value());
-        // print measurements from the rotation sensor
-        pros::lcd::print(1, "Rotation Sensor: %i", rotation_sensor.get_position());
+        // print measurements from the vertical adi encoder
+        pros::lcd::print(0, "Vertical Encoder: %i", vertical_encoder.get_value());
+        // print measurements from the horizontal rotation sensor
+        pros::lcd::print(1, "Horizontal Sensor: %i", horizontal_sensor.get_position());
         pros::delay(10); // delay to save resources. DO NOT REMOVE
     }
 }
@@ -249,7 +249,7 @@ void initialize() {
 if the sensors readings are not changing or show very large numbers (>1000000), you've likely specified the wrong ports for the sensors
 ```
 
-Use the snippet in your program and run it. When you push the robot forwards, the measured position of the vertical encoder(s) should increase. If they decrease, the sensor(s) needs to be reversed. When you push the robot to the right (relative to the robot), the position measured by horizontal encoders should increase. If they decrease, the sensor(s) needs to be reversed.
+Use the snippet in your program and run it. When you push the robot forwards, the measured position of the vertical encoder(s) should increase. If they decrease, the sensor(s) needs to be reversed. When you push the robot to the left (relative to the robot), the position measured by horizontal encoders should increase. If they decrease, the sensor(s) needs to be reversed. (This fork's odometry treats the robot's local lateral axis as positive to the left; that is what makes the Back = - / Front = + horizontal offset signs below cancel during turns.)
 
 To reverse an ADI Encoder, simply pass `true` to the encoder constructors after the ports. For a rotation sensor, make the port number negative as with motors. See the example below:
 

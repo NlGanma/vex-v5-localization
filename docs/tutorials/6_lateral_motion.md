@@ -78,7 +78,7 @@ chassis.moveToPose(
     0, // y = 0
     0, // theta = 0
     4000, // timeout of 4000ms
-    {.lead = 0.3, .horizontalDrift = 8}
+    {.horizontalDrift = 8, .lead = 0.3}
 );
 ```
 

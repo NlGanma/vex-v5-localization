@@ -27,11 +27,12 @@ void lemlib::Chassis::turnToPoint(float x, float y, int timeout, TurnToPointPara
     float deltaX, deltaY, deltaTheta;
     float motorPower;
     float prevMotorPower = 0;
-    float startTheta = getPose().theta;
-    // distTraveled compares against the loop pose, which gets a -180 facing
-    // adjustment for backwards turns; the reference needs the same shift or the
-    // counter starts at 180 and runs backwards, breaking waitUntil.
-    if (!params.forwards) startTheta = fmod(startTheta - 180, 360);
+    float prevTheta = getPose().theta;
+    // distTraveled accumulates heading change against the loop pose, which gets
+    // a -180 facing adjustment for backwards turns; the seed needs the same
+    // shift or the first tick adds ~180 and fires waitUntil at once.
+    if (!params.forwards) prevTheta = fmod(prevTheta - 180, 360);
+    float traveled = 0;
     bool settling = false;
     std::optional<float> prevRawDeltaTheta = std::nullopt;
     std::optional<float> prevDeltaTheta = std::nullopt;
@@ -47,8 +48,12 @@ void lemlib::Chassis::turnToPoint(float x, float y, int timeout, TurnToPointPara
         Pose pose = getPose();
         pose.theta = (params.forwards) ? fmod(pose.theta, 360) : fmod(pose.theta - 180, 360);
 
-        // update completion vars
-        distTraveled.store(fabs(angleError(pose.theta, startTheta, false)));
+        // update completion vars: accumulate per-tick heading change, since the
+        // net angle from the start wraps at 180 and would count back down on a
+        // forced long-way turn
+        traveled += fabs(angleError(pose.theta, prevTheta, false));
+        prevTheta = pose.theta;
+        distTraveled.store(traveled);
 
         deltaX = x - pose.x;
         deltaY = y - pose.y;

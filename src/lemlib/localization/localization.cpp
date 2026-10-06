@@ -485,6 +485,7 @@ void localizationTask(void*) {
     int lastCandidateStableScans = 0;
     int lastRequiredStableScans = 0;
     lemlib::Pose lastCandidatePose {0, 0, 0};
+    lemlib::Pose lastCandidateOdomOnlyPose {0, 0, 0}; // odomOnlyPose when lastCandidatePose was taken
     int candidateStableScans = 0;
     bool haveCandidatePose = false;
     bool lastCandidateUsedLocalRange = false;
@@ -611,8 +612,12 @@ void localizationTask(void*) {
                 meas.confidence = 0.0f;
             }
 
-            // Skip the EKF correction if the sensors have been stale, but keep
-            // sampling so the filter can recover as soon as fresh readings return.
+            // Diagnostic watchdog, not an independent accept gate: any scan with an
+            // active sensor refreshed lastActiveSensorMs above and every accept
+            // path needs live sensors in this same scan, so this is only ever set
+            // on scans already rejected for kRejectNoMeasurement. sensorStaleMs's
+            // behavioral role is the staged-correction age limit in
+            // applyStagedBoundaryReanchor().
             const bool sensorsStale = (now - lastActiveSensorMs) > config.fusion.sensorStaleMs;
             const bool turnCorrectionSuppressed = maxAngularRateSinceMcl > kMclCorrectionMaxTurnRate;
             bool correctionAccepted = false;
@@ -644,8 +649,10 @@ void localizationTask(void*) {
                 consistencyNis = rawMclConsistencyNis;
                 nis = consistencyNis;
                 measurementPoseDelta = correctionCandidatePose.distance(ekfPose);
-                measurementHeadingDelta =
-                    std::fabs(lemlib::radToDeg(lemlib::angleError(correctionCandidatePose.theta, ekfPose.theta)));
+                // Diagnostic only: the raw MCL heading's disagreement with the
+                // trusted EKF heading. Every applied candidate carries the EKF
+                // heading (stripped or zeroed), so no gate may read this value.
+                measurementHeadingDelta = rawMclHeadingDelta;
 
                 // The local grid solve is correction-only work and is more
                 // expensive than the particle update. During motion, stage only
@@ -662,20 +669,29 @@ void localizationTask(void*) {
                     consistencyNis = ekf.innovationNIS(correctionCandidatePose, correctionCandidateCovariance);
                     nis = consistencyNis;
                     measurementPoseDelta = correctionCandidatePose.distance(ekfPose);
-                    measurementHeadingDelta = 0.0f;
                 }
             }
             if (rawMeas.valid || usingLocalRangeCorrection) {
                 // Stability must be measured on the pose that will actually be
                 // applied, and a raw-MCL/local-range source change starts a new run.
                 const lemlib::Pose stableCandidatePose = correctionCandidatePose;
+                // While moving, absolute agreement measures travel plus noise, so a
+                // candidate whose offset from the track jumps backward by up to the
+                // agreement radius plus the travel between scans would pass. Also
+                // require agreement after removing the pure-odom motion between
+                // scans (tightening only; at rest it reduces to the absolute test).
                 const bool candidateAgrees =
                     haveCandidatePose && usingLocalRangeCorrection == lastCandidateUsedLocalRange &&
                     stableCandidatePose.distance(lastCandidatePose) <= kMclCandidateAgreementXY &&
+                    std::hypot((stableCandidatePose.x - lastCandidatePose.x) -
+                                   (odomOnlyPose.x - lastCandidateOdomOnlyPose.x),
+                               (stableCandidatePose.y - lastCandidatePose.y) -
+                                   (odomOnlyPose.y - lastCandidateOdomOnlyPose.y)) <= kMclCandidateAgreementXY &&
                     std::fabs(lemlib::radToDeg(lemlib::angleError(stableCandidatePose.theta, lastCandidatePose.theta))) <=
                         kMclCandidateAgreementHeadingDeg;
                 candidateStableScans = candidateAgrees ? candidateStableScans + 1 : 1;
                 lastCandidatePose = stableCandidatePose;
+                lastCandidateOdomOnlyPose = odomOnlyPose;
                 lastCandidateUsedLocalRange = usingLocalRangeCorrection;
                 haveCandidatePose = true;
             } else {
@@ -850,12 +866,16 @@ void localizationTask(void*) {
         resetMutex.take();
         const bool resetQueued = pendingReset;
         resetMutex.give();
-        const auto snapshot = lemlib::getOdomSnapshot();
-        lemlib::Pose appliedPose = snapshot.pose;
+        // Load suppression BEFORE the odom snapshot: a false read happens-after
+        // endMotion's unsuppress, which happens-after any staged boundary commit,
+        // so the snapshot below already contains that commit (silent pose writes
+        // do not bump odomPoseSeq, so the seq check alone cannot catch it).
         // Pending boundary requests are dropped by setMotionCorrectionSuppressed(true)
         // itself (writer-side, ordered with the motion lifecycle) — clearing here from
         // a stale snapshot could wipe a request whose idle window just opened.
         const bool motionCorrectionSuppressedForInjection = motionCorrectionSuppressed.load();
+        const auto snapshot = lemlib::getOdomSnapshot();
+        lemlib::Pose appliedPose = snapshot.pose;
         if (motionCorrectionSuppressedForInjection && lastCorrectionAccepted && snapshot.seq == lastSeq &&
             lastCorrectionAcceptedEpoch == motionCorrectionEpoch.load()) {
             stagedCorrectionMutex.take();
@@ -1108,6 +1128,11 @@ bool isMotionCorrectionSuppressed() { return motionCorrectionSuppressed.load(); 
 bool applyStagedBoundaryReanchor() {
     if (!config.fusion.enableBoundaryReanchor || !motionCorrectionSuppressed.load()) return false;
 
+    // Snapshot BEFORE validating the epoch: lemlib::setPose bumps the epoch in the
+    // same odom critical section that publishes its new pose/seq, so a snapshot of
+    // the new frame always fails the epoch check below, and one that predates it
+    // fails the seq re-check in setPoseSilentIfSeq if setPose lands in between.
+    const auto snapshot = lemlib::getOdomSnapshot();
     stagedCorrectionMutex.take();
     const StagedCorrection staged = stagedCorrection;
     stagedCorrectionMutex.give();
@@ -1116,7 +1141,6 @@ bool applyStagedBoundaryReanchor() {
         return false;
     }
 
-    const auto snapshot = lemlib::getOdomSnapshot();
     const lemlib::Pose target {snapshot.pose.x + staged.delta.x, snapshot.pose.y + staged.delta.y,
                               snapshot.pose.theta + staged.delta.theta};
     if (!isValidCorrectionPose(target)) return false;
@@ -1135,6 +1159,9 @@ bool applyStagedBoundaryReanchor() {
 void requestBoundaryReanchor() { boundaryReanchorPending.store(true); }
 
 void clearBoundaryReanchor() { boundaryReanchorPending.store(false); }
+
+// Atomic only: the caller holds odomStateMutex.
+void invalidateCorrectionFrame() { motionCorrectionEpoch.fetch_add(1); }
 
 void syncPose(lemlib::Pose pose) { syncPose(pose, lemlib::getOdomSnapshot().seq); }
 

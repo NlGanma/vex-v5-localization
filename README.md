@@ -51,7 +51,7 @@ flowchart LR
     O --> E["3-state EKF"]
     O --> P["Driven pose"]
     D["Four distance sensors"] --> M["MCL<br/>450 particles"]
-    M --> G["Geometry, confidence,<br/>NIS, stability, freshness"]
+    M --> G["Live sensors, geometry,<br/>confidence, NIS, stability"]
     G --> E
     E --> C["Staged correction"]
     C --> B["Bounded stopped-boundary commit"]
@@ -77,6 +77,11 @@ final measured hardware claim. The boundary re-anchor and latest relocalization
 cleanup must still pass the physical protocol before the stack is considered fully
 tuned.
 
+The PDF predates a later fix to the offline analysis tools: its per-run path lengths
+counted the start-relocalization pose jump as driven distance (corrected values are
+121/120/332/132/87/110/120 in for runs 1-7), and a few secondary figures moved
+slightly. The headline figures in the table above are unchanged.
+
 ## Safety Contract
 
 The localization layer is designed to be no worse than the odometry baseline:
@@ -85,9 +90,32 @@ The localization layer is designed to be no worse than the odometry baseline:
   driven odometry pose or motor command while a chassis motion is active.
 - Continuous corrections and motion-boundary re-anchors are bounded.
 - Evidence must pass sensor-count, confidence, covariance, NIS, residual, stability,
-  freshness, and pose-delta checks.
-- Wall ranges solve position only; heading remains IMU-driven.
-- Ambiguous or blocked views fall back to odometry instead of forcing a field fix.
+  and pose-delta checks on live sensors from the same scan; a correction staged during
+  motion is committed at the stopped boundary only while it is younger than the stale
+  timeout.
+- Wall ranges solve position only; heading stays on the odometry heading (IMU-driven
+  unless the IMU is out).
+- Ambiguous or blocked views fall back to odometry instead of forcing a field fix. Start
+  relocalization only ever vetoes its best solve and never substitutes another one. It
+  falls back to the fixed start when that solve leans on a range that ends within 3 in
+  of a field corner, on another wall, or on the center obstacle; when another solve,
+  whose own ranges do not end on their assigned walls, still explains every range and
+  lies more than 7 in away (or at any distance while the best solve fails its own commit
+  gates); or when a range's own reading fails its confidence gate or is the mean of two
+  disagreeing samples. The price is fallbacks on some exact views, mostly placements
+  about 8-19 in behind the configured start. Known limits, shared with the unchecked
+  solve:
+  - an occluder in the only ray that constrains an axis (Y from the back sensor at the
+    configured 0 deg start) still commits;
+  - a self-consistent alias, typically about 67-82 in from the true pose, where rays
+    trade the center obstacle or one wall for another between the two poses, still
+    commits;
+  - a corner alias pushed past the margin by 2-3 deg of heading error, or by 1 deg plus
+    about 1 in of range noise, still commits, up to about 30 in off;
+  - the MCL fallback can still commit a wrong pose tens of inches off, most often with
+    the back sensor dead, which leaves Y barely observed near the configured start.
+
+  Catching those would need a prior-distance gate, a policy choice left to the user.
 - Fusion thresholds are not loosened merely to increase the correction count.
 
 ## Reusable PTO Switching
@@ -165,7 +193,9 @@ The checked-in selector is currently `0`. The source constant remains authoritat
    pros terminal
    ```
 
-5. Run autonomous and wait for `Tap lower-right to dump` on the Brain.
+5. Run autonomous. Wait until `Saving tune log...` clears and the Brain shows the dump
+   cue: `Tap lower-right to dump` after the normal route (test 0), `LOG READY tap LR dump`
+   after tests 1-6, or `Log cached in RAM` when there is no SD card or the SD write failed.
 6. Keep the terminal open and tap the lower-right of the Brain screen.
 7. Capture the complete block:
 

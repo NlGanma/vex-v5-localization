@@ -13,13 +13,13 @@ Start-up procedure
 3. Inspect the metadata inside src/tune.txt (or the newest log path I provide) to identify its route, firmware configuration, coverage, sensor activity, and whether it is newer and relevant. Preserve valuable prior logs in validation_data instead of overwriting evidence.
 4. Run the checked-in analyzer before changing constants:
    python3 tools/localization_tune_analyzer.py src/tune.txt
-   Use tools/trace_query.py, tools/drift_analysis.py, and tools/audit_analysis.py when their data is relevant.
+   Use tools/trace_query.py (read-only) when its data is relevant. Do not run tools/audit_analysis.py or tools/drift_analysis.py in this working tree: they regenerate the published report evidence. audit_analysis.py always reads src/tune.txt as its "tune" entry and rewrites the tracked tools/audit_metrics.json, both scripts write report data files under report/data/, and drift_analysis.py only analyzes the fixed run1-run7 validation logs, never a new export. If their cross-checks are needed, run them only in a scratch copy of the repository.
 
 Primary objective
 Tune odometry, distance-sensor geometry, MCL, EKF, correction gating, and motion-boundary behavior until repeated hardware tests show that the shipped pose is more accurate and at least as consistent as pure odometry. Pure odometry has previously been more consistent than poorly configured range fusion, so the default failure mode must remain "stay on odometry," not "accept more corrections."
 
 Non-negotiable rules
-- Never loosen NIS, confidence, covariance, sensor-count, residual, stability, freshness, pose-delta, or motion-suppression gates merely to make corrections occur.
+- Never loosen NIS, confidence, covariance, sensor-count, residual, stability, pose-delta, or motion-suppression gates, the live-sensors-in-the-same-scan requirement, or the stale timeout (sensorStaleMs) that limits how old a motion-staged correction may be when a motion boundary commits it, merely to make corrections occur.
 - Compare odom_only, EKF/MCL, and applied/driven pose. Reject a change that makes repeatability worse than odom_only on comparable runs.
 - Treat sensor positions and angles as uncertain, but infer them from instrumented logs. Do not ask me to manually measure sensor offsets or field placement. If a parameter is not identifiable, leave it unchanged and select another test, request more placements/repetitions, or add the minimum telemetry needed.
 - Treat tracking-wheel measurements as stronger priors than distance-sensor geometry, but still validate them from turn and straight data.
@@ -61,7 +61,7 @@ Data collection workflow to give me when needed
    cd "/Users/ouji/Documents/Localization Test"
    pros terminal
    On another computer, replace the path with that clone's path.
-4. Run autonomous and wait for "Tap lower-right to dump" on the Brain.
+4. Run autonomous. Wait until the Brain no longer shows "Saving tune log..." and shows the dump cue: "Tap lower-right to dump" after the normal route (test 0), "LOG READY tap LR dump" after tests 1-6, or "Log cached in RAM" when there is no SD card or the SD write failed.
 5. Keep the terminal open and tap the lower-right of the Brain screen.
 6. Capture everything from === BEGIN LOCALIZATION TUNE LOG === through === END LOCALIZATION TUNE LOG === and place it in the path you specified.
 

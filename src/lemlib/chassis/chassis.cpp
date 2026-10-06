@@ -297,13 +297,47 @@ void lemlib::Chassis::setDriveSideBrakeMode(DriveSide side, pros::motor_brake_mo
     }
 }
 
+bool lemlib::Chassis::hasQueuedMotion() const {
+    if (this->motionWaiterOverflow.load() > 0) return true;
+    for (const auto& waiter : this->motionWaiters) {
+        if (waiter.load() != nullptr) return true;
+    }
+    return false;
+}
+
+void lemlib::Chassis::releaseStaleMotionWaiters(pros::task_t task) {
+    for (auto& waiter : this->motionWaiters) {
+        pros::task_t stale = task;
+        waiter.compare_exchange_strong(stale, nullptr);
+    }
+}
+
 void lemlib::Chassis::requestMotionStart() {
     const uint32_t queueCancelSnapshot = this->motionQueueCancelGeneration.load();
-    this->motionQueued.fetch_add(1);
+    const pros::task_t self = pros::c::task_get_current();
+    this->releaseStaleMotionWaiters(self);
+    // Register as a waiter BEFORE suppressing, so endMotion's queue reads cannot
+    // miss this request and reopen the idle window after its suppression.
+    int waiterSlot = -1;
+    for (int i = 0; i < kMaxMotionWaiters && waiterSlot < 0; ++i) {
+        pros::task_t empty = nullptr;
+        if (this->motionWaiters[i].compare_exchange_strong(empty, self)) waiterSlot = i;
+    }
+    if (waiterSlot < 0) this->motionWaiterOverflow.fetch_add(1);
     lemlib::localization::setMotionCorrectionSuppressed(true);
     const bool acquired = motionSemaphore != nullptr && pros::c::sem_wait(motionSemaphore, TIMEOUT_MAX);
-    this->motionQueued.fetch_sub(1);
-    if (acquired) this->motionOwner.store(pros::c::task_get_current());
+    if (waiterSlot >= 0) {
+        pros::task_t mine = self;
+        this->motionWaiters[waiterSlot].compare_exchange_strong(mine, nullptr);
+    } else {
+        this->motionWaiterOverflow.fetch_sub(1);
+    }
+    if (acquired) this->motionOwner.store(self);
+    // Snapshot the generation before re-reading the queue-cancel generation and
+    // before publishing motionRunning. cancelAllMotions bumps the queue-cancel
+    // generation first, so any cancel issued after this request began fails
+    // either the queue check below or the motion's motionContinues() check.
+    if (acquired) this->motionStartGeneration.store(this->motionGeneration.load());
 
     // cancelAllMotions invalidates every request that was already waiting, while
     // cancelMotion invalidates only the active loop. A cancelled waiter still
@@ -316,7 +350,7 @@ void lemlib::Chassis::requestMotionStart() {
 void lemlib::Chassis::endMotion() {
     this->motionRunning.store(false);
     const bool boundaryAllowed = this->motionBoundaryReanchorAllowed.exchange(false);
-    const bool nextMotionQueued = this->motionQueued.load() > 0;
+    const bool nextMotionQueued = this->hasQueuedMotion();
 
     if (nextMotionQueued) {
         lemlib::localization::setMotionCorrectionSuppressed(true);
@@ -332,7 +366,7 @@ void lemlib::Chassis::endMotion() {
     // A request can arrive while this function is opening the idle window, so
     // reassert suppression before waking it if a waiter appeared between the
     // two queue reads. A later request sets suppression itself before waiting.
-    if (!nextMotionQueued && this->motionQueued.load() > 0) {
+    if (!nextMotionQueued && this->hasQueuedMotion()) {
         lemlib::localization::setMotionCorrectionSuppressed(true);
     }
     // Permit exactly one queued motion to run only after its pose-injection
@@ -346,31 +380,37 @@ void lemlib::Chassis::cancelMotion() {
     // motionContinues() and must lose even if a new motion re-raises
     // motionRunning before it gets to run again
     this->motionGeneration.fetch_add(1);
-    const bool wasRunning = this->motionRunning.load();
     this->motionBoundaryReanchorAllowed.store(false);
     // cancelMotion only cancels the CURRENT motion, not a queued one. If a
     // motion is still queued it will run next, so keep corrections suppressed;
     // the queued motion's endMotion will recompute suppression from there.
     lemlib::localization::setMotionCorrectionSuppressed(true);
+    // Sample AFTER suppressing: a running owner then clears motionRunning and
+    // restores suppression in endMotion after this write; an owner that already
+    // ended is seen as idle and restored below.
+    const bool wasRunning = this->motionRunning.load();
     stopDrive();
     pros::delay(10); // give time for motion to stop
-    if (!wasRunning && !this->motionRunning.load() && this->motionQueued.load() == 0) {
+    if (!wasRunning && !this->motionRunning.load() && !this->hasQueuedMotion()) {
         lemlib::localization::setMotionCorrectionSuppressed(false);
         lemlib::localization::clearBoundaryReanchor();
     }
 }
 
 void lemlib::Chassis::cancelAllMotions() {
-    this->motionGeneration.fetch_add(1);
+    // Queue-cancel generation first: requestMotionStart snapshots the generation
+    // before re-reading it, so a request that misses this bump has a stale snapshot.
     this->motionQueueCancelGeneration.fetch_add(1);
-    const bool wasRunning = this->motionRunning.load();
+    this->motionGeneration.fetch_add(1);
     this->motionBoundaryReanchorAllowed.store(false);
     // Keep injection suppressed until the live owner has observed cancellation,
     // stopped the drivetrain, and released the motion semaphore in endMotion().
     lemlib::localization::setMotionCorrectionSuppressed(true);
+    // Sampled after suppressing, as in cancelMotion.
+    const bool wasRunning = this->motionRunning.load();
     stopDrive();
     pros::delay(10); // give time for motion to stop
-    if (!wasRunning && !this->motionRunning.load() && this->motionQueued.load() == 0) {
+    if (!wasRunning && !this->motionRunning.load() && !this->hasQueuedMotion()) {
         lemlib::localization::setMotionCorrectionSuppressed(false);
         lemlib::localization::clearBoundaryReanchor();
     }
@@ -379,15 +419,25 @@ void lemlib::Chassis::cancelAllMotions() {
 void lemlib::Chassis::recoverInterruptedMotion() {
     if (motionSemaphore == nullptr) return;
 
+    // PROS recreates every competition task in one static TCB, so a predecessor
+    // it deleted mid-wait or mid-motion has this caller's handle, and
+    // task_get_state() would report it RUNNING. Callers run at a competition
+    // callback entry before starting any motion, so that handle is the dead task.
+    const pros::task_t self = pros::c::task_get_current();
+    this->releaseStaleMotionWaiters(self);
+
     const pros::task_t owner = this->motionOwner.load();
     if (owner != nullptr) {
-        const pros::task_state_e_t state = pros::c::task_get_state(owner);
-        if (state != pros::E_TASK_STATE_DELETED && state != pros::E_TASK_STATE_INVALID) {
-            return;
+        if (owner != self) {
+            const pros::task_state_e_t state = pros::c::task_get_state(owner);
+            if (state != pros::E_TASK_STATE_DELETED && state != pros::E_TASK_STATE_INVALID) {
+                return;
+            }
         }
         this->motionOwner.store(nullptr);
         this->motionRunning.store(false);
         this->motionBoundaryReanchorAllowed.store(false);
+        this->distTraveled.store(-1.0f);
         pros::c::sem_post(motionSemaphore);
     } else {
         // A live cancelled motion normally releases within one control tick. Probe
@@ -405,7 +455,7 @@ void lemlib::Chassis::recoverInterruptedMotion() {
         }
     }
 
-    if (this->motionQueued.load() == 0) {
+    if (!this->hasQueuedMotion() && !this->isInMotion()) {
         lemlib::localization::setMotionCorrectionSuppressed(false);
         lemlib::localization::clearBoundaryReanchor();
     }
@@ -417,7 +467,7 @@ bool lemlib::Chassis::motionContinues(uint32_t generation) const {
     return this->motionRunning.load() && generation == this->motionGeneration.load();
 }
 
-uint32_t lemlib::Chassis::motionGenerationSnapshot() const { return this->motionGeneration.load(); }
+uint32_t lemlib::Chassis::motionGenerationSnapshot() const { return this->motionStartGeneration.load(); }
 
 void lemlib::Chassis::resetLocalPosition() {
     float theta = this->getPose().theta;

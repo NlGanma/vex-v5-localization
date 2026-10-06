@@ -155,7 +155,7 @@ void MCL::configure(const FieldConfig& field, const MCLConfig& cfg, const std::a
     configured_ = true;
 }
 
-void MCL::reset(const lemlib::Pose& pose) {
+void MCL::reset(const lemlib::Pose& pose, bool clampLocalSeed) {
     if (!configured_) return;
 
     particles_.clear();
@@ -181,6 +181,7 @@ void MCL::reset(const lemlib::Pose& pose) {
     float fallbackX = clampf(pose.x, minX, maxX);
     float fallbackY = clampf(pose.y, minY, maxY);
     bool haveFallbackPose = isValidParticlePose(fallbackX, fallbackY);
+    const bool clampedSeedValid = haveFallbackPose;
     if (!haveFallbackPose) {
         for (int attempt = 0; attempt < 2048; ++attempt) {
             const float candidateX = dist_field_x(rng_);
@@ -216,6 +217,17 @@ void MCL::reset(const lemlib::Pose& pose) {
                     break;
                 }
             }
+        }
+        if (!placed && clampLocalSeed && !useGlobalUniformInitXY && clampedSeedValid) {
+            // Seed past the margin box (robot near a wall, or EKF/odom drifted past it): keep the
+            // cloud local by clamping the last draw like predict()/roughening, not scattering it field-wide.
+            p.x = clampf(p.x, minX, maxX);
+            p.y = clampf(p.y, minY, maxY);
+            if (!isValidParticlePose(p.x, p.y)) {
+                p.x = fallbackX;
+                p.y = fallbackY;
+            }
+            placed = true;
         }
         if (!placed) {
             if (!haveFallbackPose) {

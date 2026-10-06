@@ -12,10 +12,8 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
-#include <fcntl.h>
 #include <string>
 #include <string_view>
-#include <unistd.h>
 #include <vector>
 
 namespace localization_tune {
@@ -36,6 +34,11 @@ constexpr const char* kTuneInternalLogPath = "localization_tune_latest_internal.
 constexpr int kTuneExportTapMinX = 200;
 constexpr int kTuneExportTapMinY = 120;
 constexpr std::uint32_t kTuneExportFeedbackMs = 2000;
+// A rumble is a controller text write: VEXos rejects it (PROS_ERR) within 50 ms
+// (VEXnet) of opcontrol's 100 ms-slot display writes. 60 ms retries land on five
+// distinct 20 ms phases of that grid, so at least two fall outside the window.
+constexpr int kTuneRumbleAttempts = 5;
+constexpr std::uint32_t kTuneRumbleRetryMs = 60;
 constexpr std::uintptr_t kStdoutStreamId = 0x74756f73u; // little-endian "sout"
 constexpr std::array<const char*, 4> kTraceSensorNames {{"front", "right", "back", "left"}};
 
@@ -168,6 +171,15 @@ lemlib::Pose tuneStartPose {0, 0, 0};
 const char* tuneStatus = "Idle";
 const char* tuneStepName = "Autonomous runs relocalized route";
 bool tuneTestRunning = false;
+// Report of a finalized run, queued for the overlay task (see processPendingTuneReport).
+bool tuneReportEmitPending = false;
+const char* tuneReportRumble = nullptr;
+std::uint32_t tuneReportGeneration = 0;
+std::uint32_t tuneReportRequest = 0;
+// Bumped before a new run clears tune state, so a report still being built for the
+// previous run is dropped instead of mixing two runs. Atomic so it can be checked
+// under pendingTuneLogMutex without nesting tuneMutex.
+std::atomic<std::uint32_t> tuneRunGeneration {0};
 TuneRunMode tuneRunMode = TuneRunMode::Idle;
 TuneTestCase tuneTestCase = kDefaultTuneTestCase;
 RelocalizationSummary relocalizationSummary {};
@@ -187,6 +199,8 @@ std::atomic_bool manualDriveFallbackActive {false};
 const char* tuneExportFeedback = nullptr;
 std::uint32_t tuneExportFeedbackUntilMs = 0;
 std::atomic<std::uint32_t> tuneExportTapSequence {0};
+// run generation at the latest tap; a tap from a run that a newer run has cleared is dropped
+std::atomic<std::uint32_t> tuneExportTapGeneration {0};
 std::uint32_t tuneExportTapLastMs = 0;
 
 void overlayControlTaskFn();
@@ -218,6 +232,20 @@ const char* currentTuneExportFeedback() {
     return message;
 }
 
+// Sets a finished run's never-expiring feedback unless a newer run has started.
+// The generation is re-checked under tuneMutex: a newer run bumps it before its
+// clearExportFeedback(), so that clear always lands after this set.
+bool setRunExportFeedback(const char* message, std::uint32_t generation) {
+    tuneMutex.take();
+    const bool current = tuneRunGeneration.load() == generation;
+    if (current) {
+        tuneExportFeedback = message;
+        tuneExportFeedbackUntilMs = 0;
+    }
+    tuneMutex.give();
+    return current;
+}
+
 void handleTuneExportTap() {
     const auto touch = pros::screen::touch_status();
     if (touch.x < kTuneExportTapMinX || touch.y < kTuneExportTapMinY) return;
@@ -226,6 +254,8 @@ void handleTuneExportTap() {
     if (now - tuneExportTapLastMs < 200) return;
 
     tuneExportTapLastMs = now;
+    // stored before the sequence bump, so a screen tick that sees the tap also sees its run
+    tuneExportTapGeneration.store(tuneRunGeneration.load());
     tuneExportTapSequence.fetch_add(1);
 }
 
@@ -512,7 +542,7 @@ std::string buildTuneReport(TuneLogOutputMode outputMode = kTuneLogOutputMode) {
     for (int i = 0; i < checkpointCount; ++i) {
         const TuneCheckpoint& checkpoint = checkpoints[i];
         const float expectedTheta = lemlib::radToDeg(checkpoint.expected.theta);
-        const float reportedTheta = lemlib::radToDeg(checkpoint.reported.theta);
+        const float reportedTheta = wrapDegrees(lemlib::radToDeg(checkpoint.reported.theta));
         const float fusedTheta = lemlib::radToDeg(checkpoint.debug.fusedPose.theta);
         const float mclTheta = lemlib::radToDeg(checkpoint.debug.mclPose.theta);
         const float errorX = checkpoint.reported.x - checkpoint.expected.x;
@@ -551,7 +581,9 @@ std::string buildTuneReport(TuneLogOutputMode outputMode = kTuneLogOutputMode) {
     return report;
 }
 
-std::string buildTuneTraceCsv() {
+// With a generation, formatting stops once a newer run starts; the caller then
+// discards the partial log (see emitTuneReport).
+std::string buildTuneTraceCsv(const std::uint32_t* generation = nullptr) {
     const auto traceSamples = lemlib::localization::getTraceSamples(false);
     const auto config = lemlib::localization::getConfig();
     RelocalizationSummary relocalize {};
@@ -615,6 +647,7 @@ std::string buildTuneTraceCsv() {
     appendFormat(csv, "\n");
 
     for (const auto& sample : traceSamples) {
+        if (generation != nullptr && tuneRunGeneration.load() != *generation) break;
         appendFormat(
             csv,
             "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%d,%d,%d,%d,%d,%lu,%.4f,%.4f,%d,%.4f,%.4f,%d,%d",
@@ -657,11 +690,10 @@ std::string buildTuneTraceCsv() {
     return csv;
 }
 
-std::string buildTuneLogFile() {
-    std::string log = buildTuneReport();
+std::string buildTuneLogFile(std::string log, const std::uint32_t* generation = nullptr) {
     if (kTuneLogOutputMode == TuneLogOutputMode::DeepDive) {
         appendFormat(log, "=== LOCALIZATION TRACE CSV ===\n");
-        log.append(buildTuneTraceCsv());
+        log.append(buildTuneTraceCsv(generation));
     }
     return log;
 }
@@ -670,8 +702,9 @@ bool writeTextFile(const char* path, const std::string& contents) {
     std::FILE* file = std::fopen(path, "w");
     if (file == nullptr) return false;
     const size_t written = std::fwrite(contents.data(), sizeof(char), contents.size(), file);
-    std::fclose(file);
-    return written == contents.size();
+    // fclose writes the buffered tail of the file; EOF means that last write failed
+    const bool closed = std::fclose(file) == 0;
+    return written == contents.size() && closed;
 }
 
 bool readTextFile(const char* path, std::string& contents) {
@@ -708,21 +741,12 @@ void restoreInternalTuneLogIfPresent() {
 void streamTextToTerminal(const std::string& text) {
     constexpr size_t kChunkSize = 512;
     constexpr std::uint32_t kChunkDelayMs = 2;
-    const int serialFd = ::open("serial", O_RDWR);
-    if (serialFd >= 0) {
-        pros::c::fdctl(serialFd, SERCTL_ACTIVATE, reinterpret_cast<void*>(kStdoutStreamId));
-        pros::c::fdctl(serialFd, SERCTL_BLKWRITE, nullptr);
-    }
-
     for (size_t pos = 0; pos < text.size(); pos += kChunkSize) {
         const size_t count = std::min(kChunkSize, text.size() - pos);
         std::printf("%.*s", static_cast<int>(count), text.data() + pos);
         std::fflush(stdout);
-        if (serialFd >= 0) ::write(serialFd, text.data() + pos, count);
         pros::delay(kChunkDelayMs);
     }
-
-    if (serialFd >= 0) ::close(serialFd);
 }
 
 void ensureTerminalStdoutActive() {
@@ -733,9 +757,15 @@ void streamTuneLogBlockToTerminal(const std::string& fullLog) {
     constexpr const char* kTerminalBeginMarker = "=== BEGIN LOCALIZATION TUNE LOG ===\n";
     constexpr const char* kTerminalEndMarker = "\n=== END LOCALIZATION TUNE LOG ===\n";
     ensureTerminalStdoutActive();
+    // Hold the stdout lock from BEGIN to END so lines the logger task drains
+    // meanwhile print after the block instead of splitting the exported log.
+    // Only the persistent replay task streams, so the lock is never held by a
+    // task PROS can delete.
+    lemlib::stdoutWriteMutex().take();
     streamTextToTerminal(kTerminalBeginMarker);
     streamTextToTerminal(fullLog);
     streamTextToTerminal(kTerminalEndMarker);
+    lemlib::stdoutWriteMutex().give();
 }
 
 void cachePendingTuneTerminalLog(const std::string& fullLog) {
@@ -777,14 +807,27 @@ bool hasLiveTuneData() {
 
 bool hasTuneExportAvailable() { return hasPendingTuneTerminalReplay() || hasLiveTuneData(); }
 
-bool queueTuneDataExportToTerminal() {
+bool queueTuneDataExportToTerminal(std::uint32_t generation) {
     pendingTuneLogMutex.take();
     const bool hasCachedLog = pendingTuneTerminalReplay && !pendingTuneTerminalLog.empty();
     pendingTuneLogMutex.give();
 
     if (!hasCachedLog) {
-        if (!hasLiveTuneData()) return false;
-        cachePendingTuneTerminalLog(buildTuneLogFile());
+        if (tuneRunGeneration.load() != generation || !hasLiveTuneData()) return false;
+        // a run that starts mid-build clears tune state and the trace, so this live
+        // log may mix two runs: drop it (the new run bumps the generation before
+        // clearing this cache under the same mutex)
+        const std::string fullLog = buildTuneLogFile(buildTuneReport(), &generation);
+        pendingTuneLogMutex.take();
+        const bool queued = tuneRunGeneration.load() == generation && !fullLog.empty();
+        if (queued) {
+            pendingTuneTerminalLog = fullLog;
+            pendingTuneTerminalReplay = true;
+            pendingTuneTerminalStreaming = false;
+            pendingTuneTerminalDumpRequested = true;
+        }
+        pendingTuneLogMutex.give();
+        return queued;
     }
 
     pendingTuneLogMutex.take();
@@ -824,35 +867,73 @@ void terminalReplayTaskFn() {
     }
 }
 
-void emitTuneReport() {
-    const std::string fullLog = buildTuneLogFile();
-
-    if (pros::usd::is_installed() != 1) {
-        cachePendingTuneTerminalLog(fullLog);
-        persistTuneLogInternal(fullLog);
-        setTuneExportFeedback("Log cached in RAM", 0);
-        lemlib::bufferedStdout().print(
-            "No SD card detected; cached tune log in RAM. Tap the lower-right of the brain screen to dump it\n");
-        return;
+// Hands a finished run's log to the terminal-replay cache: kept when it has no SD
+// copy, otherwise dropped. A dump request that is already queued keeps its place
+// and streams this final log; pendingTuneTerminalStreaming stays owned by the
+// replay task. Returns false, changing nothing, once a newer run has started (its
+// setup bumps the generation before clearing this cache under the same mutex).
+bool publishTuneTerminalLog(const std::string& fullLog, bool keepCached, std::uint32_t generation) {
+    bool exportActive = false;
+    pendingTuneLogMutex.take();
+    const bool current = tuneRunGeneration.load() == generation;
+    if (current) {
+        exportActive = pendingTuneTerminalStreaming || pendingTuneTerminalDumpRequested;
+        if (keepCached || pendingTuneTerminalDumpRequested) {
+            pendingTuneTerminalLog = fullLog;
+        } else {
+            pendingTuneTerminalLog.clear();
+        }
+        pendingTuneTerminalReplay = !pendingTuneTerminalLog.empty();
+        pendingTuneTerminalDumpRequested = pendingTuneTerminalDumpRequested && pendingTuneTerminalReplay;
     }
-    if (!writeTextFile(kTuneLogPath, fullLog)) {
-        cachePendingTuneTerminalLog(fullLog);
-        persistTuneLogInternal(fullLog);
-        setTuneExportFeedback("Log cached in RAM", 0);
-        lemlib::bufferedStdout().print(
-            "Tune report write failed: {}; cached tune log in RAM. Tap the lower-right of the brain screen to dump "
-            "it\n",
-            kTuneLogPath);
-    } else {
-        clearPendingTuneTerminalLog();
-        const std::string report = buildTuneReport();
-        lemlib::bufferedStdout().print("\n{}\n", report);
-        lemlib::bufferedStdout().print("Tune report saved: {}\n", kTuneLogPath);
-    }
+    pendingTuneLogMutex.give();
+    if (current && !keepCached && !exportActive) clearExportFeedback();
+    return current;
 }
 
-bool exportTuneDataToTerminalNow() {
-    if (!queueTuneDataExportToTerminal()) return false;
+// Returns false, writing and caching nothing, when a newer run started while the
+// log was being built: that run cleared tune state and the trace, so the log may
+// mix two runs. The build is abandoned early then, since the persistent overlay
+// task would otherwise keep formatting a dead log at the same priority as the new
+// run's competition task.
+bool emitTuneReport(std::uint32_t generation) {
+    // one snapshot for the saved log and its terminal echo
+    const std::string report = buildTuneReport();
+    if (tuneRunGeneration.load() != generation) return false;
+    const std::string fullLog = buildTuneLogFile(report, &generation);
+    // generations only grow, so a cancelled (partial) build always fails this check
+    if (tuneRunGeneration.load() != generation) return false;
+
+    if (pros::usd::is_installed() != 1) {
+        if (!publishTuneTerminalLog(fullLog, true, generation)) return false;
+        persistTuneLogInternal(fullLog);
+        if (setRunExportFeedback("Log cached in RAM", generation)) {
+            lemlib::bufferedStdout().print(
+                "No SD card detected; cached tune log in RAM. Tap the lower-right of the brain screen to dump it\n");
+        }
+        return true;
+    }
+    if (!writeTextFile(kTuneLogPath, fullLog)) {
+        if (!publishTuneTerminalLog(fullLog, true, generation)) return false;
+        persistTuneLogInternal(fullLog);
+        if (setRunExportFeedback("Log cached in RAM", generation)) {
+            lemlib::bufferedStdout().print(
+                "Tune report write failed: {}; cached tune log in RAM. Tap the lower-right of the brain screen to "
+                "dump it\n",
+                kTuneLogPath);
+        }
+    } else {
+        if (!publishTuneTerminalLog(fullLog, false, generation)) return false;
+        if (tuneRunGeneration.load() == generation) {
+            lemlib::bufferedStdout().print("\n{}\n", report);
+            lemlib::bufferedStdout().print("Tune report saved: {}\n", kTuneLogPath);
+        }
+    }
+    return true;
+}
+
+bool exportTuneDataToTerminalNow(std::uint32_t generation) {
+    if (!queueTuneDataExportToTerminal(generation)) return false;
     setTuneExportFeedback("Export queued...", kTuneExportFeedbackMs);
     return true;
 }
@@ -1010,26 +1091,63 @@ bool runDriveProbeStep(const char* name, const lemlib::Pose& expected, int durat
     return settleAndCapture(name, expected, allowAbort);
 }
 
-bool beginTuneFinalization(const char* status, const char* stepName) {
+// Claims the run and queues its report in one critical section. The report is
+// built and written later by the persistent overlay task: building and saving
+// the full log takes seconds, and on a competition task a mode change would
+// delete it mid-write (orphaning any lock it holds) or stall opcontrol's drive loop.
+bool beginTuneFinalization(const char* status, const char* stepName, const char* rumble) {
     bool shouldFinalize = false;
     tuneMutex.take();
     if (tuneTestRunning) {
         tuneStatus = status;
         tuneStepName = stepName;
         tuneTestRunning = false;
+        tuneReportEmitPending = true;
+        tuneReportRumble = rumble;
+        tuneReportGeneration = tuneRunGeneration.load();
+        ++tuneReportRequest;
         shouldFinalize = true;
     }
     tuneMutex.give();
     return shouldFinalize;
 }
 
-void printCheckpointPage(const TuneCheckpoint& checkpoint, int index, int count, const char* status, int page) {
+void processPendingTuneReport() {
+    tuneMutex.take();
+    const bool pending = tuneReportEmitPending;
+    const char* rumble = tuneReportRumble;
+    const std::uint32_t generation = tuneReportGeneration;
+    const std::uint32_t request = tuneReportRequest;
+    tuneMutex.give();
+    if (!pending) return;
+
+    const bool emitted = generation == tuneRunGeneration.load() && emitTuneReport(generation);
+
+    tuneMutex.take();
+    // another report may have been queued while this one was being built
+    if (tuneReportRequest == request) {
+        tuneReportEmitPending = false;
+        tuneReportRumble = nullptr;
+    }
+    tuneMutex.give();
+    if (emitted && rumble != nullptr && rumble[0] != '\0') {
+        // no lock held: a rejected rumble is retried here, and an opcontrol display
+        // write it displaces is retried in opcontrol's next slot
+        for (int attempt = 0; tuneRunGeneration.load() == generation && controller.rumble(rumble) == PROS_ERR &&
+                              attempt + 1 < kTuneRumbleAttempts;
+             ++attempt) {
+            pros::delay(kTuneRumbleRetryMs);
+        }
+    }
+}
+
+void printCheckpointPage(const TuneCheckpoint& checkpoint, int index, int count, const char* status, int page,
+                         bool logReady) {
     const float expectedTheta = lemlib::radToDeg(checkpoint.expected.theta);
-    const float reportedTheta = lemlib::radToDeg(checkpoint.reported.theta);
+    const float reportedTheta = wrapDegrees(lemlib::radToDeg(checkpoint.reported.theta));
     const float errorX = checkpoint.reported.x - checkpoint.expected.x;
     const float errorY = checkpoint.reported.y - checkpoint.expected.y;
     const float errorTheta = wrapDegrees(reportedTheta - expectedTheta);
-    const bool logReady = hasTuneExportAvailable();
     const char* exportFeedback = currentTuneExportFeedback();
 
     pros::screen::print(TEXT_MEDIUM, 1, "Tune %s %d/%d", status, index + 1, count);
@@ -1082,6 +1200,8 @@ void screenTaskFn() {
         const char* status = nullptr;
         const char* step = nullptr;
         bool running = false;
+        bool reportPending = false;
+        std::uint32_t runGeneration = 0;
         lemlib::Pose startPose {0, 0, 0};
 
         tuneMutex.take();
@@ -1091,6 +1211,9 @@ void screenTaskFn() {
         status = tuneStatus;
         step = tuneStepName;
         running = tuneTestRunning;
+        // a report a newer run has invalidated is being discarded and must not hold the dump cue
+        runGeneration = tuneRunGeneration.load();
+        reportPending = tuneReportEmitPending && tuneReportGeneration == runGeneration;
         startPose = tuneStartPose;
         if (checkpointCount > 0) {
             if (checkpointIndex < 0) checkpointIndex = 0;
@@ -1099,7 +1222,8 @@ void screenTaskFn() {
         }
         tuneMutex.give();
 
-        const bool logReady = hasTuneExportAvailable();
+        // the dump cue waits for the finished run's log to be saved
+        const bool logReady = !reportPending && hasTuneExportAvailable();
         const bool autonomousActive = pros::competition::is_autonomous() != 0;
         const bool disabledActive = pros::competition::is_disabled() != 0;
         const char* modeLabel =
@@ -1112,21 +1236,34 @@ void screenTaskFn() {
         const int rightX =
             pros::c::controller_get_analog(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_ANALOG_RIGHT_X);
         // single read: the touch-callback task increments the counter, so reading
-        // it twice could swallow a tap that lands between the reads
+        // it twice could swallow a tap that lands between the reads. A tap made
+        // while the finished run's log is being saved is left unhandled until the
+        // save completes, so it exports that run's log. A tap made before a newer
+        // run started (that run drops the report and clears the data) is dropped
+        // instead of dumping the new run's live state; the newest tap's run decides.
         const std::uint32_t tapSequenceSeen = tuneExportTapSequence.load();
-        const bool exportTapCallback = tapSequenceSeen != lastTapSequenceHandled;
-        lastTapSequenceHandled = tapSequenceSeen;
+        const bool tapPending = tapSequenceSeen != lastTapSequenceHandled;
+        // read after the sequence: the touch callback stores it before its bump
+        const std::uint32_t tapGeneration = tuneExportTapGeneration.load();
+        // a run started since this tick's snapshot: decide next tick against a consistent one
+        const bool decideTap = !reportPending && tapPending && tuneRunGeneration.load() == runGeneration;
+        const bool staleTap = decideTap && tapGeneration != runGeneration;
+        const bool exportTapCallback = decideTap && !staleTap;
+        if (decideTap) lastTapSequenceHandled = tapSequenceSeen;
+        if (staleTap) setTuneExportFeedback("No tune data ready", kTuneExportFeedbackMs);
+        // feedback only: the run owner, not the UI task, owns the run state
         if (exportTapCallback) {
             if (logReady) {
-                if (exportTuneDataToTerminalNow()) {
+                if (exportTuneDataToTerminalNow(runGeneration)) {
                     setTuneExportFeedback("Export queued...", kTuneExportFeedbackMs);
                 } else {
-                    setTuneExportFeedback("Export failed", kTuneExportFeedbackMs);
-                    setState("Idle", "Export failed", false);
+                    // a run that started mid-export cleared this run's data
+                    setTuneExportFeedback(tuneRunGeneration.load() != runGeneration ? "No tune data ready" :
+                                                                                      "Export failed",
+                                          kTuneExportFeedbackMs);
                 }
             } else {
                 setTuneExportFeedback("No tune data ready", kTuneExportFeedbackMs);
-                setState("Idle", "No tune data ready", false);
             }
         }
 
@@ -1153,16 +1290,22 @@ void screenTaskFn() {
                                     distances.left.confidence);
             }
         } else {
-            printCheckpointPage(checkpoint, checkpointIndex, checkpointCount, status, page);
+            printCheckpointPage(checkpoint, checkpointIndex, checkpointCount, status, page, logReady);
         }
 
-        if (running) pros::screen::print(TEXT_MEDIUM, 8, "Autonomous run active");
+        if (running) {
+            pros::screen::print(TEXT_MEDIUM, 8, "Autonomous run active");
+        } else if (reportPending) {
+            pros::screen::print(TEXT_MEDIUM, 8, "Saving tune log...");
+        }
         pros::delay(50);
     }
 }
 
 void overlayControlTaskFn() {
     while (true) {
+        processPendingTuneReport();
+
         bool tuneRunning = false;
         TuneRunMode runMode = TuneRunMode::Idle;
 
@@ -1259,6 +1402,8 @@ void setDriverControlLoopActive(bool active) { driverControlLoopActive.store(act
 void setDriverDriveLoopTicking(bool active) { driverDriveLoopTicking.store(active); }
 
 void prepareAutonomousRelocalizedRun(const lemlib::Pose& currentPose) {
+    // before any clear: invalidates a report still being built for the previous run
+    tuneRunGeneration.fetch_add(1);
     clearTuneResults();
     clearRelocalizationSummary();
     clearPendingTuneTerminalLog();
@@ -1278,29 +1423,32 @@ RelocalizationSummary performGlobalRelocalization() {
 
 void finalizeRun(const char* status, const char* stepName, const char* rumble) {
     chassis.cancelMotion();
-    if (!beginTuneFinalization(status, stepName)) return;
+    if (!beginTuneFinalization(status, stepName, rumble)) return;
     lemlib::localization::setTraceEnabled(false);
-    emitTuneReport();
-    if (rumble != nullptr && rumble[0] != '\0') controller.rumble(rumble);
+    // the overlay task emits the queued report; without the tune runtime, emit here
+    if (overlayControlTask == nullptr) processPendingTuneReport();
 }
 
 void finalizeInterruptedRunIfNeeded(const char* status, const char* stepName) {
-    if (!beginTuneFinalization(status, stepName)) return;
+    if (!beginTuneFinalization(status, stepName, ". .")) return;
+    // freeze the trace before the stops: the overlay task may start building the
+    // queued report while they run
+    lemlib::localization::setTraceEnabled(false);
 
     disableEightMotorPositionHold();
     stopAutonomousManipulatorControl();
     stopReleasedPtoControls();
     chassis.cancelAllMotions();
     chassis.tank(0, 0, true);
-    lemlib::localization::setTraceEnabled(false);
     lemlib::bufferedStdout().print("Finalizing interrupted tune run: {}\n", stepName);
-    emitTuneReport();
-    controller.rumble(". .");
+    if (overlayControlTask == nullptr) processPendingTuneReport();
 }
 
 void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbort) {
     const TuneTestCase selectedTestCase = tuneTestCaseFromNumber(testNumber);
     const TuneTestDefinition test = tuneTestDefinition(selectedTestCase);
+    // before any clear: invalidates a report still being built for the previous run
+    tuneRunGeneration.fetch_add(1);
     clearTuneResults();
     clearPendingTuneTerminalLog();
     clearRelocalizationSummary();

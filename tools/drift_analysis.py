@@ -33,6 +33,11 @@ TRACE_MARKER = "=== LOCALIZATION TRACE CSV ==="
 END_MARKER = "=== END LOCALIZATION TUNE LOG ==="
 BOUNDARY_CAP_IN = 2.5  # maxBoundaryCorrectionXY shipped in localization_config.cpp
 MOTION_SUPPRESSED_BIT = 1 << 9
+# A filter reset (start-relocalization setPose, seq-gap resync) moves odom_only in one
+# row; that jump is not driven distance. Top drive speed is ~77 ips; the largest logged
+# real step is 1.08 in, the smallest logged reset 2.57 in. Mirrored in audit_analysis.py.
+RESET_MIN_JUMP_IN = 2.0
+RESET_MAX_SPEED_IPS = 150.0
 
 RUNS = [
     ("run1", "Sample route (moving fusion)", "run1_sample_route_moving_fusion_log.txt"),
@@ -97,7 +102,7 @@ def analyze(rows):
     # ---- pass 1: path, booked divergence, accept anchors ----
     base = []  # (t, path, rex, rey, accepted, ox, oy, ex, ey)
     path_len = 0.0
-    prev_ox = prev_oy = None
+    prev_ox = prev_oy = prev_t = None
     motion_rows = 0
     accepts = []           # (t, |cx|, |cy|, mag, nis, active) at rising edges
     anchor_paths = [0.0]   # path positions where error resets (start + accept edges)
@@ -107,8 +112,10 @@ def analyze(rows):
         ox, oy = f(r, "odom_only_x"), f(r, "odom_only_y")
         ex, ey = f(r, "ekf_x"), f(r, "ekf_y")
         if prev_ox is not None:
-            path_len += math.hypot(ox - prev_ox, oy - prev_oy)
-        prev_ox, prev_oy = ox, oy
+            step = math.hypot(ox - prev_ox, oy - prev_oy)
+            if step <= max(RESET_MIN_JUMP_IN, RESET_MAX_SPEED_IPS * (t - prev_t)):
+                path_len += step
+        prev_ox, prev_oy, prev_t = ox, oy, t
         if i(r, "correction_reject_mask") & MOTION_SUPPRESSED_BIT:
             motion_rows += 1
         acc = i(r, "correction_accepted") == 1

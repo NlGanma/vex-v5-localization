@@ -1,7 +1,10 @@
+#include <cstdint>
+#include <limits>
 #include "lemlib/chassis/trackingWheel.hpp"
 #include "lemlib/util.hpp"
 #include "lemlib/logger/logger.hpp"
 #include "pros/abstract_motor.hpp"
+#include "pros/error.h"
 #include "pros/motor_group.hpp"
 #include "pros/motors.h"
 
@@ -35,10 +38,17 @@ void lemlib::TrackingWheel::reset() {
 }
 
 float lemlib::TrackingWheel::getDistanceTraveled() {
+    // A failed read returns NaN rather than a number: PROS_ERR (INT32_MAX) is a
+    // representable count, so converting it would look like a real (if huge)
+    // distance. Odometry treats a non-finite reading as "hold the last baseline".
     if (this->encoder != nullptr) {
-        return (float(this->encoder->get_value()) * this->diameter * M_PI / 360) / this->gearRatio;
+        const std::int32_t ticks = this->encoder->get_value();
+        if (ticks == PROS_ERR) return std::numeric_limits<float>::quiet_NaN();
+        return (float(ticks) * this->diameter * M_PI / 360) / this->gearRatio;
     } else if (this->rotation != nullptr) {
-        return (float(this->rotation->get_position()) * this->diameter * M_PI / 36000) / this->gearRatio;
+        const std::int32_t centidegrees = this->rotation->get_position();
+        if (centidegrees == PROS_ERR) return std::numeric_limits<float>::quiet_NaN();
+        return (float(centidegrees) * this->diameter * M_PI / 36000) / this->gearRatio;
     } else if (this->motors != nullptr) {
         // get distance traveled by each motor
         std::vector<pros::MotorGears> gearsets = this->motors->get_gearing_all();
@@ -59,7 +69,8 @@ float lemlib::TrackingWheel::getDistanceTraveled() {
             }
             distances.push_back(positions[i] * (diameter * M_PI) * (rpm / in));
         }
-        if (distances.empty()) return 0; // all motors disconnected
+        // all motors disconnected: a literal 0 would read as a stationary wheel
+        if (distances.empty()) return std::numeric_limits<float>::quiet_NaN();
         return lemlib::avg(distances);
     } else {
         return 0;

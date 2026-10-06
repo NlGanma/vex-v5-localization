@@ -14,7 +14,7 @@ Examples:
 The reject-mask bit names match src/lemlib/localization/localization.cpp.
 """
 from __future__ import annotations
-import argparse, math, sys
+import argparse, ast, math, sys
 from pathlib import Path
 
 TRACE_MARKER = "=== LOCALIZATION TRACE CSV ==="
@@ -43,7 +43,7 @@ def load(path: Path):
             hdr = s.split(","); continue
         if hdr and s and not s.startswith("#"):
             parts = s.split(",")
-            if len(parts) == len(hdr):
+            if len(parts) == len(hdr) and parts != hdr:
                 rows.append(dict(zip(hdr, parts)))
     return hdr, rows
 
@@ -77,29 +77,71 @@ def main() -> int:
         except (SyntaxError, ValueError) as exc:
             print(f"error: invalid --filter: {exc}", file=sys.stderr)
             return 2
+        if hdr:
+            # a typo behind a guard that no row passes (or under --accepted with no accepted rows) is never evaluated
+            nodes = list(ast.walk(ast.parse(a.filter, mode="eval")))
+            bound = {n.id for n in nodes if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load)}
+            bound |= {n.arg for n in nodes if isinstance(n, ast.arg)}
+            unknown = {n.id for n in nodes if isinstance(n, ast.Name)} - bound - set(hdr) - set(REJECT_BITS.values())
+            if unknown:
+                print(f"error: invalid --filter: name {min(unknown)!r} is not defined", file=sys.stderr)
+                return 2
+
+        row_errors, first_error = {"arith": 0, "other": 0}, {}
 
         def ok(r):
             env = {k: num(v) for k, v in r.items()}
-            mask = int(env.get("correction_reject_mask", 0) or 0)
+            m = env.get("correction_reject_mask", 0.0)
+            if not math.isfinite(m):
+                # corrupted mask cell: the reject-bit names are unknown, so exclude the row like other row data errors
+                row_errors["other"] += 1
+                first_error.setdefault("other", "non-numeric correction_reject_mask")
+                return False
+            mask = int(m)
             for bit, name in REJECT_BITS.items():
                 env[name] = 1.0 if mask & bit else 0.0
             try:
                 return bool(eval(filter_code, {"__builtins__": {}}, env))
-            except Exception as exc:
+            except NameError as exc:
+                # every row has the same columns, so an unknown name is a filter typo, never row data
                 raise ValueError(str(exc)) from exc
+            except Exception as exc:
+                # per-row data error (x/0, overflow, complex from neg**0.5 ordered with < or used in // or %):
+                # exclude the row; any other error (calling/indexing a column or a complex value, float & int)
+                # is a filter error even when a short-circuit lets only some rows reach it
+                arith = isinstance(exc, ArithmeticError)
+                msg = str(exc)
+                complex_data = isinstance(exc, TypeError) and (("'complex'" in msg and (
+                    "not supported between instances" in msg or "for //:" in msg or "for %:" in msg))
+                    or "floor of complex" in msg or "mod complex" in msg)  # Python 3.9 wording
+                if not (arith or complex_data):
+                    raise ValueError(f"{type(exc).__name__}: {exc}") from exc
+                kind = "arith" if arith else "other"
+                row_errors[kind] += 1
+                first_error.setdefault(kind, f"{type(exc).__name__}: {exc}")
+                return False
         try:
             sel = [r for r in sel if ok(r)]
         except ValueError as exc:
             print(f"error: invalid --filter: {exc}", file=sys.stderr)
             return 2
+        n_errors = row_errors["arith"] + row_errors["other"]
+        if n_errors:
+            first = first_error.get("other", first_error.get("arith"))
+            print(f"note: --filter excluded {n_errors} rows on per-row errors (e.g. {first})", file=sys.stderr)
     print(f"# matched {len(sel)} rows")
 
     if a.reject_bits:
         hist = {name: 0 for name in REJECT_BITS.values()}
         masks = 0
-        for r in rows:
-            m = int(num(r.get("correction_reject_mask", 0)) or 0)
-            if m:
+        staged = 0
+        for r in sel:
+            v = num(r.get("correction_reject_mask", 0))
+            m = int(v) if math.isfinite(v) else 0
+            if m and r.get("correction_accepted") == "1":
+                # firmware since c1dadfb keeps motion_suppressed on an accepted (staged) row
+                staged += 1
+            elif m:
                 masks += 1
                 for bit, name in REJECT_BITS.items():
                     if m & bit:
@@ -107,6 +149,8 @@ def main() -> int:
         print(f"# rows with any reject bit: {masks}")
         for name, c in sorted(hist.items(), key=lambda kv: -kv[1]):
             print(f"  {name:20s} {c}")
+        if staged:
+            print(f"# accepted rows carrying mask bits (staged in motion, not rejected): {staged}")
         return 0
 
     if a.stats:

@@ -71,8 +71,8 @@ class TrackingWheel {
          * @b Example
          * @code {.cpp}
          * // Create a new rotation sensor on port 1
-         * // this sensor is not reversed
-         * pros::Rotation verticalEncoder(1, false);
+         * // this sensor is not reversed (use a negative port to reverse it)
+         * pros::Rotation verticalEncoder(1);
          * // create a new vertical tracking wheel
          * // it's using a new 2.75 inch wheel
          * // it's also 5 inches away from the tracking center. This tracking wheel is to the left
@@ -80,8 +80,8 @@ class TrackingWheel {
          * // tracking center, we would use a positive distance
          * lemlib::TrackingWheel verticalTrackingWheel(&verticalEncoder, lemlib::Omniwheel::NEW_275, -5);
          * // create a new rotation sensor on port 2
-         * // this sensor is reversed
-         * pros::Rotation horizontalEncoder(2, true);
+         * // this sensor is reversed, so the port is negative
+         * pros::Rotation horizontalEncoder(-2);
          * // create a new horizontal tracking wheel
          * // it's using an old 3.25 inch wheel
          * // it's also 2 inches away from the tracking center. This tracking wheel is to the back
@@ -102,13 +102,10 @@ class TrackingWheel {
          *
          * @b Example
          * @code {.cpp}
-         * // Create motor objects
+         * // create a motor group for the left side of the drivetrain:
+         * // left front (port 5, reversed), left middle (port 4), left back (port 3, reversed)
          * // note its important to include the motor gearset otherwise the gear ratio will be incorrect
-         * pros::Motor lF(-5, pros::E_MOTOR_GEARSET_06); // left front motor. port 5, reversed
-         * pros::Motor lM(4, pros::E_MOTOR_GEARSET_06); // left middle motor. port 4
-         * pros::Motor lB(-3, pros::E_MOTOR_GEARSET_06); // left back motor. port 3, reversed
-         * // create a motor group for the left side of the drivetrain
-         * pros::MotorGroup leftMotors({lF, lM, lB});
+         * pros::MotorGroup leftMotors({-5, 4, -3}, pros::MotorGearset::blue);
          * // Create a new tracking wheel using the left motor group
          * // it's using an old 4 inch wheel
          * // and its distance is half the track width of the drivetrain
@@ -138,7 +135,8 @@ class TrackingWheel {
         /**
          * @brief Get the distance traveled by the tracking wheel
          *
-         * @return float distance traveled in inches
+         * @return float distance traveled in inches, or NaN if the sensor read failed (for a motor group,
+         * if every motor's read failed)
          *
          * @b Example
          * @code {.cpp}
@@ -149,6 +147,7 @@ class TrackingWheel {
          *         pros::delay(10);
          *     }
          * }
+         * @endcode
          */
         float getDistanceTraveled();
         /**

@@ -2,12 +2,17 @@
 # Keep src/tune.txt as the latest robot export, then paste each run's full exported log into the matching file below.
 # Provenance note: run1/run4 were recorded on the May 31 18:25/19:22 builds whose report header echoed a stale
 # default test_case (1, Turn center). The actual route is identified by checkpoint_count and path length:
-# checkpoint_count=0 with ~135 in of path = the wired normal sample route (kLocalizationTuneTest = 0).
+# checkpoint_count=0 with ~120-130 in of driven path (run1 121 in, run4 132 in) = the wired normal sample route
+# (kLocalizationTuneTest = 0). Older drift_analysis output said ~135 in because it counted the start-relocalization
+# setPose jump as path.
 # src/tune.txt currently holds a May 24 pre-calibration sensor-angle sweep (test 5) kept as historical
 # evidence for the old two-sensor wall_direct accept and the sensor-angle calibration provenance.
 # The sample autonomous route is already wired into src/autonomous_control.cpp and records a full tune trace/report.
 # Set kLocalizationTuneTest = 0 to run it. Set kLocalizationTuneTest = 1..6 to run the built-in tune routes, which also record full tune traces/reports.
 # Since the air pump/PTO is not available, the normal route and score() path leave the robot in 4-motor mode.
+# Checkpoint 'Rep' headings in these logs are unwrapped (e.g. run3 'Rep -23.2 -34.3 714.5'); current firmware wraps
+# Rep to (-180, 180]. Their Err lines were already wrapped and correct, and the trace CSV applied_theta_deg column
+# stays continuous (unwrapped) in both versions.
 
 Recommended 30 minute order:
 1. Set kLocalizationTuneTest = 0, run the wired sample route, and paste the exported log into run1_sample_route_moving_fusion_log.txt.

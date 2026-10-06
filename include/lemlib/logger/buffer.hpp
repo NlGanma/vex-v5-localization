@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <deque>
 #include <functional>
 #include <string>
 
@@ -34,9 +33,13 @@ class Buffer {
         /**
          * @brief Push to the buffer
          *
+         * Holds no lock: the publish runs with the scheduler suspended, so it is atomic against task switches and a
+         * producer that PROS deletes mid-push (competition tasks are deleted on every mode change without releasing
+         * held mutexes) can only lose its own message, never wedge the buffer.
+         *
          * @param bufferData
          */
-        void pushToBuffer(const std::string& bufferData);
+        void pushToBuffer(std::string bufferData);
 
         /**
          * @brief Set the rate of the sink
@@ -51,6 +54,11 @@ class Buffer {
          */
         bool buffersEmpty();
     private:
+        struct Node {
+                std::string data;
+                Node* next = nullptr;
+        };
+
         /**
          * @brief The function that will be run inside of the buffer's task.
          *
@@ -63,13 +71,15 @@ class Buffer {
          */
         std::function<void(std::string)> bufferFunc;
 
-        std::deque<std::string> buffer = {};
-
-        pros::Mutex mutex;
-        pros::Task task;
+        // producers push newest-first; only the buffer task takes from here
+        std::atomic<Node*> inbox {nullptr};
+        // oldest-first messages already taken from the inbox; written only by the buffer task
+        std::atomic<Node*> pending {nullptr};
         std::atomic<bool> running {true};
         std::atomic<bool> taskStopped {false};
 
         uint32_t rate = 10;
+        // must stay the last member: constructing it starts taskLoop(), which reads every member above
+        pros::Task task;
 };
 } // namespace lemlib

@@ -21,6 +21,10 @@ constexpr float kRelocalizeStartupMaxRange = 96.0f;
 constexpr int kRelocalizeStartupMinConfidence = 12;
 constexpr int kRelocalizeSnapshotCount = 3;
 constexpr std::uint32_t kRelocalizeSnapshotSpacingMs = 20;
+// After a dropout the combined range is the mean of the two remaining samples;
+// past this spread that mean is more than 1" from both samples, a range neither
+// measured. Logged stationary consecutive readings stayed within 1.61".
+constexpr float kRelocalizeMaxSamplePairSpread = 2.0f;
 constexpr int kRelocalizeCoarseHeadingHypotheses = 16;
 constexpr int kRelocalizeRefineHeadingHypotheses = 5;
 constexpr int kRelocalizeIterationsPerHypothesis = 6;
@@ -33,15 +37,38 @@ constexpr int kDirectWallCommitMinSensors = 3;
 constexpr int kRelocalizeCommitMinSensors = 3;
 // At start the field-frame heading prior (odometry heading, IMU-driven) is
 // strong and drift-free. The wall solve runs AT that heading (never snapped
-// cardinals), so wall-distance aliasing cannot steer heading at all; the MCL
-// fallback sweep below still uses the prior as a tiebreak between otherwise
-// comparable hypotheses on the near-square field.
+// cardinals), so wall-distance aliasing cannot steer heading. The MCL fallback
+// sweep uses this window as a tiebreak between comparable hypotheses on the
+// near-square field and rejects a final candidate whose heading falls outside
+// it; an accepted candidate is committed AT the prior heading.
 constexpr float kRelocalizeHeadingTiebreakRad = 0.3490659f; // 20 deg
+// A ray ending this close to a field corner cannot be attributed to one wall:
+// a ray that really ends on the adjacent wall is solved exactly onto the
+// corner, so only the hit's slide along the wall tells the two apart. 3" covers
+// an inlier-sized (7") range error on the back/left rays (7*sin(22-25 deg)) and
+// ~1 deg of heading-prior error on the ~90" right ray (~1.5" per degree);
+// narrower per-ray margins re-admitted right-ray corner aliases in host replay.
+// raycastField() labels such a hit Unknown, which feeds both the direct solve's
+// assignment/mirror vetoes and the MCL commit's axis check (axis_unobserved).
+// Each use can only veto, so its cost is fallbacks to the fixed start, mostly
+// placements ~8-19" behind the configured start, where the right or left ray
+// ends near a bottom corner.
+constexpr float kWallCornerMargin = 3.0f;
 
 enum class WallAxisDirection { PosX, NegX, PosY, NegY, Unknown };
 
 struct DirectWallSolveCandidate {
     bool valid = false;
+    // Vetoes on the ranked pick (set only on the returned best). The pick is
+    // never replaced by another mask, so they can only turn a commit into a
+    // fallback.
+    // A ray the pick used does not really end on its assigned wall.
+    bool assignmentRejected = false;
+    // Another solve whose used rays do not end on their walls still explains
+    // every scored range under the full raycast...
+    bool consistentAlternative = false;
+    // ...and lies farther than an inlier error from the pick.
+    bool mirrored = false;
     lemlib::Pose pose {0, 0, 0};
     float meanAbsResidual = 0.0f;
     float maxAbsResidual = 0.0f;
@@ -51,6 +78,13 @@ struct DirectWallSolveCandidate {
     int inlierSensors = 0;
     int xSensors = 0;
     int ySensors = 0;
+};
+
+struct RayHit {
+    float distance = -1.0f;
+    // Perimeter wall the ray ends on; Unknown for an obstacle, a miss, or a hit
+    // within kWallCornerMargin of a corner.
+    WallAxisDirection wall = WallAxisDirection::Unknown;
 };
 
 struct RelocalizationCandidate {
@@ -77,27 +111,48 @@ SensorSnapshot captureSensor(pros::Distance& sensor) {
     return snapshot;
 }
 
+// Median distance with the strongest sample confidence; everything downstream
+// uses this. readingConfidence receives the confidence of the reading(s) behind
+// the median (the smaller available one of an even-count middle pair, -1 if
+// none; 0 when the two samples left after a dropout disagree), which
+// performGlobalRelocalization uses only to veto. Samples at an identical range
+// sort weakest first, so the median slot can take a weaker duplicate of a
+// confident reading: that costs a fallback, never a commit.
 template <size_t N>
-SensorSnapshot combineSensorSnapshots(const std::array<SensorSnapshot, N>& samples) {
+SensorSnapshot combineSensorSnapshots(const std::array<SensorSnapshot, N>& samples, int& readingConfidence) {
     SensorSnapshot combined {};
-    std::array<float, N> distances {};
-    size_t distanceCount = 0;
+    std::array<SensorSnapshot, N> valid {};
+    size_t validCount = 0;
 
     for (const auto& sample : samples) {
-        if (sample.distance > 0.0f) distances[distanceCount++] = sample.distance;
+        if (sample.distance > 0.0f) valid[validCount++] = sample;
         if (sample.confidence > combined.confidence) combined.confidence = sample.confidence;
     }
 
-    if (distanceCount == 0) return combined;
+    readingConfidence = -1;
+    if (validCount == 0) return combined;
 
-    std::sort(distances.begin(), distances.begin() + static_cast<std::ptrdiff_t>(distanceCount));
-    if (distanceCount % 2 == 1) combined.distance = distances[distanceCount / 2];
-    else combined.distance = 0.5f * (distances[distanceCount / 2 - 1] + distances[distanceCount / 2]);
-
+    std::sort(valid.begin(), valid.begin() + static_cast<std::ptrdiff_t>(validCount),
+              [](const SensorSnapshot& lhs, const SensorSnapshot& rhs) {
+                  if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+                  return lhs.confidence < rhs.confidence;
+              });
+    const SensorSnapshot& upper = valid[validCount / 2];
+    combined.distance = upper.distance;
+    readingConfidence = upper.confidence;
+    if (validCount % 2 == 0) {
+        const SensorSnapshot& lower = valid[validCount / 2 - 1];
+        combined.distance = 0.5f * (lower.distance + upper.distance);
+        if (lower.confidence >= 0 && (readingConfidence < 0 || lower.confidence < readingConfidence)) {
+            readingConfidence = lower.confidence;
+        }
+        // Two disagreeing samples have no trustworthy median: veto like a failed reading.
+        if (upper.distance - lower.distance > kRelocalizeMaxSamplePairSpread) readingConfidence = 0;
+    }
     return combined;
 }
 
-DistanceSnapshot captureStableDistances() {
+DistanceSnapshot captureStableDistances(std::array<int, 4>& readingConfidence) {
     std::array<DistanceSnapshot, kRelocalizeSnapshotCount> snapshots {};
     for (int i = 0; i < kRelocalizeSnapshotCount; ++i) {
         snapshots[static_cast<size_t>(i)] = DistanceSnapshot {
@@ -121,10 +176,10 @@ DistanceSnapshot captureStableDistances() {
     }
 
     return DistanceSnapshot {
-        combineSensorSnapshots(front),
-        combineSensorSnapshots(right),
-        combineSensorSnapshots(back),
-        combineSensorSnapshots(left),
+        combineSensorSnapshots(front, readingConfidence[0]),
+        combineSensorSnapshots(right, readingConfidence[1]),
+        combineSensorSnapshots(back, readingConfidence[2]),
+        combineSensorSnapshots(left, readingConfidence[3]),
     };
 }
 
@@ -170,6 +225,21 @@ int countUsableDistanceSnapshots(const lemlib::localization::LocalizationConfig&
         if (sensorSnapshotUsable(samples[i], config.sensors[i])) ++count;
     }
     return count;
+}
+
+// A sensor counts as usable on its strongest sample's confidence, but the
+// reading behind its median range may itself fail the confidence gate (0 marks
+// a disagreeing post-dropout pair, below every relocalization gate).
+bool usableRangeHasLowReadingConfidence(const lemlib::localization::LocalizationConfig& config,
+                                        const DistanceSnapshot& snapshot,
+                                        const std::array<int, 4>& readingConfidence) {
+    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto& sensor = config.sensors[i];
+        if (sensor.sensor == nullptr || !sensorSnapshotUsable(samples[i], sensor)) continue;
+        if (readingConfidence[i] >= 0 && readingConfidence[i] < sensor.minConfidence) return true;
+    }
+    return false;
 }
 
 float raycastCircle(float sx, float sy, float dirX, float dirY, float cx, float cy, float radius) {
@@ -219,8 +289,8 @@ float raycastRect(float sx, float sy, float dirX, float dirY, float minX, float 
     return -1.0f;
 }
 
-float expectedDistance(const lemlib::localization::LocalizationConfig& config, const lemlib::Pose& pose,
-                       const lemlib::localization::SensorConfig& sensor) {
+RayHit raycastField(const lemlib::localization::LocalizationConfig& config, const lemlib::Pose& pose,
+                    const lemlib::localization::SensorConfig& sensor) {
     const float sinTheta = std::sin(pose.theta);
     const float cosTheta = std::cos(pose.theta);
     const float sx = pose.x + sensor.dx * cosTheta + sensor.dy * sinTheta;
@@ -229,30 +299,42 @@ float expectedDistance(const lemlib::localization::LocalizationConfig& config, c
     const float dirX = std::sin(heading);
     const float dirY = std::cos(heading);
     constexpr float eps = 1e-6f;
-    float best = 1.0e9f;
+    RayHit best {1.0e9f, WallAxisDirection::Unknown};
 
-    auto consider = [&](float distance) {
-        if (distance > 0.0f && distance < best) best = distance;
+    auto consider = [&](float distance, WallAxisDirection wall) {
+        if (distance > 0.0f && distance < best.distance) best = RayHit {distance, wall};
+    };
+    auto considerWall = [&](float distance, WallAxisDirection wall, float along, float wallMin, float wallMax) {
+        const bool attributable = along >= wallMin + kWallCornerMargin && along <= wallMax - kWallCornerMargin;
+        consider(distance, attributable ? wall : WallAxisDirection::Unknown);
     };
 
     if (std::fabs(dirX) > eps) {
         const float t1 = (config.field.minX - sx) / dirX;
         const float y1 = sy + t1 * dirY;
-        if (t1 > 0.0f && y1 >= config.field.minY && y1 <= config.field.maxY) consider(t1);
+        if (t1 > 0.0f && y1 >= config.field.minY && y1 <= config.field.maxY) {
+            considerWall(t1, WallAxisDirection::NegX, y1, config.field.minY, config.field.maxY);
+        }
 
         const float t2 = (config.field.maxX - sx) / dirX;
         const float y2 = sy + t2 * dirY;
-        if (t2 > 0.0f && y2 >= config.field.minY && y2 <= config.field.maxY) consider(t2);
+        if (t2 > 0.0f && y2 >= config.field.minY && y2 <= config.field.maxY) {
+            considerWall(t2, WallAxisDirection::PosX, y2, config.field.minY, config.field.maxY);
+        }
     }
 
     if (std::fabs(dirY) > eps) {
         const float t3 = (config.field.minY - sy) / dirY;
         const float x3 = sx + t3 * dirX;
-        if (t3 > 0.0f && x3 >= config.field.minX && x3 <= config.field.maxX) consider(t3);
+        if (t3 > 0.0f && x3 >= config.field.minX && x3 <= config.field.maxX) {
+            considerWall(t3, WallAxisDirection::NegY, x3, config.field.minX, config.field.maxX);
+        }
 
         const float t4 = (config.field.maxY - sy) / dirY;
         const float x4 = sx + t4 * dirX;
-        if (t4 > 0.0f && x4 >= config.field.minX && x4 <= config.field.maxX) consider(t4);
+        if (t4 > 0.0f && x4 >= config.field.minX && x4 <= config.field.maxX) {
+            considerWall(t4, WallAxisDirection::PosY, x4, config.field.minX, config.field.maxX);
+        }
     }
 
     for (const auto& obstacle : config.field.obstacles) {
@@ -263,10 +345,15 @@ float expectedDistance(const lemlib::localization::LocalizationConfig& config, c
             hit = raycastRect(sx, sy, dirX, dirY, obstacle.x - obstacle.halfW, obstacle.x + obstacle.halfW,
                               obstacle.y - obstacle.halfH, obstacle.y + obstacle.halfH);
         }
-        consider(hit);
+        consider(hit, WallAxisDirection::Unknown);
     }
 
-    return best >= 1.0e8f ? -1.0f : best;
+    return best.distance >= 1.0e8f ? RayHit {} : best;
+}
+
+float expectedDistance(const lemlib::localization::LocalizationConfig& config, const lemlib::Pose& pose,
+                       const lemlib::localization::SensorConfig& sensor) {
+    return raycastField(config, pose, sensor).distance;
 }
 
 PoseResidualSummary scorePoseResiduals(const lemlib::localization::LocalizationConfig& config,
@@ -299,6 +386,26 @@ bool residualsAccepted(const PoseResidualSummary& residuals, int minSensors,
            residuals.maxAbsResidual <= maxResidual;
 }
 
+// At a fixed heading a range that ends on an X wall constrains only X (and one
+// on a Y wall only Y), so a pose whose inlier rays all end on X walls -- or on
+// corners/the obstacle -- leaves Y free even with zero residuals.
+bool inlierRaysObserveBothAxes(const lemlib::localization::LocalizationConfig& config,
+                               const DistanceSnapshot& snapshot, const lemlib::Pose& pose) {
+    const std::array<SensorSnapshot, 4> samples {snapshot.front, snapshot.right, snapshot.back, snapshot.left};
+    bool xObserved = false;
+    bool yObserved = false;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto& sensor = config.sensors[i];
+        const auto& sample = samples[i];
+        if (sensor.sensor == nullptr || !sensorSnapshotUsable(sample, sensor)) continue;
+        const RayHit hit = raycastField(config, pose, sensor);
+        if (hit.distance <= 0.0f || std::fabs(hit.distance - sample.distance) > config.mcl.outlierThreshold) continue;
+        if (hit.wall == WallAxisDirection::PosX || hit.wall == WallAxisDirection::NegX) xObserved = true;
+        if (hit.wall == WallAxisDirection::PosY || hit.wall == WallAxisDirection::NegY) yObserved = true;
+    }
+    return xObserved && yObserved;
+}
+
 WallAxisDirection classifyWallAxisDirection(float heading) {
     const float normalized = wrapRadians(heading);
     const float absHeading = std::fabs(normalized);
@@ -307,6 +414,21 @@ WallAxisDirection classifyWallAxisDirection(float heading) {
     if (std::fabs(normalized - kPiOver2) <= lemlib::degToRad(30.0f)) return WallAxisDirection::PosX;
     if (std::fabs(normalized + kPiOver2) <= lemlib::degToRad(30.0f)) return WallAxisDirection::NegX;
     return WallAxisDirection::Unknown;
+}
+
+bool usedRaysEndOnAssignedWalls(const lemlib::localization::LocalizationConfig& config,
+                                const std::array<SensorSnapshot, 4>& samples,
+                                const std::array<WallAxisDirection, 4>& axes, int mask, const lemlib::Pose& pose) {
+    for (size_t i = 0; i < samples.size(); ++i) {
+        if ((mask & (1 << static_cast<int>(i))) == 0) continue;
+        const auto& sensor = config.sensors[i];
+        if (sensor.sensor == nullptr || !sensorSnapshotUsable(samples[i], sensor) ||
+            axes[i] == WallAxisDirection::Unknown) {
+            continue;
+        }
+        if (raycastField(config, pose, sensor).wall != axes[i]) return false;
+    }
+    return true;
 }
 
 DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::LocalizationConfig& config,
@@ -328,6 +450,11 @@ DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::Localiz
     DirectWallSolveCandidate best {};
     best.pose.theta = wrapRadians(heading);
     best.selectionScore = 1.0e9f;
+    int bestMask = 0;
+    std::array<int, 16> solveMasks {};
+    std::array<float, 16> solveX {};
+    std::array<float, 16> solveY {};
+    int solveCount = 0;
 
     for (int mask = 1; mask < (1 << static_cast<int>(samples.size())); ++mask) {
         DirectWallSolveCandidate candidate {};
@@ -431,9 +558,41 @@ DirectWallSolveCandidate solveDirectWallPose(const lemlib::localization::Localiz
                                    kDirectWallIgnoredSensorPenalty * static_cast<float>(ignoredSensors) +
                                    kDirectWallOutlierPenalty * static_cast<float>(outlierSensors);
         candidate.valid = true;
-        if (!best.valid || candidate.selectionScore < best.selectionScore) best = candidate;
+        solveMasks[static_cast<size_t>(solveCount)] = mask;
+        solveX[static_cast<size_t>(solveCount)] = candidate.pose.x;
+        solveY[static_cast<size_t>(solveCount++)] = candidate.pose.y;
+        if (!best.valid || candidate.selectionScore < best.selectionScore) {
+            best = candidate;
+            bestMask = mask;
+        }
     }
 
+    if (!best.valid) return best;
+    // Walls were assigned from ray heading alone. A used ray that really ends on
+    // the adjacent wall, a corner, or the obstacle makes the solve invent that
+    // axis -- e.g. the lone Y ray actually hitting an X wall is solved onto the
+    // corner, where both walls agree and the full-raycast residual reads ~0.
+    // These checks only veto the pick: promoting the next-ranked mask instead
+    // committed aliases that this ranking had placed lower.
+    best.assignmentRejected = !usedRaysEndOnAssignedWalls(config, samples, axes, bestMask, best.pose);
+    for (int j = 0; j < solveCount; ++j) {
+        const lemlib::Pose alternative(solveX[static_cast<size_t>(j)], solveY[static_cast<size_t>(j)], best.pose.theta);
+        if (solveMasks[static_cast<size_t>(j)] == bestMask ||
+            usedRaysEndOnAssignedWalls(config, samples, axes, solveMasks[static_cast<size_t>(j)], alternative)) {
+            continue;
+        }
+        const PoseResidualSummary residuals = scorePoseResiduals(config, snapshot, alternative);
+        if (!residualsAccepted(residuals, kDirectWallCommitMinSensors) ||
+            residuals.inlierSensors != residuals.scoredSensors) {
+            continue;
+        }
+        best.consistentAlternative = true;
+        // Two solves farther apart than an inlier error both explain the ranges
+        // (typically a centre-obstacle mirror), so the pick may not commit.
+        if (std::hypot(best.pose.x - alternative.x, best.pose.y - alternative.y) > config.mcl.outlierThreshold) {
+            best.mirrored = true;
+        }
+    }
     return best;
 }
 
@@ -494,7 +653,13 @@ bool relocalizationWallDirectAccepted(const RelocalizationSummary& summary,
     // residual can still be zero and the pose can be catastrophically wrong.
     // Require a third agreeing sensor before committing; otherwise the caller
     // falls back to odometry or to the broader MCL path when enough sensors are
-    // available.
+    // available. This counts sensors, NOT per-axis redundancy: an axis seen by
+    // one wall-facing sensor stays exactly determined. At heading 0 the back ray
+    // is the only Y constraint (front at -34 deg is Unknown and ends on an X
+    // wall), so an occluder in the back ray shifts Y by the reading error at ~0
+    // residual and still commits; neither this guard nor the MCL path can see
+    // it. Requiring two sensors per axis would disable relocalization at the
+    // configured start with this sensor geometry.
     return summary.activeSensors >= kDirectWallCommitMinSensors &&
            summary.scoredSensors >= kDirectWallCommitMinSensors;
 }
@@ -504,14 +669,12 @@ const char* relocalizationStatus(const lemlib::localization::MCLMeasurement& mea
     if (!measurement.valid) return "no_valid_pose";
     if (measurement.activeSensors < kRelocalizeMinSensors) return "not_enough_live_sensors";
     if (measurement.activeSensors < kRelocalizeCommitMinSensors) return "not_enough_commit_sensors";
+    // Strong before weak: the weak gate trades a lower confidence floor for
+    // TIGHTER variance limits, so most strong solves also pass it.
+    if (relocalizationAccepted(measurement, config)) return "accepted";
     if (relocalizationWeakAccepted(measurement, config)) return "weak_accept";
     if (measurement.confidence < kRelocalizeMinConfidence) return "low_confidence";
-    if (measurement.covariance.m[0][0] > config.fusion.maxVarXY ||
-        measurement.covariance.m[1][1] > config.fusion.maxVarXY ||
-        measurement.covariance.m[2][2] > config.fusion.maxVarTheta) {
-        return "high_variance";
-    }
-    return "accepted";
+    return "high_variance";
 }
 
 bool relocalizationMeasurementBetter(const lemlib::localization::MCLMeasurement& lhs,
@@ -589,7 +752,7 @@ RelocalizationCandidate evaluateRelocalizationHeading(const lemlib::localization
 
     lemlib::localization::MCL relocalizer;
     relocalizer.configure(config.field, candidateConfig, config.sensors);
-    relocalizer.reset(lemlib::Pose(0.0f, 0.0f, candidate.seedHeading));
+    relocalizer.reset(lemlib::Pose(0.0f, 0.0f, candidate.seedHeading), false);
 
     for (int i = 0; i < kRelocalizeIterationsPerHypothesis && pros::millis() < deadlineMs; ++i) {
         const auto measurement = relocalizer.update(observations);
@@ -619,7 +782,10 @@ RelocalizationCandidate evaluateRelocalizationPoseSeed(const lemlib::localizatio
 
     lemlib::localization::MCL relocalizer;
     relocalizer.configure(config.field, baseConfig, config.sensors);
-    relocalizer.reset(seedPose);
+    // Pre-sweep seeding (no margin clamp of failed local draws): the clamp changes the
+    // RNG stream and so the wall-seeded estimate, and in host replay it committed
+    // 1.4-3.1" off where the pre-sweep seeding fell back or committed closer.
+    relocalizer.reset(seedPose, false);
 
     for (int i = 0; i < kRelocalizeIterationsPerHypothesis && pros::millis() < deadlineMs; ++i) {
         const auto measurement = relocalizer.update(observations);
@@ -733,7 +899,8 @@ void applyRelocalizedPose(const lemlib::Pose& pose) {
 RelocalizationSummary performGlobalRelocalization() {
     RelocalizationSummary summary {};
     summary.attempted = true;
-    summary.distances = captureStableDistances();
+    std::array<int, 4> readingConfidence {};
+    summary.distances = captureStableDistances(readingConfidence);
     summary.headingMode = "heading_search";
     summary.pose = chassis.getPose(true);
     summary.imuHeading = currentHeadingRadians();
@@ -753,6 +920,16 @@ RelocalizationSummary performGlobalRelocalization() {
         summary.status = "not_enough_live_sensors";
         return summary;
     }
+    // A range whose median-slot reading fails its confidence gate (the sensor
+    // counts as usable on its strongest sample), or that is the mean of two
+    // disagreeing samples, is not trusted. Fail closed rather than drop the
+    // sensor: a solve without it can commit a pose the full view would not.
+    // Below three usable sensors nothing can commit, so the status stays as is.
+    if (usableSnapshots >= kRelocalizeCommitMinSensors &&
+        usableRangeHasLowReadingConfidence(relocalizeLocConfig, summary.distances, readingConfidence)) {
+        summary.status = "low_reading_confidence";
+        return summary;
+    }
 
     // Solve the walls once, at the trusted field-frame heading. Heading is never
     // taken from the walls: on a near-square field a 90/180 deg-rotated alias can
@@ -761,13 +938,15 @@ RelocalizationSummary performGlobalRelocalization() {
     // window (+-30 deg) of error while the residual gates stay quiet (close-wall
     // starts shrink residuals faster than heading error grows). Solving at the
     // IMU/odom heading keeps the ray model exact for off-cardinal placements and
-    // removes the alias trap entirely; X/Y still comes from the walls.
+    // keeps heading aliases out of the direct solve; X/Y still comes from the
+    // walls. The MCL fallback below enforces the same contract at commit time.
     const DirectWallSolveCandidate bestWallSolve =
         solveDirectWallPose(relocalizeLocConfig, summary.distances, summary.imuHeading, priorPose);
+    const bool wallSolveVetoed = bestWallSolve.valid && (bestWallSolve.assignmentRejected || bestWallSolve.mirrored);
     std::array<DirectWallSolveCandidate, 1> wallCandidates {bestWallSolve};
     const int wallCandidateCount = bestWallSolve.valid ? 1 : 0;
 
-    if (bestWallSolve.valid) {
+    if (bestWallSolve.valid && !wallSolveVetoed) {
         summary.headingMode = "wall_direct";
         summary.pose = bestWallSolve.pose;
         const PoseResidualSummary residuals = scorePoseResiduals(relocalizeLocConfig, summary.distances, summary.pose);
@@ -801,7 +980,29 @@ RelocalizationSummary performGlobalRelocalization() {
     }
 
     if (usableSnapshots < kRelocalizeCommitMinSensors) {
+        // Only a vetoed direct pick reaches here with a valid solve; the pose stays
+        // the prior because the vetoed pick may be an alias.
+        if (bestWallSolve.valid) summary.headingMode = "wall_direct";
         summary.status = "not_enough_commit_sensors";
+        return summary;
+    }
+
+    if (wallSolveVetoed || (bestWallSolve.valid && bestWallSolve.consistentAlternative)) {
+        // The direct pick leans on a ray that really ends on another wall, a
+        // corner, or the obstacle, or another solve also explains the ranges, so
+        // the view leaves an axis ambiguous. Fail closed to the fixed start rather
+        // than commit it or seed the MCL search at a possible alias.
+        summary.headingMode = "wall_direct";
+        summary.status = "wall_assignment_ambiguous";
+        summary.pose = priorPose;
+        summary.confidence = 0.0f;
+        summary.varX = 0.0f;
+        summary.varY = 0.0f;
+        summary.varTheta = 0.0f;
+        summary.meanResidual = 0.0f;
+        summary.maxResidual = 0.0f;
+        summary.activeSensors = 0;
+        summary.scoredSensors = 0;
         return summary;
     }
 
@@ -810,8 +1011,8 @@ RelocalizationSummary performGlobalRelocalization() {
     // Cross-hypothesis selection that layers the IMU heading prior on top of the
     // residual/confidence ordering: among two plausible candidates, prefer the
     // one whose heading agrees with the IMU when they disagree with it by
-    // meaningfully different amounts. Breaks square-field 90/180 deg aliasing
-    // without overriding a clearly-better (residual-accepted) solve.
+    // meaningfully different amounts. This only ranks hypotheses; the commit
+    // gate at the end is what keeps a 90/180 deg alias from being committed.
     const float imuHeadingForPrior = summary.imuHeading;
     auto candidateBetterWithHeadingPrior = [&](const RelocalizationCandidate& lhs,
                                                const RelocalizationCandidate& rhs) -> bool {
@@ -901,6 +1102,19 @@ RelocalizationSummary performGlobalRelocalization() {
 
     summary.pose = bestCandidate.measurement.pose;
     summary.pose.theta = wrapRadians(bestCandidate.measurement.pose.theta);
+    const PoseResidualSummary candidateResiduals =
+        scorePoseResiduals(relocalizeWallConfig, summary.distances, summary.pose);
+    // Same contract as wall_direct: ranges solve X/Y, never heading. Three rays
+    // and a free heading are exactly determined, so a far-heading alias can pass
+    // every confidence/variance/residual gate, and fusion never revisits a
+    // committed heading. Reject a candidate outside the prior's window; commit
+    // the rest AT the prior heading. X/Y must pass the residual gates both at the
+    // candidate's own estimate and at the committed pose (where its inlier rays
+    // must also really observe both axes), so the pin can only reject: MCL never
+    // evaluated its X/Y at the pinned heading.
+    const bool headingAgrees =
+        std::fabs(wrapRadians(summary.pose.theta - summary.imuHeading)) <= kRelocalizeHeadingTiebreakRad;
+    if (headingAgrees) summary.pose.theta = summary.imuHeading;
     const PoseResidualSummary residuals = scorePoseResiduals(relocalizeWallConfig, summary.distances, summary.pose);
     summary.confidence = bestCandidate.measurement.confidence;
     summary.varX = bestCandidate.measurement.covariance.m[0][0];
@@ -915,12 +1129,33 @@ RelocalizationSummary performGlobalRelocalization() {
     const bool residualAccepted = residualsAccepted(residuals, kRelocalizeCommitMinSensors);
     const bool robustOutlierAccepted =
         relocalizationRobustOutlierAccepted(bestCandidate.measurement, residuals, relocalizeWallConfig);
-    summary.success = (filterAccepted && residualAccepted) || robustOutlierAccepted;
-    summary.status = robustOutlierAccepted
-                         ? "robust_outlier_accept"
-                         : (filterAccepted && !residualAccepted
-                                ? "bad_residual"
-                                : relocalizationStatus(bestCandidate.measurement, relocalizeWallConfig));
+    const bool candidateResidualAccepted = residualsAccepted(candidateResiduals, kRelocalizeCommitMinSensors);
+    const bool candidateEvidenceAccepted =
+        (filterAccepted && candidateResidualAccepted) ||
+        relocalizationRobustOutlierAccepted(bestCandidate.measurement, candidateResiduals, relocalizeWallConfig);
+    // Labels follow the committed-pose evidence, which is what the log records.
+    const bool normalAccepted = filterAccepted && residualAccepted;
+    const bool committedEvidenceAccepted = normalAccepted || robustOutlierAccepted;
+    const bool evidenceAccepted = candidateEvidenceAccepted && committedEvidenceAccepted;
+    const bool bothAxesObserved =
+        headingAgrees && inlierRaysObserveBothAxes(relocalizeWallConfig, summary.distances, summary.pose);
+    summary.success = evidenceAccepted && headingAgrees && bothAxesObserved;
+    if (!committedEvidenceAccepted) {
+        summary.status = filterAccepted ? "bad_residual"
+                                        : relocalizationStatus(bestCandidate.measurement, relocalizeWallConfig);
+    } else if (!candidateEvidenceAccepted) {
+        // The logged residuals (scored at the pinned pose) pass; this rejection
+        // came from MCL's own unpinned estimate.
+        summary.status = "candidate_bad_residual";
+    } else if (!headingAgrees) {
+        summary.status = "heading_disagree";
+    } else if (!bothAxesObserved) {
+        summary.status = "axis_unobserved";
+    } else {
+        // The robust label only when the normal filter+residual path rejected it.
+        summary.status = normalAccepted ? relocalizationStatus(bestCandidate.measurement, relocalizeWallConfig)
+                                        : "robust_outlier_accept";
+    }
     return summary;
 }
 
@@ -947,7 +1182,8 @@ bool beginAutonomousWithRelocalizationOrFixedStart(const lemlib::Pose& fixedStar
     ensureLocalizationRunning();
     // Robot must be stationary here: performGlobalRelocalization median-combines
     // several distance snapshots. A trustworthy wall_direct solve is near-instant
-    // when three agreeing wall-facing sensors are in view; a worst-case MCL seed
+    // when at least three wall-facing sensors are inliers (per-axis redundancy is
+    // not guaranteed; see relocalizationWallDirectAccepted); a worst-case MCL seed
     // search can take up to kRelocalizeTimeoutMs before it falls back.
     const RelocalizationSummary result = performGlobalRelocalization();
     if (summary != nullptr) *summary = result;

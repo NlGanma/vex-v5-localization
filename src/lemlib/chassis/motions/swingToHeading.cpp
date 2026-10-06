@@ -28,7 +28,8 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
     float deltaTheta;
     float motorPower;
     float prevMotorPower = 0;
-    float startTheta = getPose().theta;
+    float prevTheta = getPose().theta;
+    float traveled = 0;
     bool settling = false;
     std::optional<float> prevRawDeltaTheta = std::nullopt;
     std::optional<float> prevDeltaTheta = std::nullopt;
@@ -47,8 +48,12 @@ void lemlib::Chassis::swingToHeading(float theta, DriveSide lockedSide, int time
         Pose pose = getPose();
         pose.theta = fmod(pose.theta, 360);
 
-        // update completion vars
-        distTraveled.store(fabs(angleError(pose.theta, startTheta, false)));
+        // update completion vars: accumulate per-tick heading change, since the
+        // net angle from the start wraps at 180 and would count back down on a
+        // forced long-way turn
+        traveled += fabs(angleError(pose.theta, prevTheta, false));
+        prevTheta = pose.theta;
+        distTraveled.store(traveled);
         targetTheta = theta;
 
         // check if settling

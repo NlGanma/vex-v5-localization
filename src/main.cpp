@@ -2,6 +2,7 @@
 
 #include "app_config.hpp"
 #include "lemlib/api.hpp" // IWYU pragma: keep
+#include "lemlib/logger/stdout.hpp"
 #include "localization_config.hpp"
 #include "localization_tune.hpp"
 #include "robot_control.hpp"
@@ -38,6 +39,15 @@ void initialize() {
         rightDriveMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_BRAKE);
         return;
     }
+
+    // Construct the lazy logger singletons here: PROS never deletes the
+    // initialize task, and no LemLib/tune task exists yet. A first construction
+    // inside a competition task deleted mid-constructor would leave the
+    // single-thread libstdc++ static guard "in progress", so the next call would
+    // throw recursive_init_error and terminate the program.
+    (void)lemlib::bufferedStdout();
+    (void)lemlib::infoSink();
+    (void)lemlib::telemetrySink();
 
     localization_tune::setState("Init", "Starting up", true);
     initializeRobotControlState();

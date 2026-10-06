@@ -248,13 +248,18 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
     float curvature;
     float targetVel;
     const int finalPoint = static_cast<int>(pathPoints.size()) - 1;
-    const float endTolerance = std::max(1.0f, lookahead * 0.5f);
+    // the authored end of the path is the first point of the terminal zero-velocity run: path.jerryio
+    // exports repeat the end point and append a zero-velocity lookahead extension (~20 in) after it
+    int endPoint = finalPoint;
+    if (pathPoints.at(finalPoint).theta <= 0.0f) {
+        while (endPoint > 0 && pathPoints.at(endPoint - 1).theta <= 0.0f) --endPoint;
+    }
     int closestPoint;
     float prevVel = 0;
     int compState = pros::competition::get_status();
     distTraveled.store(0.0f);
 
-    // loop until the robot is within the end tolerance
+    // loop until the robot reaches the end of the path
     for (int i = 0; i < timeout / 10 && pros::competition::get_status() == compState && this->motionContinues(motionGen); i++) {
         // get the current position of the robot
         pose = this->getPose(true);
@@ -267,8 +272,9 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
         // find the closest point on the path to the robot
         closestPoint = findClosest(pose, pathPoints);
         if (closestPoint < 0) break;
-        // stop only once we are actually at the end of the path
-        if (closestPoint >= finalPoint || pose.distance(pathPoints.back()) <= endTolerance) break;
+        // stop only once the closest point reaches the authored end of the path; a distance radius
+        // around the last point ignores progress, so an out-and-back path ending inside it never moves
+        if (closestPoint >= endPoint) break;
 
         // find the lookahead point
         lookaheadPose = lookaheadPoint(lastLookahead, pose, pathPoints, closestPoint, lookahead);
@@ -280,7 +286,7 @@ void lemlib::Chassis::follow(const asset& path, float lookahead, int timeout, bo
 
         // get the target velocity of the robot
         targetVel = pathPoints.at(closestPoint).theta;
-        if (targetVel <= 0.0f && pose.distance(pathPoints.back()) > endTolerance) {
+        if (targetVel <= 0.0f) {
             bool foundFutureSpeed = false;
             for (int idx = closestPoint + 1; idx <= finalPoint; ++idx) {
                 if (pathPoints.at(idx).theta <= 0.0f) continue;

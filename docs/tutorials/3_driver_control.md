@@ -84,7 +84,7 @@ This section is optional and is not needed to control the robot
 ```
 
 When we combine throttle and steering inputs, we can sometimes get a value over the motors' max voltage. 
-For example, if the steering input and throttle input are both maxed out at 127, then the power supplied to the left drive will be 0, and the right drive will get 254, which will be rounded down to 127. 
+For example, if the steering input and throttle input are both maxed out at 127, then the power supplied to the left drive will be 254, which will be rounded down to 127, and the right drive will get 0. 
 This means the drive won't move forward at full speed, nor will it turn at full speed. 
 This can be undesired behavior, as you may want steering to be consistent, no matter what throttle you provide.
 

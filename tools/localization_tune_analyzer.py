@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -126,8 +127,9 @@ def median(values: Iterable[float]) -> float | None:
 def downsample(values: list[dict[str, float | int]], limit: int) -> list[dict[str, float | int]]:
     if len(values) <= limit:
         return values
-    step = max(1, len(values) // limit)
-    return values[::step][:limit]
+    # exactly `limit` evenly spaced rows; a prefix slice would drop whole later traces
+    count = len(values)
+    return [values[(k * count) // limit] for k in range(limit)]
 
 
 def parse_number(value: str) -> float | int | str:
@@ -145,7 +147,9 @@ def parse_number(value: str) -> float | int | str:
 
 
 def parse_trace(path: Path) -> tuple[FieldConfig | None, OdomModel | None, dict[int, SensorModel], list[dict[str, float | int]]]:
-    text = path.read_text(encoding="utf-8")
+    # A corrupted capture byte decodes to U+FFFD, and a NUL (which the csv module rejects outright
+    # before Python 3.11) is mapped to it too, so either leaves a str cell the row checks skip.
+    text = path.read_text(encoding="utf-8", errors="replace")
     if TRACE_MARKER in text:
         text = text.split(TRACE_MARKER, 1)[1]
     if END_MARKER in text:
@@ -154,7 +158,8 @@ def parse_trace(path: Path) -> tuple[FieldConfig | None, OdomModel | None, dict[
     comment_lines: list[str] = []
     csv_lines: list[str] = []
     for raw_line in text.splitlines():
-        line = raw_line.strip()
+        # deleting the NUL instead could turn a corrupted cell into a wrong but valid number
+        line = raw_line.replace("\0", "\ufffd").strip()
         if not line:
             continue
         if line.startswith("#"):
@@ -162,8 +167,14 @@ def parse_trace(path: Path) -> tuple[FieldConfig | None, OdomModel | None, dict[
         else:
             csv_lines.append(line)
 
-    if not csv_lines:
+    header_index = next((i for i, line in enumerate(csv_lines) if line.startswith("time_ms,")), None)
+    if header_index is None:
         raise ValueError("No CSV trace section found in log file")
+    # a renamed column or metadata tag, or a metadata line whose '#' was hit (it lands before the
+    # header), would silently drop that data instead of failing
+    if any("\ufffd" in line for line in csv_lines[: header_index + 1]) or any("\ufffd" in line for line in comment_lines):
+        raise ValueError(f"Corrupted CSV header or trace metadata in {path}")
+    csv_lines = csv_lines[header_index:]
 
     field: FieldConfig | None = None
     odom: OdomModel | None = None
@@ -249,10 +260,21 @@ def parse_trace(path: Path) -> tuple[FieldConfig | None, OdomModel | None, dict[
     if field is not None:
         field.obstacles = obstacles
 
-    reader = csv.DictReader(csv_lines)
+    reader = csv.DictReader(csv_lines, quoting=csv.QUOTE_NONE)
     rows: list[dict[str, float | int]] = []
+    skipped_rows = 0
     for row in reader:
-        parsed = {key: parse_number(value or "") for key, value in row.items()}
+        # A capture cut mid-stream, or another task's print with a newline spliced into a row,
+        # leaves a field count that differs from the header (DictReader restkey/restval None) or an empty field.
+        if None in row or any(value is None or value == "" for value in row.values()):
+            skipped_rows += 1
+            continue
+        parsed = {key: parse_number(value) for key, value in row.items()}
+        # every firmware trace column is numeric; text spliced into a field with no comma or
+        # newline keeps the field count but leaves a str cell
+        if any(isinstance(value, str) for value in parsed.values()):
+            skipped_rows += 1
+            continue
         parsed["_test_case_number"] = -1 if test_case_number is None else test_case_number
         parsed["_relocalize_success"] = 1 if relocalize_success else 0
         trusted_relocalize = (
@@ -277,6 +299,8 @@ def parse_trace(path: Path) -> tuple[FieldConfig | None, OdomModel | None, dict[
             parsed["stationary_heading_offset_deg"] = 0.0
         rows.append(parsed)
 
+    if skipped_rows:
+        print(f"warning: skipped {skipped_rows} malformed trace row(s) in {path}", file=sys.stderr)
     return field, odom, sensors, rows
 
 
@@ -364,6 +388,27 @@ def local_delta_from_poses(prev_pose: Pose, next_pose: Pose) -> tuple[float, flo
     return local_x, local_y, delta_theta
 
 
+def row_filter_in_sync(row: dict[str, float | int]) -> bool:
+    # odom_local_*, odom_delta_theta_deg and the ekf_*/odom_only_* poses are as of the last
+    # odom delta the localization loop consumed; odom_seq, odom_tel_* and odom_*/applied_*
+    # come from its later odom snapshot. When odom ticked in between, the row mixes two odom
+    # steps (no filter-seq column exists). In sync, the logged delta and the snapshot
+    # telemetry are the same floats: identical %.4f heading, and the odom.cpp arc model
+    # rebuilds odom_local_* from telemetry to within %.4f rounding (~1e-4 in).
+    if float(row["odom_delta_theta_deg"]) != float(row["odom_delta_heading_deg"]):
+        return False
+    delta_theta = math.radians(float(row["odom_delta_heading_deg"]))
+    raw_horizontal = float(row["odom_selected_delta_horizontal"])
+    raw_vertical = float(row["odom_selected_delta_vertical"])
+    if abs(delta_theta) < 1e-6:
+        model_x, model_y = raw_horizontal, raw_vertical
+    else:
+        turn_factor = 2.0 * math.sin(delta_theta / 2.0)
+        model_x = turn_factor * (raw_horizontal / delta_theta + float(row["odom_selected_horizontal_offset"]))
+        model_y = turn_factor * (raw_vertical / delta_theta + float(row["odom_selected_vertical_offset"]))
+    return abs(model_x - float(row["odom_local_x"])) < 5e-4 and abs(model_y - float(row["odom_local_y"])) < 5e-4
+
+
 def pair_is_reliable(prev_row: dict[str, float | int], row: dict[str, float | int]) -> bool:
     if int(row["odom_seq"]) != int(prev_row["odom_seq"]) + 1:
         return False
@@ -387,6 +432,12 @@ def build_odom_pairs(rows: list[dict[str, float | int]], pose_source: str) -> li
         if int(prev_row.get("_trace_index", 0)) != int(row.get("_trace_index", 0)):
             continue
         if not pair_is_reliable(prev_row, row):
+            continue
+        # odom_delta_theta_deg (current row) is filter-side for every source; the ekf and
+        # odom_only reference poses are filter-side on both rows. 'applied' is snapshot-side.
+        if not row_filter_in_sync(row):
+            continue
+        if pose_source != "applied" and not row_filter_in_sync(prev_row):
             continue
         prev_pose = pose_from_row(prev_row, pose_source)
         current_pose = pose_from_row(row, pose_source)
@@ -957,7 +1008,9 @@ def summarize_trace_diagnostics(rows: list[dict[str, float | int]]) -> None:
 
     print("Fusion diagnostics")
     if "odom_only_x" in rows[0]:
-        separations: list[float] = []
+        parsed = 0
+        max_xy = 0.0
+        prev_boundary = False
         final_dx = final_dy = final_dtheta = 0.0
         for row in rows:
             try:
@@ -967,14 +1020,25 @@ def summarize_trace_diagnostics(rows: list[dict[str, float | int]]) -> None:
                     math.radians(float(row["applied_theta_deg"]) - float(row["odom_only_theta_deg"])),
                     2.0 * math.pi,
                 )
+                corr_x = float(row["applied_corr_x"])
+                corr_y = float(row["applied_corr_y"])
             except (KeyError, TypeError, ValueError):
                 continue
-            separations.append(math.hypot(dx, dy))
+            parsed += 1
+            boundary = int(row.get("boundary_reanchor_applied", 0)) == 1
+            # applied_* is the odom snapshot (odom_seq) while odom_only_* is the filter state
+            # (last consumed delta), so other rows can show one odom step of lag or a queued
+            # setPose reset as phantom separation. The firmware only commits a correction when
+            # the two share a seq, and only commits change the separation; an out-of-loop
+            # boundary commit lands on the flagged row or the next one.
+            if corr_x != 0.0 or corr_y != 0.0 or boundary or prev_boundary:
+                max_xy = max(max_xy, math.hypot(dx, dy))
+            prev_boundary = boundary
             final_dx, final_dy, final_dtheta = dx, dy, math.degrees(dtheta)
-        if separations:
+        if parsed:
             print(
                 f"  odom-only delta final applied-odom=({final_dx:+.3f}, {final_dy:+.3f}, {final_dtheta:+.3f} deg),"
-                f" max_xy={max(separations):.3f} in"
+                f" max_xy={max_xy:.3f} in"
             )
         else:
             print("  odom-only delta unavailable")
@@ -983,6 +1047,7 @@ def summarize_trace_diagnostics(rows: list[dict[str, float | int]]) -> None:
 
     if "correction_reject_mask" in rows[0]:
         accepted = 0
+        staged_in_motion = 0
         accepted_by_sensors: dict[int, int] = {}
         accepted_theta_sum_by_sensors: dict[int, float] = {}
         accepted_theta_max_by_sensors: dict[int, float] = {}
@@ -992,6 +1057,9 @@ def summarize_trace_diagnostics(rows: list[dict[str, float | int]]) -> None:
             mask = int(row.get("correction_reject_mask", 0))
             if int(row.get("correction_accepted", 0)) == 1:
                 accepted += 1
+                # since c1dadfb an accept during motion is staged and keeps motion_suppressed
+                if mask & (1 << 9):
+                    staged_in_motion += 1
                 active = int(row.get("active_sensors", 0))
                 accepted_by_sensors[active] = accepted_by_sensors.get(active, 0) + 1
                 try:
@@ -1002,12 +1070,14 @@ def summarize_trace_diagnostics(rows: list[dict[str, float | int]]) -> None:
                 accepted_theta_max_by_sensors[active] = max(
                     accepted_theta_max_by_sensors.get(active, 0.0), abs(applied_theta)
                 )
-            if mask:
+            elif mask:
                 mask_counts[mask] = mask_counts.get(mask, 0) + 1
                 for bit in CORRECTION_REJECT_BITS:
                     if mask & bit:
                         bit_counts[bit] = bit_counts.get(bit, 0) + 1
         print(f"  corrections accepted rows={accepted}")
+        if staged_in_motion:
+            print(f"  accepted while moving (staged for the endMotion commit) rows={staged_in_motion}")
         if accepted_by_sensors:
             counts = ", ".join(f"A{active}={count}" for active, count in sorted(accepted_by_sensors.items()))
             print(f"  accepted by live sensors: {counts}")
@@ -1186,9 +1256,10 @@ def main() -> int:
     parser.add_argument("trace", nargs="+", type=Path, help="Path(s) to localization_tune_latest.txt logs")
     parser.add_argument(
         "--pose-source",
-        choices=("applied", "ekf", "mcl", "odom_only"),
+        choices=("applied", "ekf", "odom_only"),
         default="applied",
-        help="Pose source used as the offline reference trajectory for odom diagnostics",
+        help="Pose source used as the offline reference trajectory for odom diagnostics"
+        " (mcl is not offered: mcl_* only refreshes every mcl_period_ms MCL tick, so it cannot be a per-row odom reference)",
     )
     parser.add_argument(
         "--sensor-pose-source",
@@ -1203,6 +1274,8 @@ def main() -> int:
         help="Maximum number of per-sensor measurements to evaluate during bounded offset search",
     )
     args = parser.parse_args()
+    if args.sensor_sample_limit < 1:
+        parser.error("--sensor-sample-limit must be at least 1")
 
     try:
         field, odom_model, sensors, rows = parse_traces(args.trace)

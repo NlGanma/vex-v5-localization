@@ -15,6 +15,11 @@ DATA = ROOT / "validation_data"
 TRACE_MARKER = "=== LOCALIZATION TRACE CSV ==="
 END_MARKER = "=== END LOCALIZATION TUNE LOG ==="
 MOTION_SUPPRESSED_BIT = 1 << 9
+# Filter-reset (setPose/resync) jumps of odom_only are not driven path; same gate as
+# drift_analysis.py: top drive speed ~77 ips, largest logged real step 1.08 in,
+# smallest logged reset 2.57 in.
+RESET_MIN_JUMP_IN = 2.0
+RESET_MAX_SPEED_IPS = 150.0
 REJECT_BITS = {
     1 << 0: "turn_suppressed", 1 << 1: "sensors_stale", 1 << 2: "not_enough_sensors",
     1 << 3: "unstable_candidate", 1 << 4: "pose_delta", 1 << 5: "readiness",
@@ -57,6 +62,10 @@ def parse_log(path: Path):
     m = re.search(r"^relocalize_conf=([\d.]+) active=(\d+) scored=(\d+)", text, re.M)
     if m:
         meta["reloc_conf"], meta["reloc_active"], meta["reloc_scored"] = float(m.group(1)), int(m.group(2)), int(m.group(3))
+    # committed relocalization pose at %.4f (x, y in, theta deg) from the trace header
+    m = re.search(r"^# relocalize,\d+,\d+,\w+,([-\d.]+),([-\d.]+),([-\d.]+),", text, re.M)
+    if m:
+        meta["relocalize_pose_csv"] = [float(m.group(k)) for k in (1, 2, 3)]
     m = re.search(r"Compiled:\s+(.*)$", text, re.M)
     if m:
         meta["compiled"] = m.group(1).strip()
@@ -102,7 +111,7 @@ def parse_log(path: Path):
     if fb:
         meta["field"] = [float(fb.group(k)) for k in range(1, 7)]
     fusion_caps = re.search(
-        r"^# max_var_xy=[-\d.]+,max_var_theta=[-\d.]+,max_meas_xy=[-\d.]+,"
+        r"^# max_var_xy=[-\d.]+,max_var_theta=[-\d.]+,max_meas_xy=[-\d.]+,(?:max_meas_theta_deg=[-\d.]+,)?"
         r"max_corr_xy=([-\d.]+),max_corr_theta_deg=[-\d.]+,stale_ms=\d+$",
         text, re.M,
     )
@@ -271,7 +280,7 @@ def mcl_scan_groups(rows):
 
 
 def analyze_run(name, meta, rows):
-    out = {"name": name, "meta": {k: v for k, v in meta.items() if k not in ("checkpoints", "sensor_model", "obstacles", "reloc_sensors", "field")}}
+    out = {"name": name, "meta": {k: v for k, v in meta.items() if k not in ("checkpoints", "sensor_model", "obstacles", "reloc_sensors", "field", "relocalize_pose_csv")}}
     if not rows:
         out["rows"] = 0
         return out
@@ -280,7 +289,7 @@ def analyze_run(name, meta, rows):
 
     # path length over odom_only
     path = 0.0
-    px = py = None
+    px = py = pt = None
     motion_rows = 0
     seq_gaps = []
     seq_prev = None
@@ -299,9 +308,12 @@ def analyze_run(name, meta, rows):
     for k, r in enumerate(rows):
         ox, oy = fnum(r["odom_only_x"]), fnum(r["odom_only_y"])
         ex, ey = fnum(r["ekf_x"]), fnum(r["ekf_y"])
+        tt = (fnum(r["time_ms"]) - t0) / 1000.0
         if px is not None:
-            path += math.hypot(ox - px, oy - py)
-        px, py = ox, oy
+            step = math.hypot(ox - px, oy - py)
+            if step <= max(RESET_MIN_JUMP_IN, RESET_MAX_SPEED_IPS * (tt - pt)):
+                path += step
+        px, py, pt = ox, oy, tt
         mask = int(fnum(r["correction_reject_mask"], 0))
         if mask & MOTION_SUPPRESSED_BIT:
             motion_rows += 1
@@ -353,9 +365,11 @@ def analyze_run(name, meta, rows):
     nis_vals = []
     for _, r in scans:
         mask = int(fnum(r["correction_reject_mask"], 0))
-        for bit, bname in REJECT_BITS.items():
-            if mask & bit:
-                mask_hist[bname] = mask_hist.get(bname, 0) + 1
+        # an accepted scan staged during motion keeps motion_suppressed (c1dadfb); not a rejection
+        if r.get("correction_accepted") != "1":
+            for bit, bname in REJECT_BITS.items():
+                if mask & bit:
+                    mask_hist[bname] = mask_hist.get(bname, 0) + 1
         nis = fnum(r["last_nis"])
         if nis >= 0 and r.get("mcl_valid") == "1":
             nis_vals.append(nis)
@@ -451,6 +465,8 @@ def main():
         print(f"  reloc: status={m.get('relocalize_status')} pose={m.get('relocalize_pose')} "
               f"conf={m.get('reloc_conf')} active={m.get('reloc_active')} scored={m.get('reloc_scored')} "
               f"imu={m.get('imu_heading_deg')}")
+        if "max_corr_xy" not in m:
+            print("  note: max_corr_xy not in trace metadata; cap check uses the 0.015 default")
         if res.get("rows", 0) == 0:
             print("  (no trace rows)")
             continue
@@ -486,18 +502,17 @@ def main():
             sens = meta.get("reloc_sensors", {})
             if field and smodel and sens:
                 sensors = [smodel[i] for i in range(4)]
-                imu = math.radians(meta.get("imu_heading_deg", 0.0))
-                # mirror the post-June-11 firmware: a SINGLE solve at the logged
-                # field-frame IMU heading, never snapped to cardinals (the old
-                # cardinal enumeration quantized the heading and inflated the
-                # reproduction error; imu_heading_deg is logged at %.1f, which
-                # bounds the residual reproduction error instead)
-                sol = solve_wall(field, sensors, sens, imu)
+                # Walls never steer heading, so the committed theta IS the solve heading in
+                # both firmware generations (the May logs here committed a snapped cardinal;
+                # post-June-11 firmware commits the field-frame IMU heading). Solve there and
+                # compare against the %.4f CSV pose; the residual is then bounded by the %.1f
+                # logging of the relocalize_sensors distances.
+                want = meta.get("relocalize_pose_csv") or [float(x) for x in m["relocalize_pose"].split()]
+                sol = solve_wall(field, sensors, sens, math.radians(want[2]))
                 if sol is not None:
-                    want = [float(x) for x in m["relocalize_pose"].split()]
                     res["wall_repro_err"] = round(math.hypot(sol[0] - want[0], sol[1] - want[1]), 4)
                     print(f"  wall-solve repro: ({sol[0]:.2f},{sol[1]:.2f}) used={sol[3]} "
-                          f"vs logged ({want[0]:.1f},{want[1]:.1f}) "
+                          f"vs logged ({want[0]:.2f},{want[1]:.2f}) "
                           f"d=({sol[0]-want[0]:+.2f},{sol[1]-want[1]:+.2f})")
 
     out = ROOT / "tools" / "audit_metrics.json"

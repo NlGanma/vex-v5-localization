@@ -151,13 +151,18 @@ void init();
 
 namespace detail {
 /**
- * @brief Internal pose setter used by the localization task.
+ * @brief Unchecked internal pose setter (currently no callers; the localization
+ * paths use setPoseSilentIfSeq).
  *
  * This updates odom state without resynchronizing the localization filters.
  */
 void setPoseSilent(Pose pose, bool radians = false);
 /**
- * @brief Seq-guarded silent pose setter used by the localization task.
+ * @brief Seq-guarded silent pose setter. Callers: the localization task (with
+ * abortIf = isMotionCorrectionSuppressed) and Chassis::endMotion's staged
+ * boundary commit via applyStagedBoundaryReanchor (no abortIf: suppression is
+ * intentionally still active there, so never make the predicate mandatory or
+ * the default).
  *
  * Writes the corrected pose only if the published odom sequence still equals
  * expectedSeq, holding the odom update lock (same order as the tracking task)

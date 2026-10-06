@@ -21,10 +21,12 @@ void opcontrol() {
     // Recover the motion semaphore if the autonomous task died while holding it
     // (skipped autonomous->driver transitions bypass disabled()).
     chassis.recoverInterruptedMotion();
-    // cancelAllMotions arms the boundary re-anchor one-shot, but in teleop no
-    // motion ever suppresses corrections, so it would stay armed and commit a
-    // bounded pose step while the driver is moving; the one-shot is documented
-    // as between-motions-while-stopped only, so drop it.
+    // The boundary re-anchor one-shot is between-motions-while-stopped only. In
+    // teleop no driver motion re-suppresses corrections, so an armed request
+    // would commit a bounded pose step while the driver is moving. Drop any
+    // request left from autonomous here, and again after every 8-motor engage:
+    // its creep is a chassis motion (drivePulse) whose endMotion re-arms it, and
+    // any legal stopped commit has already had its window by then.
     lemlib::localization::clearBoundaryReanchor();
 
     if (kSmokeTestMode) {
@@ -54,14 +56,23 @@ void opcontrol() {
     stopAutonomousManipulatorControl();
     setAllMotorBrakeModes();
     switchToEightMotorDrive();
+    lemlib::localization::clearBoundaryReanchor();
     // Start teleop in a known retracted state. Using toggleMiddleGoal() here made
     // the starting position depend on the prior path into opcontrol (it only
     // lands "down" if it happened to be "up" coming in).
     middleGoalDown();
-    controller.clear_line(1);
-    controller.clear_line(2);
 
-    std::uint32_t nextControllerDisplayUpdate = 0;
+    // VEXos drops controller text writes closer than 10 ms (wired) / 50 ms
+    // (VEXnet) apart, so issue one write per slot: blank lines 1 and 2 once, then
+    // alternate the pose and status lines (each still refreshes every 200 ms).
+    // A rejected write is retried in the next slot. Blanks use set_text, not
+    // clear_line: clear_line returns VEXos's raw result (0 when rate-rejected,
+    // not PROS_ERR), so a dropped clear would be indistinguishable from success.
+    constexpr std::uint32_t kControllerTextSlotMs = 100;
+    constexpr char kBlankControllerLine[] = "                   "; // full 19-column line
+    static_assert(sizeof(kBlankControllerLine) - 1 == 19);
+    std::uint32_t nextControllerDisplayUpdate = pros::millis() + kControllerTextSlotMs;
+    int controllerTextStep = 0; // 0: blank line 1, 1: blank line 2, then 2 (pose) / 3 (CTL)
     bool upPressedLastCycle = false;
     bool r1PressedLastCycle = false;
     bool r2PressedLastCycle = false;
@@ -72,18 +83,29 @@ void opcontrol() {
         localization_tune::setDriverDriveLoopTicking(true);
 
         if (pros::millis() >= nextControllerDisplayUpdate) {
-            const lemlib::Pose currentPose = chassis.getPose();
-            const int controllerConnected = pros::c::controller_is_connected(pros::E_CONTROLLER_MASTER);
-            controller.print(0, 0, "X%3.0f Y%3.0f T%3.0f",
-                             static_cast<double>(currentPose.x),
-                             static_cast<double>(currentPose.y),
-                             static_cast<double>(currentPose.theta));
-            controller.print(1, 0, "CTL %d", controllerConnected);
-            nextControllerDisplayUpdate = pros::millis() + 200;
+            std::int32_t written = PROS_ERR;
+            if (controllerTextStep == 0) {
+                written = controller.set_text(1, 0, kBlankControllerLine);
+            } else if (controllerTextStep == 1) {
+                written = controller.set_text(2, 0, kBlankControllerLine);
+            } else if (controllerTextStep == 2) {
+                const lemlib::Pose currentPose = chassis.getPose();
+                written = controller.print(0, 0, "X%3.0f Y%3.0f T%3.0f",
+                                           static_cast<double>(currentPose.x),
+                                           static_cast<double>(currentPose.y),
+                                           static_cast<double>(currentPose.theta));
+            } else {
+                const int controllerConnected = pros::c::controller_is_connected(pros::E_CONTROLLER_MASTER);
+                written = controller.print(1, 0, "CTL %d", controllerConnected);
+            }
+            if (written != PROS_ERR) controllerTextStep = controllerTextStep < 3 ? controllerTextStep + 1 : 2;
+            nextControllerDisplayUpdate = pros::millis() + kControllerTextSlotMs;
         }
 
-        if (pros::c::controller_get_digital_new_press(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_X))
+        if (pros::c::controller_get_digital_new_press(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_X)) {
             switchToEightMotorDrive();
+            lemlib::localization::clearBoundaryReanchor();
+        }
         if (pros::c::controller_get_digital_new_press(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_Y))
             toggleLoadingMechanism();
         if (pros::c::controller_get_digital_new_press(pros::E_CONTROLLER_MASTER, pros::E_CONTROLLER_DIGITAL_L2))
@@ -115,6 +137,7 @@ void opcontrol() {
 
         if (autoReturnToEightMotorDrivePending && !effectiveL1Pressed && !r1Pressed && !r2Pressed) {
             requestSwitchToEightMotorDrive();
+            lemlib::localization::clearBoundaryReanchor();
             autoReturnToEightMotorDrivePending = !chassis.isPtoEngaged();
         }
 

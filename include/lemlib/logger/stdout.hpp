@@ -31,4 +31,13 @@ class BufferedStdout : public Buffer {
  *
  */
 BufferedStdout& bufferedStdout();
+
+/**
+ * @brief Lock that every task must hold while writing to stdout.
+ *
+ * The firmware libc's FILE locks are no-op stubs, so two tasks writing stdout at once can corrupt the shared stdout
+ * buffer. Never take it from a PROS competition task: PROS deletes those on mode changes without releasing held
+ * mutexes.
+ */
+pros::Mutex& stdoutWriteMutex();
 } // namespace lemlib

@@ -42,17 +42,18 @@ void Chassis::arcade(int throttle, int turn, bool disableDriveCurve, float desat
 }
 
 void Chassis::curvature(int throttle, int turn, bool disableDriveCurve) {
-    // If we're not moving forwards change to arcade drive
-    if (throttle == 0) {
+    // If we're not moving forwards change to arcade drive. Test the curved throttle: stick drift inside the
+    // throttle deadband curves to 0, which would also zero the |throttle|-scaled turn below. arcade() gets the
+    // raw inputs so it applies its own (rounded) curves exactly once.
+    const int curvedThrottle = disableDriveCurve ? throttle : static_cast<int>(throttleCurve->curve(throttle));
+    if (curvedThrottle == 0) {
         arcade(throttle, turn, disableDriveCurve);
         return;
     }
 
     // use drive curves if they have not been disabled
-    if (!disableDriveCurve) {
-        throttle = throttleCurve->curve(throttle);
-        turn = steerCurve->curve(turn);
-    }
+    throttle = curvedThrottle;
+    if (!disableDriveCurve) turn = steerCurve->curve(turn);
 
     float leftPower = throttle + (std::fabs(throttle) * turn / 127.0);
     float rightPower = throttle - (std::fabs(throttle) * turn / 127.0);

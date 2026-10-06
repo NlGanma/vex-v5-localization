@@ -32,6 +32,10 @@ bool prepareAutonomousStart(autonomous_localization::StartRelativeChassis* local
     stopReleasedPtoControls();
     setAllMotorBrakeModes();
     stopChassisMotion();
+    // A direct driver->autonomous switch bypasses disabled(), and PROS may have
+    // killed opcontrol mid-motion (e.g. the 8-motor engage drivePulse). Recover
+    // before the shift so the shift window does not time out on a dead owner.
+    chassis.recoverInterruptedMotion();
     switchToFourMotorDrive();
     loadingMechanismDown();
     middleGoalUp();
@@ -121,7 +125,7 @@ void autonomous() {
     // ::chassis.follow(my_path_txt, 12.0f, 3000, true, false);           // Path assets stay in their authored absolute frame.
 
     // Chassis motion flow helpers:
-    // chassis.waitUntil(10.0f);                                          // Wait until the current motion is within 10 in/deg.
+    // chassis.waitUntil(10.0f);                                          // Wait until the current motion has traveled 10 in (moves) or turned 10 deg (turns/swings) since it started; returns early if it ends first.
     // chassis.waitUntilDone();                                           // Wait until the current motion fully completes.
     // chassis.cancelMotion();                                            // Cancel only the current active motion.
     // chassis.cancelAllMotions();                                        // Cancel the current motion and anything queued.

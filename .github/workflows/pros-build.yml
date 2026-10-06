@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Build template
+      - name: Build firmware and template
         id: build
         run: |
           set -euo pipefail
@@ -39,6 +39,7 @@ jobs:
               make clean -j
               sed -i "s/^VERSION:=.*$/VERSION:=${version}+${sha}/" Makefile
               make template -j
+              make quick -j
               rm -rf template
               unzip -o "${name}.zip" -d template
               printf "%s\n" "${name}" > .pros-template-name

@@ -67,7 +67,16 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
         // check if the robot is close enough to the target to start settling
         if (distTarget < 7.5 && close == false) {
             close = true;
-            params.maxSpeed = fmax(fabs(prevLateralOut), 60);
+            // the latch only lowers the cap for settling; never raise it above the caller's maxSpeed
+            params.maxSpeed = std::fmin(params.maxSpeed, std::fmax(std::fabs(prevLateralOut), 60.0f));
+            // the exits so far tracked the moving carrot (its bearing and distance), so a latch
+            // from the approach would skip the final-heading check; judge settling on the
+            // final-pose errors only
+            lateralLargeExit.reset();
+            lateralSmallExit.reset();
+            angularLargeExit.reset();
+            angularSmallExit.reset();
+            lateralSettled = false;
         }
 
         // check if the lateral controller has settled
@@ -78,16 +87,21 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
         if (close) carrot = target; // settling behavior
 
         // motion chaining: exit when the robot itself crosses the half-plane
-        // earlyExitRange before the target, mirroring moveToPoint's crossing
-        // check. The old robot-vs-carrot sameSide comparison broke at the close
-        // latch: teleporting the carrot to the target flipped carrotSide there,
-        // firing the exit at the fixed 7.5" latch instead of at earlyExitRange.
+        // earlyExitRange before the target (robotSide true = on/past it). The
+        // old robot-vs-carrot sameSide comparison broke at the close latch:
+        // teleporting the carrot to the target flipped carrotSide there, firing
+        // the exit at the fixed 7.5" latch instead of at earlyExitRange.
+        // Unlike moveToPoint, the plane normal is the commanded final heading,
+        // not the start->target bearing, so the robot can start on or past the
+        // plane and the boomerang carrot then pulls it back behind. Only an
+        // approach crossing (behind -> past) near the target counts; the gate
+        // still lets a larger earlyExitRange exit before the 7.5" latch.
         const bool robotSide =
             (pose.y - target.y) * -sin(target.theta) <= (pose.x - target.x) * cos(target.theta) + params.earlyExitRange;
         if (prevRobotSide == std::nullopt) prevRobotSide = robotSide;
-        // Exit on the configured crossing. This may intentionally occur before
-        // the fixed 7.5-inch settling latch when earlyExitRange is larger.
-        if (robotSide != prevRobotSide && params.minSpeed != 0) break;
+        if (params.minSpeed != 0 && !*prevRobotSide && robotSide &&
+            distTarget < std::max(7.5f, params.earlyExitRange + 7.5f))
+            break;
         prevRobotSide = robotSide;
 
         // calculate error
@@ -136,10 +150,13 @@ void lemlib::Chassis::moveToPose(float x, float y, float theta, int timeout, Mov
         if (!close) lateralOut = slew(lateralOut, prevLateralOut, lateralSettings.slew);
 
         // constrain lateral output by the max speed it can travel at without
-        // slipping
-        const float radius = 1 / fabs(getCurvature(pose, carrot));
-        const float maxSlipSpeed(sqrt(params.horizontalDrift * radius * 9.8));
-        lateralOut = std::clamp(lateralOut, -maxSlipSpeed, maxSlipSpeed);
+        // slipping. A horizontalDrift of 0 is documented as ignored; feeding it
+        // in would make maxSlipSpeed 0 and stall all translation.
+        if (params.horizontalDrift > 0) {
+            const float radius = 1 / fabs(getCurvature(pose, carrot));
+            const float maxSlipSpeed(sqrt(params.horizontalDrift * radius * 9.8));
+            lateralOut = std::clamp(lateralOut, -maxSlipSpeed, maxSlipSpeed);
+        }
         // prioritize angular movement over lateral movement
         const float overturn = fabs(angularOut) + fabs(lateralOut) - params.maxSpeed;
         if (overturn > 0) lateralOut -= lateralOut > 0 ? overturn : -overturn;

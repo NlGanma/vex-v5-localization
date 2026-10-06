@@ -121,9 +121,10 @@ Here's a drawing of a possible use case:
 And here's how you would implement that movement:
 
 ```cpp
-// turn the chassis to 90 degrees, so it faces away from the goal
+// swing the chassis to 90 degrees, so it faces away from the goal
 chassis.swingToHeading(
     90,
+    lemlib::DriveSide::RIGHT, // lock the right side; the left side drives forward into the next motion
     500,
     {.minSpeed = 127, .earlyExitRange = 20}
     // minSpeed 127 means the chassis will move as fast

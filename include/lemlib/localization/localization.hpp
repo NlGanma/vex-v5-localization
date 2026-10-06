@@ -31,7 +31,10 @@ struct FusionConfig { // TUNE
         float maxBoundaryCorrectionTheta = 0.0872665f; // radians (~5 deg), one-shot cap at a boundary
         float initStdXY = 3.0f; // inches
         float initStdTheta = 0.2f; // radians
-        uint32_t sensorStaleMs = 500; // skip EKF correction if no fresh MCL sensor data for this long
+        // Max age of a motion-staged correction that a motion boundary may still
+        // commit; also drives the diagnostic sensorsStale flag. Not an independent
+        // accept gate: every accept already needs live sensors in the same scan.
+        uint32_t sensorStaleMs = 500;
 };
 
 struct DebugInfo {
@@ -131,10 +134,15 @@ bool applyStagedBoundaryReanchor();
 // Request a one-shot boundary re-anchor: the next fully-gated accept (while idle)
 // commits the trusted EKF pose in a single bounded step. Called when a motion ends.
 void requestBoundaryReanchor();
-// Drop any pending boundary re-anchor request. Called on teleop entry: no motion
-// ever suppresses corrections there, so a request armed by cancelAllMotions would
-// otherwise stay armed and commit a bounded step while the driver is moving.
+// Drop any pending boundary re-anchor request. Called on teleop entry and after
+// every teleop 8-motor engage (its creep is a drivePulse motion whose endMotion
+// arms the request): no driver motion re-suppresses corrections, so an armed
+// request would otherwise commit a bounded step while the driver is moving.
 void clearBoundaryReanchor();
+// Internal: invalidate corrections staged against the current odom frame.
+// lemlib::setPose calls this inside the odom critical section that publishes
+// the new pose/seq, so any snapshot of the new frame also sees the new epoch.
+void invalidateCorrectionFrame();
 void syncPose(lemlib::Pose pose);
 void syncPose(lemlib::Pose pose, uint32_t seq);
 

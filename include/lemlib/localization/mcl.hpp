@@ -86,7 +86,9 @@ struct MCLConfig { // TUNE
         float confidenceMaxSpread = 24.0f; // inches (2 ft)
         float rougheningStdXY = 0.15f; // inches, post-resample jitter
         float rougheningStdTheta = 0.005f; // radians, post-resample jitter
-        float sideRougheningStdPerRad = 0.0f; // inches of extra side spread per accumulated radian since last scan
+        // Inches of extra side spread per radian turned since the last resample or reset (not per scan);
+        // injected only when a scan resamples, with the accumulated turn capped at pi.
+        float sideRougheningStdPerRad = 0.0f;
 };
 
 struct MCLMeasurement {
@@ -102,7 +104,9 @@ struct MCLMeasurement {
 class MCL {
     public:
         void configure(const FieldConfig& field, const MCLConfig& cfg, const std::array<SensorConfig, 4>& sensors);
-        void reset(const lemlib::Pose& pose);
+        // clampLocalSeed=false keeps the pre-2026-10 placement of a local seed's failed draws (field-uniform
+        // scatter, same RNG consumption); start relocalization uses it so its gated commits stay unchanged.
+        void reset(const lemlib::Pose& pose, bool clampLocalSeed = true);
         void predict(const lemlib::OdomDelta& delta);
         MCLMeasurement update();
         MCLMeasurement update(const std::array<SensorObservation, 4>& observations);

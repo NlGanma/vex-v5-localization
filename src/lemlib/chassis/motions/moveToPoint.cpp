@@ -59,7 +59,8 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
         // check if the robot is close enough to the target to start settling
         if (distTarget < 7.5 && close == false) {
             close = true;
-            params.maxSpeed = fmax(fabs(prevLateralOut), 60);
+            // the latch only lowers the cap for settling; never raise it above the caller's maxSpeed
+            params.maxSpeed = std::fmin(params.maxSpeed, std::fmax(std::fabs(prevLateralOut), 60.0f));
         }
 
         // motion chaining
