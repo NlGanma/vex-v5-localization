@@ -18,8 +18,8 @@ void opcontrol() {
     localization_tune::setDriverDriveLoopTicking(false);
     localization_tune::finalizeInterruptedRunIfNeeded("Interrupted", "Entered driver control");
     stopChassisMotion();
-    // Recover the motion semaphore if the autonomous task died while holding it
-    // (skipped autonomous->driver transitions bypass disabled()).
+    // Take back a motion left owned by a killed autonomous task, and settle
+    // correction suppression (skipped autonomous->driver transitions bypass disabled()).
     chassis.recoverInterruptedMotion();
     // The boundary re-anchor one-shot is between-motions-while-stopped only. In
     // teleop no driver motion re-suppresses corrections, so an armed request
@@ -31,14 +31,12 @@ void opcontrol() {
 
     if (kSmokeTestMode) {
         bool rumbled = false;
+        showSmokeTestStatus("SMOKE TEST", "Mode: Driver");
         while (true) {
             if (!rumbled) {
                 controller.rumble(".");
                 rumbled = true;
             }
-            pros::screen::erase();
-            pros::screen::print(pros::E_TEXT_MEDIUM, 1, "SMOKE TEST");
-            pros::screen::print(pros::E_TEXT_MEDIUM, 2, "Mode: Driver");
 
             const int throttle = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
             const int turn = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
@@ -48,7 +46,7 @@ void opcontrol() {
             leftDriveMotors.move(left);
             rightDriveMotors.move(right);
 
-            pros::screen::print(pros::E_TEXT_MEDIUM, 3, "L %d R %d", left, right);
+            showSmokeTestDrive(left, right);
             pros::delay(20);
         }
     }

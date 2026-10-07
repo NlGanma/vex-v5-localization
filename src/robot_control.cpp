@@ -1,5 +1,7 @@
 #include "robot_control.hpp"
 #include "pros/rtos.hpp"
+#include "pros/screen.hpp"
+#include "lemlib/killSafe.hpp"
 
 #include <array>
 #include <atomic>
@@ -63,8 +65,8 @@ enum class FourMotorShiftState : std::uint8_t { IDLE, FOLLOW, CREEP };
 std::atomic<FourMotorShiftState> fourMotorShiftState {FourMotorShiftState::IDLE};
 std::atomic_bool eightMotorControllerProfileActive {false};
 std::atomic<std::uint32_t> fourMotorShiftGeneration {0};
-// Competition tasks hold this only around atomics (never a delay or a kernel task
-// create/delete), so a mode-change kill cannot orphan it across a long window.
+// The shift task holds this around its motor writes; competition-task paths take it
+// only inside lemlib::withKillSafeLock.
 pros::Mutex fourMotorShiftLifecycleMutex;
 
 std::array<pros::MotorGroup*, 6> eightMotorHoldGroups() {
@@ -194,10 +196,12 @@ void hardStopReleasedPtoGroups() {
 void cancelFourMotorShiftTask() {
     // The shift task is never deleted: it re-checks the generation under this lock
     // before every write, so it leaves on its own and cannot overwrite the stop.
-    fourMotorShiftLifecycleMutex.take();
-    fourMotorShiftGeneration.fetch_add(1);
-    fourMotorShiftState.store(FourMotorShiftState::IDLE);
-    fourMotorShiftLifecycleMutex.give();
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            fourMotorShiftGeneration.fetch_add(1);
+            fourMotorShiftState.store(FourMotorShiftState::IDLE);
+        },
+        fourMotorShiftLifecycleMutex);
     hardStopReleasedPtoGroups();
 }
 
@@ -253,13 +257,15 @@ void waitForFourMotorShiftComplete() {
 }
 
 void startFourMotorShiftTask() {
-    fourMotorShiftLifecycleMutex.take();
-    if (fourMotorShiftState.load() != FourMotorShiftState::FOLLOW) {
-        fourMotorShiftLifecycleMutex.give();
-        return;
-    }
-    const std::uint32_t generation = fourMotorShiftGeneration.fetch_add(1) + 1;
-    fourMotorShiftLifecycleMutex.give();
+    bool follow = false;
+    std::uint32_t generation = 0;
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            follow = fourMotorShiftState.load() == FourMotorShiftState::FOLLOW;
+            if (follow) generation = fourMotorShiftGeneration.fetch_add(1) + 1;
+        },
+        fourMotorShiftLifecycleMutex);
+    if (!follow) return;
 
     // Created outside the lock. A cancel that lands before this task first runs
     // bumps the generation, so the task returns without a single write.
@@ -621,4 +627,52 @@ void score(std::uint32_t durationMs, int direction) {
     // released 4-motor mode after scoring instead of trying to shift back to
     // 8-motor drive.
     switchToFourMotorDrive();
+}
+
+namespace {
+std::atomic_bool smokeDisplayStarted {false};
+std::atomic<const char*> smokeLine1 {nullptr};
+std::atomic<const char*> smokeLine2 {nullptr};
+std::atomic_bool smokeDriveShown {false};
+std::atomic<int> smokeLeft {0};
+std::atomic<int> smokeRight {0};
+// Bumped after the fields above change; the display task redraws on a new value.
+std::atomic<std::uint32_t> smokeSerial {0};
+} // namespace
+
+void startSmokeTestDisplay() {
+    if (smokeDisplayStarted.exchange(true)) return;
+    pros::Task::create(
+        [] {
+            std::uint32_t drawn = 0;
+            while (true) {
+                const std::uint32_t serial = smokeSerial.load();
+                if (serial != drawn) {
+                    drawn = serial;
+                    pros::screen::erase();
+                    if (const char* line = smokeLine1.load()) pros::screen::print(pros::E_TEXT_MEDIUM, 1, "%s", line);
+                    if (const char* line = smokeLine2.load()) pros::screen::print(pros::E_TEXT_MEDIUM, 2, "%s", line);
+                    if (smokeDriveShown.load()) {
+                        pros::screen::print(pros::E_TEXT_MEDIUM, 3, "L %d R %d", smokeLeft.load(), smokeRight.load());
+                    }
+                }
+                pros::delay(20);
+            }
+        },
+        "Smoke Display");
+}
+
+void showSmokeTestStatus(const char* line1, const char* line2) {
+    smokeLine1.store(line1);
+    smokeLine2.store(line2);
+    smokeDriveShown.store(false);
+    smokeSerial.fetch_add(1);
+}
+
+void showSmokeTestDrive(int left, int right) {
+    const bool changed = !smokeDriveShown.load() || smokeLeft.load() != left || smokeRight.load() != right;
+    smokeLeft.store(left);
+    smokeRight.store(right);
+    smokeDriveShown.store(true);
+    if (changed) smokeSerial.fetch_add(1);
 }

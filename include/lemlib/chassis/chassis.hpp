@@ -11,6 +11,7 @@
 #include "lemlib/driveCurve.hpp"
 #include <array>
 #include <atomic>
+#include <functional>
 
 namespace lemlib {
 
@@ -977,12 +978,12 @@ class Chassis {
          */
         void cancelAllMotions();
         /**
-         * @brief Recover the motion semaphore after an interrupted motion.
+         * @brief Recover the motion after an interrupted motion.
          *
          * When a blocking motion's task is killed externally (PROS deletes the
-         * running competition task on a mode change), release the owner-independent
-         * motion semaphore after giving a live cancelled task time to exit, and
-         * drop the queue entry of a task killed while waiting for it.
+         * running competition task on a mode change), take the motion back from
+         * the deleted owner and release it, and drop the queue entry of a task
+         * killed while waiting for it. A live owner keeps its motion.
          *
          * Call only at a competition-callback entry (disabled/opcontrol/autonomous),
          * before the calling task starts any motion: PROS recreates every
@@ -1048,11 +1049,16 @@ class Chassis {
         void noteExternalDriveCommand(float left, float right);
     protected:
         /**
-         * @brief Indicates that this motion is queued and blocks current task until this motion reaches front of queue
+         * @brief Registers this motion as queued and blocks the calling task until it
+         * takes the motion (an async motion's task, which already adopted the motion,
+         * returns at once). Two or more queued requests are not served in strict
+         * FIFO order.
          */
         void requestMotionStart();
         /**
-         * @brief Dequeues this motion and permits queued task to run
+         * @brief On the task that owns the motion (otherwise does nothing): settles
+         * correction suppression for the queued or idle state, then releases the
+         * motion and wakes queued requests.
          */
         void endMotion();
         /**
@@ -1068,8 +1074,9 @@ class Chassis {
         bool motionContinues(uint32_t generation) const;
         /**
          * @brief The motion generation captured inside requestMotionStart(), before
-         * motionRunning was published. Called once by a motion after
-         * requestMotionStart() returns, while it still owns the motion semaphore.
+         * motionRunning was published (for an async motion's task, inside its
+         * caller's request). Called once by a motion after requestMotionStart()
+         * returns, while it still owns the motion.
          */
         uint32_t motionGenerationSnapshot() const;
         /**
@@ -1120,27 +1127,76 @@ class Chassis {
         std::atomic<float> lastCommandedRightOutput = 0.0f;
         std::atomic<uint32_t> motionGeneration {0};
         std::atomic<uint32_t> motionQueueCancelGeneration {0};
-        // written only by the motion-semaphore owner inside requestMotionStart()
+        // written only by the motion owner inside requestMotionStart()
         std::atomic<uint32_t> motionStartGeneration {0};
+        // The motion lock: the task that owns the motion, or nullptr when it is
+        // free. It is taken, handed over and released only scheduler-suspended
+        // (requestMotionStart, startAsyncMotion, adoptMotionHandoff,
+        // settleAndReleaseMotion, settleIdleMotion, recoverInterruptedMotion), so
+        // a kill never leaves the motion taken without a recorded owner.
+        // motionGeneration, motionQueueCancelGeneration, motionWaiters,
+        // motionWaiterOverflow, motionBoundaryReanchorAllowed and motionIdleRecheck
+        // are likewise updated only in scheduler-suspended regions (these and the
+        // cancels'), with plain loads and stores: no ldrex/strex, which a PROS
+        // context switch does not clear.
         std::atomic<pros::task_t> motionOwner {nullptr};
         // Tasks waiting in requestMotionStart(), keyed by handle so the entry of a
         // waiter PROS deletes mid-wait (the competition task on a mode change) can
-        // be reclaimed instead of leaking a queued count. Each slot changes in one
-        // atomic step, so no kill point leaves a half-updated record. Realistic
-        // concurrent requesters number one or two; overflow keeps counter semantics.
+        // be reclaimed instead of leaking a queued count. Realistic concurrent
+        // requesters number one or two; overflow keeps counter semantics.
         static constexpr int kMaxMotionWaiters = 8;
         std::array<std::atomic<pros::task_t>, kMaxMotionWaiters> motionWaiters {};
         std::atomic<uint32_t> motionWaiterOverflow {0};
         std::atomic_bool motionBoundaryReanchorAllowed {false};
+        // Async motion hand-off (startAsyncMotion). The token is non-zero only
+        // while the caller's ownership waits for its new task to adopt it; the
+        // adoption, a failed task creation and recoverInterruptedMotion() clear it.
+        std::atomic<uint32_t> motionHandoffToken {0};
+        std::atomic<uint32_t> motionHandoffSerial {0};
+        // Set by the adopting task; its own requestMotionStart() consumes it.
+        std::atomic<pros::task_t> motionHandoffAdopter {nullptr};
+        // Bumped by a cancel or recovery that could not settle suppression itself
+        // because the motion was owned or queued; an owner that made its idle
+        // decision before the bump makes it again before releasing.
+        std::atomic<uint32_t> motionIdleRecheck {0};
+        // Wake-up for queued motions, posted on every release. It confers nothing:
+        // a waiter owns the motion only once it sets motionOwner.
         void* motionSemaphore = nullptr;
         /**
-         * @brief Whether any task is waiting in requestMotionStart() for the motion semaphore.
+         * @brief Whether any task is waiting in requestMotionStart() for the motion.
          */
         bool hasQueuedMotion() const;
         /**
+         * @brief Run by the motion owner: set correction suppression for the queued
+         * (`queued`) or idle state, then release the motion, deciding again while a
+         * motionIdleRecheck bump since `recheck` or an emptied queue invalidates
+         * the decision. The idle state commits or requests a boundary re-anchor
+         * when `boundaryAllowed`, and clears any pending one when `clearBoundary`.
+         */
+        void settleAndReleaseMotion(bool queued, bool boundaryAllowed, bool clearBoundary, uint32_t recheck);
+        /**
+         * @brief Idle path of the cancels: take a free, unqueued motion and settle it
+         * idle (unsuppress, clear the boundary request), else bump motionIdleRecheck.
+         */
+        void settleIdleMotion();
+        /**
+         * @brief Run an async motion in a new task that takes over the motion the
+         * caller started in requestMotionStart(), without releasing the motion
+         * in between. `motion` calls the same motion with async = false;
+         * its requestMotionStart() keeps the caller's ownership, published
+         * motionRunning and start generation instead of queueing again.
+         */
+        void startAsyncMotion(std::function<void()> motion);
+        /**
+         * @brief Run on the new task: take over the hand-off `token`, unless
+         * recoverInterruptedMotion() reclaimed the motion first.
+         */
+        bool adoptMotionHandoff(uint32_t token);
+        /**
          * @brief Drop the waiter entries holding `task`. Only valid for the calling
          * task's own handle: a running task cannot be blocked waiting, so such an
-         * entry was left by a deleted task whose TCB the caller now reuses.
+         * entry was left by a deleted task whose TCB the caller now reuses. Call
+         * scheduler-suspended.
          */
         void releaseStaleMotionWaiters(pros::task_t task);
 };

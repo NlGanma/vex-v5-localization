@@ -18,9 +18,7 @@ void lemlib::Chassis::turnToHeading(float theta, int timeout, TurnToHeadingParam
     const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
-        pros::Task task([=, this]() { turnToHeading(theta, timeout, params, false); });
-        this->endMotion();
-        pros::delay(10); // delay to give the task time to start
+        this->startAsyncMotion([=, this]() { turnToHeading(theta, timeout, params, false); });
         return;
     }
     float targetTheta;

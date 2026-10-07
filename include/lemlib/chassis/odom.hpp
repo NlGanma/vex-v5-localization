@@ -85,6 +85,7 @@ OdomDelta getOdomDelta();
  *
  * This is primarily used internally by the localization task so it can replay
  * every odom increment instead of silently skipping updates under scheduler lag.
+ * Persistent tasks only (blocking lock, allocates under it).
  *
  * @param seq the last sequence number already consumed
  * @return std::vector<OdomDelta>
@@ -111,6 +112,8 @@ OdomSnapshot getOdomSnapshot();
 OdomTelemetry getOdomTelemetry();
 /**
  * @brief Get odometry telemetry for a specific sequence number
+ *
+ * Persistent tasks only (blocking lock).
  *
  * @param seq the sequence number to look up
  * @return OdomTelemetry
@@ -168,10 +171,11 @@ void setPoseSilent(Pose pose, bool radians = false);
  * expectedSeq, holding the odom update lock (same order as the tracking task)
  * so a concurrent odom integration step cannot be silently overwritten.
  *
- * @param abortIf optional predicate evaluated under the odom locks; if it
- * returns true the write is skipped. Lets the caller re-check a condition
- * (e.g. motion-correction suppression) that another task may have flipped
- * between building the pose and committing it.
+ * @param abortIf optional predicate evaluated with the scheduler suspended
+ * under the odom locks; must be a single atomic load (never block, allocate,
+ * print or touch a device). If it returns true the write is skipped. Lets the
+ * caller re-check a condition (e.g. motion-correction suppression) that
+ * another task may have flipped between building the pose and committing it.
  * @return true if the write was applied, false if odom advanced or the abort
  * predicate fired (write skipped)
  */

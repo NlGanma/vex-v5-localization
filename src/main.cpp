@@ -31,9 +31,8 @@ ASSET(example_txt);
 
 void initialize() {
     if (kSmokeTestMode) {
-        pros::screen::erase();
-        pros::screen::print(pros::E_TEXT_MEDIUM, 1, "SMOKE TEST BOOT");
-        pros::screen::print(pros::E_TEXT_MEDIUM, 2, "No LemLib init");
+        startSmokeTestDisplay();
+        showSmokeTestStatus("SMOKE TEST BOOT", "No LemLib init");
         controller.rumble(".");
         leftDriveMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_BRAKE);
         rightDriveMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_BRAKE);
@@ -56,6 +55,10 @@ void initialize() {
     if (localization_tune::kEnabled) {
         lemlib::localization::configure(buildLocalizationConfig());
         localization_tune::initializeRuntime();
+    } else {
+        // finalized runs' reports are still built and saved on this persistent
+        // task, never on a competition task
+        localization_tune::startReportTask();
     }
 
     localization_tune::setState("Init", "Calibrating chassis", true);
@@ -73,25 +76,19 @@ void disabled() {
     localization_tune::finalizeInterruptedRunIfNeeded("Interrupted", "Autonomous period ended");
     stopAutonomousManipulatorControl();
     stopChassisMotion();
-    // If PROS killed the autonomous task mid-blocking-motion, release the
-    // owner-independent motion semaphore after live cancellation has settled.
+    // If PROS killed the autonomous task mid-blocking-motion, take back the
+    // motion it left owned, and settle correction suppression.
     chassis.recoverInterruptedMotion();
 
-    if (kSmokeTestMode) {
-        pros::screen::erase();
-        pros::screen::print(pros::E_TEXT_MEDIUM, 1, "SMOKE TEST");
-        pros::screen::print(pros::E_TEXT_MEDIUM, 2, "Mode: Disabled");
-    }
+    if (kSmokeTestMode) showSmokeTestStatus("SMOKE TEST", "Mode: Disabled");
 }
 
 void competition_initialize() {
     localization_tune::setDriverControlLoopActive(false);
     localization_tune::setDriverDriveLoopTicking(false);
     localization_tune::finalizeInterruptedRunIfNeeded("Interrupted", "Competition init interrupted tune");
+    // Same as disabled(): take back a motion left owned by a killed predecessor.
+    chassis.recoverInterruptedMotion();
 
-    if (kSmokeTestMode) {
-        pros::screen::erase();
-        pros::screen::print(pros::E_TEXT_MEDIUM, 1, "SMOKE TEST");
-        pros::screen::print(pros::E_TEXT_MEDIUM, 2, "Mode: Comp Init");
-    }
+    if (kSmokeTestMode) showSmokeTestStatus("SMOKE TEST", "Mode: Comp Init");
 }

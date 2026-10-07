@@ -18,9 +18,7 @@ void lemlib::Chassis::turnToPoint(float x, float y, int timeout, TurnToPointPara
     const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
-        pros::Task task([=, this]() { turnToPoint(x, y, timeout, params, false); });
-        this->endMotion();
-        pros::delay(10); // delay to give the task time to start
+        this->startAsyncMotion([=, this]() { turnToPoint(x, y, timeout, params, false); });
         return;
     }
     float targetTheta;

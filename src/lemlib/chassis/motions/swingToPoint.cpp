@@ -19,9 +19,7 @@ void lemlib::Chassis::swingToPoint(float x, float y, DriveSide lockedSide, int t
     const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
-        pros::Task task([=, this]() { swingToPoint(x, y, lockedSide, timeout, params, false); });
-        this->endMotion();
-        pros::delay(10); // delay to give the task time to start
+        this->startAsyncMotion([=, this]() { swingToPoint(x, y, lockedSide, timeout, params, false); });
         return;
     }
     float targetTheta;

@@ -37,4 +37,11 @@ void intake(std::uint32_t durationMs);
 void stopAutonomousManipulatorControl();
 void score(std::uint32_t durationMs, int direction);
 
+// Smoke-test mode screen text. Only the persistent display task calls pros::screen:
+// the kernel screen mutex is outside the daemon's port-mutex barrier, so a
+// competition task deleted mid-print would orphan it.
+void startSmokeTestDisplay();
+void showSmokeTestStatus(const char* line1, const char* line2);
+void showSmokeTestDrive(int left, int right);
+
 #endif

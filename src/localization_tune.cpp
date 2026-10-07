@@ -1,6 +1,7 @@
 #include "localization_tune.hpp"
 
 #include "main.h"
+#include "lemlib/killSafe.hpp"
 #include "lemlib/logger/stdout.hpp"
 #include "pros/apix.h"
 #include "robot_control.hpp"
@@ -162,6 +163,11 @@ constexpr std::array<AutonomousRouteStep, 4> kDriveProbeRoute {{
     {TuneMotionKind::Drive, "Open rev 90", 0.0f, 0.0f, 0.0f, 1000, false, 0.0f, 90.0f, 0.0f, 0.0f},
 }};
 
+// Competition-task paths take tuneMutex only inside lemlib::withKillSafeLock. Blocking
+// takes run only on tasks PROS never deletes (initialize and the tune tasks):
+// setTuneExportFeedback, currentTuneExportFeedback, setRunExportFeedback,
+// buildTuneReport, buildTuneTraceCsv, hasLiveTuneData and the
+// screen/overlay-control/manual-drive task loops.
 pros::Mutex tuneMutex;
 std::array<TuneCheckpoint, kTuneCheckpointCapacity> tuneCheckpoints {};
 int tuneCheckpointCount = 0;
@@ -188,6 +194,10 @@ pros::Task* screenTask = nullptr;
 pros::Task* overlayControlTask = nullptr;
 pros::Task* terminalReplayTask = nullptr;
 pros::Task* manualDriveFallbackTask = nullptr;
+// Competition-task paths take this only inside lemlib::withKillSafeLock
+// (clearPendingTuneTerminalLog). Blocking takes are persistent-task only (initialize
+// restore, overlay report save, terminal replay task, and the screen task's per-tick
+// hasPendingTuneTerminalReplay poll and tap export).
 pros::Mutex pendingTuneLogMutex;
 std::string pendingTuneTerminalLog;
 bool pendingTuneTerminalReplay = false;
@@ -336,18 +346,21 @@ lemlib::Pose autonomousRouteTarget(const lemlib::Pose& start, const AutonomousRo
 }
 
 void clearTuneResults() {
-    tuneMutex.take();
-    tuneCheckpoints = {};
-    tuneCheckpointCount = 0;
-    tuneSelectedCheckpoint = 0;
-    tuneDisplayPage = 0;
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            // drops a run carried over unclaimed from a callback killed in its pre-claim
+            // stops, so a run start becomes claimable only at its own setState(..., true)
+            tuneTestRunning = false;
+            tuneCheckpoints = {};
+            tuneCheckpointCount = 0;
+            tuneSelectedCheckpoint = 0;
+            tuneDisplayPage = 0;
+        },
+        tuneMutex);
 }
 
 void clearRelocalizationSummary() {
-    tuneMutex.take();
-    relocalizationSummary = {};
-    tuneMutex.give();
+    lemlib::withKillSafeLock([]() noexcept { relocalizationSummary = {}; }, tuneMutex);
 }
 
 const char* tuneRunModeName(TuneRunMode mode) {
@@ -778,12 +791,15 @@ void cachePendingTuneTerminalLog(const std::string& fullLog) {
 }
 
 void clearPendingTuneTerminalLog() {
-    pendingTuneLogMutex.take();
-    pendingTuneTerminalLog.clear();
-    pendingTuneTerminalReplay = false;
-    pendingTuneTerminalStreaming = false;
-    pendingTuneTerminalDumpRequested = false;
-    pendingTuneLogMutex.give();
+    // std::string::clear() keeps the buffer: no allocator call in the region.
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            pendingTuneTerminalLog.clear();
+            pendingTuneTerminalReplay = false;
+            pendingTuneTerminalStreaming = false;
+            pendingTuneTerminalDumpRequested = false;
+        },
+        pendingTuneLogMutex);
     clearExportFeedback();
 }
 
@@ -974,14 +990,16 @@ void storeTuneCheckpoint(const char* name, const lemlib::Pose& expected) {
     }
     checkpoint.recorded = true;
 
-    tuneMutex.take();
-    const int slot =
-        (tuneCheckpointCount < static_cast<int>(tuneCheckpoints.size())) ? tuneCheckpointCount :
-                                                                           static_cast<int>(tuneCheckpoints.size()) - 1;
-    tuneCheckpoints[slot] = checkpoint;
-    if (tuneCheckpointCount < static_cast<int>(tuneCheckpoints.size())) ++tuneCheckpointCount;
-    tuneSelectedCheckpoint = slot;
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            const int slot = (tuneCheckpointCount < static_cast<int>(tuneCheckpoints.size())) ?
+                                 tuneCheckpointCount :
+                                 static_cast<int>(tuneCheckpoints.size()) - 1;
+            tuneCheckpoints[slot] = checkpoint;
+            if (tuneCheckpointCount < static_cast<int>(tuneCheckpoints.size())) ++tuneCheckpointCount;
+            tuneSelectedCheckpoint = slot;
+        },
+        tuneMutex);
 
     const float errorX = checkpoint.reported.x - expected.x;
     const float errorY = checkpoint.reported.y - expected.y;
@@ -1091,45 +1109,69 @@ bool runDriveProbeStep(const char* name, const lemlib::Pose& expected, int durat
     return settleAndCapture(name, expected, allowAbort);
 }
 
+// Reads, in one region, whether an unclaimed run exists and which run it is.
+bool unclaimedTuneRun(std::uint32_t& runGeneration) {
+    bool running = false;
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            running = tuneTestRunning;
+            runGeneration = tuneRunGeneration.load();
+        },
+        tuneMutex);
+    return running;
+}
+
 // Claims the run and queues its report in one critical section. The report is
 // built and written later by the persistent overlay task: building and saving
 // the full log takes seconds, and on a competition task a mode change would
 // delete it mid-write (orphaning any lock it holds) or stall opcontrol's drive loop.
-bool beginTuneFinalization(const char* status, const char* stepName, const char* rumble) {
+// With runGeneration, only the run started under that generation is claimed.
+bool beginTuneFinalization(const char* status, const char* stepName, const char* rumble,
+                           const std::uint32_t* runGeneration = nullptr) {
     bool shouldFinalize = false;
-    tuneMutex.take();
-    if (tuneTestRunning) {
-        tuneStatus = status;
-        tuneStepName = stepName;
-        tuneTestRunning = false;
-        tuneReportEmitPending = true;
-        tuneReportRumble = rumble;
-        tuneReportGeneration = tuneRunGeneration.load();
-        ++tuneReportRequest;
-        shouldFinalize = true;
-    }
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            if (!tuneTestRunning) return;
+            if (runGeneration != nullptr && tuneRunGeneration.load() != *runGeneration) return;
+            tuneStatus = status;
+            tuneStepName = stepName;
+            tuneTestRunning = false;
+            tuneReportEmitPending = true;
+            tuneReportRumble = rumble;
+            tuneReportGeneration = tuneRunGeneration.load();
+            ++tuneReportRequest;
+            shouldFinalize = true;
+        },
+        tuneMutex);
     return shouldFinalize;
 }
 
 void processPendingTuneReport() {
-    tuneMutex.take();
-    const bool pending = tuneReportEmitPending;
-    const char* rumble = tuneReportRumble;
-    const std::uint32_t generation = tuneReportGeneration;
-    const std::uint32_t request = tuneReportRequest;
-    tuneMutex.give();
+    bool pending = false;
+    const char* rumble = nullptr;
+    std::uint32_t generation = 0;
+    std::uint32_t request = 0;
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            pending = tuneReportEmitPending;
+            rumble = tuneReportRumble;
+            generation = tuneReportGeneration;
+            request = tuneReportRequest;
+        },
+        tuneMutex);
     if (!pending) return;
 
     const bool emitted = generation == tuneRunGeneration.load() && emitTuneReport(generation);
 
-    tuneMutex.take();
-    // another report may have been queued while this one was being built
-    if (tuneReportRequest == request) {
-        tuneReportEmitPending = false;
-        tuneReportRumble = nullptr;
-    }
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            // another report may have been queued while this one was being built
+            if (tuneReportRequest == request) {
+                tuneReportEmitPending = false;
+                tuneReportRumble = nullptr;
+            }
+        },
+        tuneMutex);
     if (emitted && rumble != nullptr && rumble[0] != '\0') {
         // no lock held: a rejected rumble is retried here, and an opcontrol display
         // write it displaces is retried in opcontrol's next slot
@@ -1303,22 +1345,40 @@ void screenTaskFn() {
 }
 
 void overlayControlTaskFn() {
+    // Back up only a run that stays unclaimed longer than a callback entry's
+    // worst-case pre-claim stops (manipulator exit wait up to 100 ms, then
+    // cancelAllMotions' 10 ms), so a live callback normally claims and labels the
+    // run itself, and this task normally does not run the stops beside it.
+    constexpr std::uint32_t kOrphanedRunGraceMs = 150;
+    bool orphanArmed = false;
+    std::uint32_t orphanGeneration = 0;
+    std::uint32_t orphanSinceMs = 0;
     while (true) {
         processPendingTuneReport();
 
         bool tuneRunning = false;
         TuneRunMode runMode = TuneRunMode::Idle;
+        std::uint32_t runGeneration = 0;
 
         tuneMutex.take();
         tuneRunning = tuneTestRunning;
         runMode = tuneRunMode;
+        runGeneration = tuneRunGeneration.load();
         tuneMutex.give();
 
         const bool autonomousActive = pros::competition::is_autonomous() != 0;
         if (tuneRunning && runMode == TuneRunMode::AutonomousRelocalized && !autonomousActive) {
-            finalizeInterruptedRunIfNeeded("Interrupted", "Autonomous ended outside callback");
-            pros::delay(20);
-            continue;
+            const std::uint32_t now = pros::millis();
+            if (!orphanArmed || orphanGeneration != runGeneration) {
+                orphanArmed = true;
+                orphanGeneration = runGeneration;
+                orphanSinceMs = now;
+            } else if (now - orphanSinceMs >= kOrphanedRunGraceMs) {
+                finalizeInterruptedRunIfNeeded("Interrupted", "Autonomous ended outside callback");
+                orphanArmed = false;
+            }
+        } else {
+            orphanArmed = false;
         }
         pros::delay(20);
     }
@@ -1361,40 +1421,44 @@ void manualDriveFallbackTaskFn() {
 }
 } // namespace
 
+void startReportTask() {
+    if (overlayControlTask == nullptr) overlayControlTask = new pros::Task([] { overlayControlTaskFn(); });
+}
+
 void initializeRuntime() {
     pros::screen::touch_callback(handleTuneExportTap, pros::E_TOUCH_RELEASED);
     if (screenTask == nullptr) screenTask = new pros::Task([] { screenTaskFn(); });
-    if (overlayControlTask == nullptr) overlayControlTask = new pros::Task([] { overlayControlTaskFn(); });
+    startReportTask();
     if (terminalReplayTask == nullptr) terminalReplayTask = new pros::Task([] { terminalReplayTaskFn(); });
     if (manualDriveFallbackTask == nullptr) manualDriveFallbackTask = new pros::Task([] { manualDriveFallbackTaskFn(); });
     restoreInternalTuneLogIfPresent();
 }
 
 void setState(const char* status, const char* stepName, bool running) {
-    tuneMutex.take();
-    tuneStatus = status;
-    tuneStepName = stepName;
-    tuneTestRunning = running;
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            tuneStatus = status;
+            tuneStepName = stepName;
+            tuneTestRunning = running;
+        },
+        tuneMutex);
 }
 
 void clearExportFeedback() {
-    tuneMutex.take();
-    tuneExportFeedback = nullptr;
-    tuneExportFeedbackUntilMs = 0;
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            tuneExportFeedback = nullptr;
+            tuneExportFeedbackUntilMs = 0;
+        },
+        tuneMutex);
 }
 
 void storeRelocalizationSummary(const RelocalizationSummary& summary) {
-    tuneMutex.take();
-    relocalizationSummary = summary;
-    tuneMutex.give();
+    lemlib::withKillSafeLock([&]() noexcept { relocalizationSummary = summary; }, tuneMutex);
 }
 
 void setStartPose(const lemlib::Pose& pose) {
-    tuneMutex.take();
-    tuneStartPose = pose;
-    tuneMutex.give();
+    lemlib::withKillSafeLock([&]() noexcept { tuneStartPose = pose; }, tuneMutex);
 }
 
 void setDriverControlLoopActive(bool active) { driverControlLoopActive.store(active); }
@@ -1410,11 +1474,13 @@ void prepareAutonomousRelocalizedRun(const lemlib::Pose& currentPose) {
     clearExportFeedback();
     lemlib::localization::clearTrace();
 
-    tuneMutex.take();
-    tuneRunMode = TuneRunMode::AutonomousRelocalized;
-    tuneTestCase = TuneTestCase::NormalRoute;
-    tuneStartPose = currentPose;
-    tuneMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            tuneRunMode = TuneRunMode::AutonomousRelocalized;
+            tuneTestCase = TuneTestCase::NormalRoute;
+            tuneStartPose = currentPose;
+        },
+        tuneMutex);
 }
 
 RelocalizationSummary performGlobalRelocalization() {
@@ -1423,25 +1489,31 @@ RelocalizationSummary performGlobalRelocalization() {
 
 void finalizeRun(const char* status, const char* stepName, const char* rumble) {
     chassis.cancelMotion();
-    if (!beginTuneFinalization(status, stepName, rumble)) return;
+    // freeze before the claim: a mode change between the two then leaves a frozen,
+    // unclaimed run that the next callback entry (or the overlay task) claims
     lemlib::localization::setTraceEnabled(false);
-    // the overlay task emits the queued report; without the tune runtime, emit here
-    if (overlayControlTask == nullptr) processPendingTuneReport();
+    // the persistent overlay task (startReportTask) builds and saves the queued
+    // report, never this competition task
+    beginTuneFinalization(status, stepName, rumble);
 }
 
 void finalizeInterruptedRunIfNeeded(const char* status, const char* stepName) {
-    if (!beginTuneFinalization(status, stepName, ". .")) return;
-    // freeze the trace before the stops: the overlay task may start building the
-    // queued report while they run
+    // freeze the trace before the claim (see finalizeRun) and so before the stops
     lemlib::localization::setTraceEnabled(false);
-
+    // Stop before the claim: a run is claimed once, so a mode change between a claim
+    // and the stops would skip them for good. Until the claim the run stays
+    // claimable, and the next callback entry (or the overlay task) repeats these
+    // idempotent stops before claiming it. The claim is keyed to the run seen here,
+    // so a run started while the stops execute is never claimed by this call.
+    std::uint32_t runGeneration = 0;
+    if (!unclaimedTuneRun(runGeneration)) return;
     disableEightMotorPositionHold();
     stopAutonomousManipulatorControl();
     stopReleasedPtoControls();
     chassis.cancelAllMotions();
     chassis.tank(0, 0, true);
+    if (!beginTuneFinalization(status, stepName, ". .", &runGeneration)) return;
     lemlib::bufferedStdout().print("Finalizing interrupted tune run: {}\n", stepName);
-    if (overlayControlTask == nullptr) processPendingTuneReport();
 }
 
 void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbort) {
@@ -1453,16 +1525,22 @@ void runAutonomousRoute(const lemlib::Pose& start, int testNumber, bool allowAbo
     clearPendingTuneTerminalLog();
     clearRelocalizationSummary();
     clearExportFeedback();
-
-    tuneMutex.take();
-    tuneRunMode = TuneRunMode::AutonomousRelocalized;
-    tuneStartPose = start;
-    tuneTestCase = selectedTestCase;
-    tuneMutex.give();
-
-    setState("Setup", "Apply start pose", true);
-    chassis.cancelMotion();
+    // with the other clears, before cancelMotion's delay and before the run becomes
+    // claimable (as prepareAutonomousRelocalizedRun does): a mode change in between
+    // would otherwise pair the previous run's frozen trace with this run's cleared
+    // state, in a live tap export or in a claimable report
     lemlib::localization::clearTrace();
+
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            tuneRunMode = TuneRunMode::AutonomousRelocalized;
+            tuneStartPose = start;
+            tuneTestCase = selectedTestCase;
+        },
+        tuneMutex);
+
+    chassis.cancelMotion();
+    setState("Setup", "Apply start pose", true);
     lemlib::localization::setTraceEnabled(true);
     chassis.setPose(start, true);
     if (!lemlib::localization::isRunning()) lemlib::localization::start();

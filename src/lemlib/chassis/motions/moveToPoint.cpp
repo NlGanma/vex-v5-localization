@@ -18,9 +18,7 @@ void lemlib::Chassis::moveToPoint(float x, float y, int timeout, MoveToPointPara
     const uint32_t motionGen = this->motionGenerationSnapshot();
     // if the function is async, run it in a new task
     if (async) {
-        pros::Task task([=, this]() { moveToPoint(x, y, timeout, params, false); });
-        this->endMotion();
-        pros::delay(10); // delay to give the task time to start
+        this->startAsyncMotion([=, this]() { moveToPoint(x, y, timeout, params, false); });
         return;
     }
 

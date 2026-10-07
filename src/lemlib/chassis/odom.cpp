@@ -10,6 +10,7 @@
 #include "pros/rtos.hpp"
 #include "lemlib/util.hpp"
 #include "lemlib/chassis/odom.hpp"
+#include "lemlib/killSafe.hpp"
 #include "lemlib/chassis/chassis.hpp"
 #include "lemlib/chassis/trackingWheel.hpp"
 #include "lemlib/localization/localization.hpp"
@@ -30,6 +31,9 @@ std::deque<lemlib::OdomDelta> odomDeltaHistory; // recent deltas for localizatio
 std::deque<lemlib::OdomTelemetry> odomTelemetryHistory; // recent raw telemetry for offline tuning
 pros::Mutex odomDeltaMutex; // protects odomDelta from torn reads
 pros::Mutex odomUpdateMutex; // serializes setPose resets with live odom integration
+// The three odom locks are taken blocking only on persistent tasks (update(),
+// getOdomDeltasSince, getOdomTelemetryForSeq); every other path uses
+// lemlib::withKillSafeLock, so a deleted competition task never owns one.
 std::atomic<uint32_t> odomDeltaSeq {0};
 uint32_t odomPoseSeq = 0;
 uint32_t lastUpdateMs = 0;
@@ -166,7 +170,8 @@ RawSensorBaselines readSensorBaselines() {
     return raw;
 }
 
-// The caller holds odomUpdateMutex.
+// The caller holds odomUpdateMutex, inside setPose's kill-safe region: pure math
+// and TrackingWheel::getType only.
 void applySensorBaselines(const RawSensorBaselines& raw) {
     prevVertical1 = (odomSensors.vertical1 != nullptr) ? sanitizeReading(raw.vertical1, prevVertical1) : 0.0f;
     prevVertical2 = (odomSensors.vertical2 != nullptr) ? sanitizeReading(raw.vertical2, prevVertical2) : 0.0f;
@@ -199,9 +204,8 @@ void lemlib::setSensors(lemlib::OdomSensors sensors, lemlib::Drivetrain drivetra
 }
 
 lemlib::Pose lemlib::getPose(bool radians) {
-    odomStateMutex.take();
-    const Pose pose = odomPose;
-    odomStateMutex.give();
+    Pose pose(0, 0, 0);
+    withKillSafeLock([&]() noexcept { pose = odomPose; }, odomStateMutex);
     if (radians) return pose;
     else return lemlib::Pose(pose.x, pose.y, radToDeg(pose.theta));
 }
@@ -210,49 +214,40 @@ namespace {
 void setPoseImpl(lemlib::Pose pose, bool radians, bool syncLocalization, bool resetOdomDelta) {
     const lemlib::Pose poseRad = radians ? pose : lemlib::Pose(pose.x, pose.y, lemlib::degToRad(pose.theta));
     uint32_t newSeq = 0;
-    // PROS deletes the competition task on a mode change without releasing the
-    // mutexes it owns, and an orphaned odomUpdateMutex freezes odom and fusion
-    // for the rest of the power cycle. Keep device reads and allocator work out
-    // of that window: sample baselines and build the empty replacement histories
-    // first, and let the old histories free when this function returns.
+    // Device reads and allocator work stay outside the kill-safe region; the reset
+    // is never half-applied and a competition task can no longer orphan an odom lock.
     std::deque<lemlib::OdomDelta> retiredDeltaHistory;
     std::deque<lemlib::OdomTelemetry> retiredTelemetryHistory;
     RawSensorBaselines rawBaselines {};
     if (resetOdomDelta) rawBaselines = readSensorBaselines();
 
-    if (resetOdomDelta) odomUpdateMutex.take();
-
     if (resetOdomDelta) {
-        odomDeltaMutex.take();
-        newSeq = odomDeltaSeq.fetch_add(1) + 1;
-        odomDelta.localX = 0;
-        odomDelta.localY = 0;
-        odomDelta.deltaTheta = 0;
-        odomDelta.dt = 0.01f;
-        odomDelta.seq = newSeq;
-        odomTelemetry = {};
-        odomTelemetry.seq = newSeq;
-        odomDeltaHistory.swap(retiredDeltaHistory);
-        odomTelemetryHistory.swap(retiredTelemetryHistory);
-        odomDeltaMutex.give();
-    }
-
-    odomStateMutex.take();
-    // Invalidate corrections staged against the old frame in the SAME critical
-    // section that publishes the new pose/seq: any snapshot that observes the new
-    // frame then also observes the new epoch (see applyStagedBoundaryReanchor).
-    if (resetOdomDelta) lemlib::localization::invalidateCorrectionFrame();
-    odomPose = poseRad;
-    if (resetOdomDelta) {
-        odomSpeed = lemlib::Pose(0, 0, 0);
-        odomLocalSpeed = lemlib::Pose(0, 0, 0);
-        odomPoseSeq = newSeq;
-    }
-    odomStateMutex.give();
-
-    if (resetOdomDelta) {
-        applySensorBaselines(rawBaselines);
-        odomUpdateMutex.give();
+        lemlib::withKillSafeLock(
+            [&]() noexcept {
+                newSeq = odomDeltaSeq.fetch_add(1) + 1;
+                odomDelta.localX = 0;
+                odomDelta.localY = 0;
+                odomDelta.deltaTheta = 0;
+                odomDelta.dt = 0.01f;
+                odomDelta.seq = newSeq;
+                odomTelemetry = {};
+                odomTelemetry.seq = newSeq;
+                odomDeltaHistory.swap(retiredDeltaHistory);
+                odomTelemetryHistory.swap(retiredTelemetryHistory);
+                // Invalidate corrections staged against the old frame in the SAME
+                // critical section that publishes the new pose/seq: any snapshot that
+                // observes the new frame then also observes the new epoch (see
+                // applyStagedBoundaryReanchor).
+                lemlib::localization::invalidateCorrectionFrame();
+                odomPose = poseRad;
+                odomSpeed = lemlib::Pose(0, 0, 0);
+                odomLocalSpeed = lemlib::Pose(0, 0, 0);
+                odomPoseSeq = newSeq;
+                applySensorBaselines(rawBaselines);
+            },
+            odomUpdateMutex, odomDeltaMutex, odomStateMutex);
+    } else {
+        lemlib::withKillSafeLock([&]() noexcept { odomPose = poseRad; }, odomStateMutex);
     }
 
     if (syncLocalization) {
@@ -270,44 +265,44 @@ bool lemlib::detail::setPoseSilentIfSeq(lemlib::Pose pose, uint32_t expectedSeq,
     const lemlib::Pose poseRad = radians ? pose : lemlib::Pose(pose.x, pose.y, lemlib::degToRad(pose.theta));
     // Same lock order as lemlib::update() (odomUpdateMutex -> odomStateMutex) so
     // no odom integration can interleave between the seq check and the write.
-    odomUpdateMutex.take();
-    odomStateMutex.take();
+    bool seqMatches = false;
     // The abort predicate is evaluated under the odom locks: callers use it to
     // re-check a condition (e.g. motion-correction suppression) that another
     // task may have changed between building the pose and committing it. A
     // motion's first getPose also takes odomStateMutex, so a write that passes
     // this check is ordered before any pose read of the motion that suppressed.
-    const bool aborted = (abortIf != nullptr) && abortIf();
-    const bool seqMatches = !aborted && (odomPoseSeq == expectedSeq);
-    if (seqMatches) odomPose = poseRad;
-    odomStateMutex.give();
-    odomUpdateMutex.give();
+    // abortIf runs scheduler-suspended: atomic load only.
+    withKillSafeLock(
+        [&]() noexcept {
+            const bool aborted = (abortIf != nullptr) && abortIf();
+            seqMatches = !aborted && (odomPoseSeq == expectedSeq);
+            if (seqMatches) odomPose = poseRad;
+        },
+        odomUpdateMutex, odomStateMutex);
     return seqMatches;
 }
 
 lemlib::Pose lemlib::getSpeed(bool radians) {
-    odomStateMutex.take();
-    const Pose speed = odomSpeed;
-    odomStateMutex.give();
+    Pose speed(0, 0, 0);
+    withKillSafeLock([&]() noexcept { speed = odomSpeed; }, odomStateMutex);
     if (radians) return speed;
     else return lemlib::Pose(speed.x, speed.y, radToDeg(speed.theta));
 }
 
 lemlib::Pose lemlib::getLocalSpeed(bool radians) {
-    odomStateMutex.take();
-    const Pose localSpeed = odomLocalSpeed;
-    odomStateMutex.give();
+    Pose localSpeed(0, 0, 0);
+    withKillSafeLock([&]() noexcept { localSpeed = odomLocalSpeed; }, odomStateMutex);
     if (radians) return localSpeed;
     else return lemlib::Pose(localSpeed.x, localSpeed.y, radToDeg(localSpeed.theta));
 }
 
 lemlib::OdomDelta lemlib::getOdomDelta() {
-    odomDeltaMutex.take();
-    const OdomDelta copy = odomDelta;
-    odomDeltaMutex.give();
+    OdomDelta copy;
+    withKillSafeLock([&]() noexcept { copy = odomDelta; }, odomDeltaMutex);
     return copy;
 }
 
+// Blocking take, allocates under the lock: persistent tasks only.
 std::vector<lemlib::OdomDelta> lemlib::getOdomDeltasSince(uint32_t seq) {
     odomDeltaMutex.take();
     std::vector<OdomDelta> deltas;
@@ -320,19 +315,18 @@ std::vector<lemlib::OdomDelta> lemlib::getOdomDeltasSince(uint32_t seq) {
 }
 
 lemlib::OdomSnapshot lemlib::getOdomSnapshot() {
-    odomStateMutex.take();
-    const OdomSnapshot snapshot {.pose = odomPose, .seq = odomPoseSeq};
-    odomStateMutex.give();
+    OdomSnapshot snapshot;
+    withKillSafeLock([&]() noexcept { snapshot = {.pose = odomPose, .seq = odomPoseSeq}; }, odomStateMutex);
     return snapshot;
 }
 
 lemlib::OdomTelemetry lemlib::getOdomTelemetry() {
-    odomDeltaMutex.take();
-    const OdomTelemetry copy = odomTelemetry;
-    odomDeltaMutex.give();
+    OdomTelemetry copy;
+    withKillSafeLock([&]() noexcept { copy = odomTelemetry; }, odomDeltaMutex);
     return copy;
 }
 
+// Blocking take, scans the history under the lock: persistent tasks only.
 lemlib::OdomTelemetry lemlib::getOdomTelemetryForSeq(uint32_t seq) {
     odomDeltaMutex.take();
     OdomTelemetry copy {};

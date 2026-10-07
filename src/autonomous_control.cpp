@@ -54,9 +54,7 @@ bool prepareAutonomousStart(autonomous_localization::StartRelativeChassis* local
 
 void autonomous() {
     if (kSmokeTestMode) {
-        pros::screen::erase();
-        pros::screen::print(pros::E_TEXT_MEDIUM, 1, "SMOKE TEST");
-        pros::screen::print(pros::E_TEXT_MEDIUM, 2, "Mode: Autonomous");
+        showSmokeTestStatus("SMOKE TEST", "Mode: Autonomous");
         leftDriveMotors.move(80);
         rightDriveMotors.move(80);
         pros::delay(1000);

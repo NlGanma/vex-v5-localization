@@ -6,6 +6,7 @@
 #include <deque>
 
 #include "lemlib/chassis/odom.hpp"
+#include "lemlib/killSafe.hpp"
 #include "lemlib/util.hpp"
 #include "pros/rtos.hpp"
 
@@ -75,16 +76,22 @@ EKF ekf;
 MCL mcl;
 lemlib::Pose fusedPose {0, 0, 0};
 lemlib::Pose odomOnlyPose {0, 0, 0};
-pros::Mutex poseMutex;
+// Locks below: blocking takes only on persistent tasks, as noted per lock; every
+// other path takes them inside lemlib::withKillSafeLock (competition-task safe).
+pros::Mutex poseMutex; // kill-safe regions only
 DebugInfo debugInfo {};
-pros::Mutex debugMutex;
-pros::Mutex resetMutex;
+pros::Mutex debugMutex; // blocking: localization task MCL-tick block only
+pros::Mutex resetMutex; // blocking: localization task loop only
 bool pendingReset = false;
 lemlib::Pose pendingResetPose {0, 0, 0};
 uint32_t pendingResetSeq = 0;
 uint32_t initialSeq = 0;
-pros::Mutex traceMutex;
+pros::Mutex traceMutex; // blocking: recordTraceSample, getTraceSamples (persistent tasks only)
 std::deque<TraceSample> traceSamples;
+// clearTrace moves the trace here in O(1) and frees it in bounded chunks; a clear cut
+// short by a mode change leaves the rest for the next clear instead of leaking it.
+std::deque<TraceSample> retiredTraceSamples;
+constexpr size_t kTraceFreeChunk = 16;
 TraceSample latestTraceSample {};
 bool traceEnabled = false;
 
@@ -94,13 +101,11 @@ struct StagedCorrection {
     uint32_t epoch = 0;
     bool valid = false;
 };
-pros::Mutex stagedCorrectionMutex;
+pros::Mutex stagedCorrectionMutex; // blocking: localization task staging block only
 StagedCorrection stagedCorrection {};
 
 void clearStagedCorrection() {
-    stagedCorrectionMutex.take();
-    stagedCorrection = {};
-    stagedCorrectionMutex.give();
+    lemlib::withKillSafeLock([]() noexcept { stagedCorrection = {}; }, stagedCorrectionMutex);
 }
 
 void recordBoundaryReanchor(float dx, float dy, float dtheta) {
@@ -141,21 +146,22 @@ lemlib::Pose predictPoseOnly(lemlib::Pose pose, const lemlib::OdomDelta& delta) 
 }
 
 void setFusedPoseInternal(const lemlib::Pose& pose) {
-    poseMutex.take();
-    fusedPose = pose;
-    poseMutex.give();
-
-    debugMutex.take();
-    debugInfo.fusedPose = pose;
-    debugMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            fusedPose = pose;
+            debugInfo.fusedPose = pose;
+        },
+        poseMutex, debugMutex);
 }
 
 void resetDebugInfo(const lemlib::Pose& pose) {
-    debugMutex.take();
-    debugInfo = {};
-    debugInfo.fusedPose = pose;
-    debugInfo.mclPose = pose;
-    debugMutex.give();
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            debugInfo = {};
+            debugInfo.fusedPose = pose;
+            debugInfo.mclPose = pose;
+        },
+        debugMutex);
 }
 
 void resetFilters(const lemlib::Pose& pose) {
@@ -959,7 +965,13 @@ void localizationTask(void*) {
         sample.mclValid = lastMeasurement.valid;
         sample.sensorsStale = lastSensorsStale;
         sample.correctionAccepted = lastCorrectionAccepted;
-        sample.boundaryReanchorApplied = boundaryReanchorAppliedSinceTrace.exchange(false);
+        // Read-and-clear with the scheduler suspended, not exchange(): the PROS context
+        // switch never clears the exclusive monitor, so a strexb preempted mid-exchange
+        // could still succeed after endMotion's store(true) and drop the commit's row.
+        rtos_suspend_all();
+        sample.boundaryReanchorApplied = boundaryReanchorAppliedSinceTrace.load();
+        boundaryReanchorAppliedSinceTrace.store(false);
+        rtos_resume_all();
         if (sample.boundaryReanchorApplied) {
             // A synchronous boundary commit occurs between localization loops,
             // so the next snapshot already contains it. Preserve the real event
@@ -1068,10 +1080,12 @@ void start() {
     motionCorrectionEpoch.store(0);
     clearStagedCorrection();
     taskExited.store(false);
-    resetMutex.take();
-    pendingReset = false;
-    pendingResetSeq = 0;
-    resetMutex.give();
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            pendingReset = false;
+            pendingResetSeq = 0;
+        },
+        resetMutex);
 
     const auto snapshot = lemlib::getOdomSnapshot();
     initialSeq = snapshot.seq;
@@ -1086,10 +1100,12 @@ void stop() {
     motionCorrectionSuppressed.store(false);
     boundaryReanchorPending.store(false);
     clearStagedCorrection();
-    resetMutex.take();
-    pendingReset = false;
-    pendingResetSeq = 0;
-    resetMutex.give();
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            pendingReset = false;
+            pendingResetSeq = 0;
+        },
+        resetMutex);
     if (task != nullptr) {
         // Real handshake: wait until the task loop observes running==false and
         // sets taskExited just before returning, so we never delete it mid-body
@@ -1108,19 +1124,27 @@ void stop() {
 bool isRunning() { return running.load(); }
 
 void setMotionCorrectionSuppressed(bool suppressed) {
-    const bool wasSuppressed = motionCorrectionSuppressed.exchange(suppressed);
     // Clearing the pending one-shot lives HERE, on the writer side, so the
     // suppress/clear pair is totally ordered by the motion lifecycle. If the
     // localization loop cleared it from its own (stale) snapshot of the
     // suppression flag, a request issued by endMotion right after the loop's
     // load could be wiped even though its idle window had just opened.
-    if (suppressed) {
-        boundaryReanchorPending.store(false);
-        if (!wasSuppressed) {
-            motionCorrectionEpoch.fetch_add(1);
-            clearStagedCorrection();
-        }
+    if (!suppressed) {
+        motionCorrectionSuppressed.store(false);
+        return;
     }
+    // One kill-safe region: a deleted caller never leaves suppression raised
+    // without its edge's epoch bump and staged clear.
+    lemlib::withKillSafeLock(
+        []() noexcept {
+            const bool wasSuppressed = motionCorrectionSuppressed.exchange(true);
+            boundaryReanchorPending.store(false);
+            if (!wasSuppressed) {
+                motionCorrectionEpoch.fetch_add(1);
+                stagedCorrection = {};
+            }
+        },
+        stagedCorrectionMutex);
 }
 
 bool isMotionCorrectionSuppressed() { return motionCorrectionSuppressed.load(); }
@@ -1133,9 +1157,8 @@ bool applyStagedBoundaryReanchor() {
     // the new frame always fails the epoch check below, and one that predates it
     // fails the seq re-check in setPoseSilentIfSeq if setPose lands in between.
     const auto snapshot = lemlib::getOdomSnapshot();
-    stagedCorrectionMutex.take();
-    const StagedCorrection staged = stagedCorrection;
-    stagedCorrectionMutex.give();
+    StagedCorrection staged {};
+    lemlib::withKillSafeLock([&]() noexcept { staged = stagedCorrection; }, stagedCorrectionMutex);
     if (!staged.valid || staged.epoch != motionCorrectionEpoch.load() ||
         pros::millis() - staged.acceptedAtMs > config.fusion.sensorStaleMs) {
         return false;
@@ -1160,7 +1183,7 @@ void requestBoundaryReanchor() { boundaryReanchorPending.store(true); }
 
 void clearBoundaryReanchor() { boundaryReanchorPending.store(false); }
 
-// Atomic only: the caller holds odomStateMutex.
+// Atomic only: runs inside setPose's kill-safe odom region.
 void invalidateCorrectionFrame() { motionCorrectionEpoch.fetch_add(1); }
 
 void syncPose(lemlib::Pose pose) { syncPose(pose, lemlib::getOdomSnapshot().seq); }
@@ -1170,36 +1193,40 @@ void syncPose(lemlib::Pose pose, uint32_t seq) {
 
     // An accepted correction from the old frame must not be staged after this
     // call clears it but before the localization task consumes the reset.
-    motionCorrectionEpoch.fetch_add(1);
-    clearStagedCorrection();
-    boundaryReanchorPending.store(false);
-
     if (!running.load()) {
+        motionCorrectionEpoch.fetch_add(1);
+        clearStagedCorrection();
+        boundaryReanchorPending.store(false);
         initialSeq = seq;
         resetFilters(pose);
         return;
     }
 
-    resetMutex.take();
-    pendingResetPose = pose;
-    pendingResetSeq = seq;
-    pendingReset = true;
-    resetMutex.give();
-    setFusedPoseInternal(pose);
+    // One kill-safe region: the reset is queued completely or not at all.
+    lemlib::withKillSafeLock(
+        [&]() noexcept {
+            motionCorrectionEpoch.fetch_add(1);
+            stagedCorrection = {};
+            boundaryReanchorPending.store(false);
+            pendingResetPose = pose;
+            pendingResetSeq = seq;
+            pendingReset = true;
+            fusedPose = pose;
+            debugInfo.fusedPose = pose;
+        },
+        stagedCorrectionMutex, resetMutex, poseMutex, debugMutex);
 }
 
 lemlib::Pose getFusedPose(bool radians) {
-    poseMutex.take();
-    const lemlib::Pose pose = fusedPose;
-    poseMutex.give();
+    lemlib::Pose pose {0, 0, 0};
+    lemlib::withKillSafeLock([&]() noexcept { pose = fusedPose; }, poseMutex);
     if (radians) return pose;
     return lemlib::Pose(pose.x, pose.y, lemlib::radToDeg(pose.theta));
 }
 
 DebugInfo getDebugInfo(bool radians) {
-    debugMutex.take();
-    DebugInfo info = debugInfo;
-    debugMutex.give();
+    DebugInfo info {};
+    lemlib::withKillSafeLock([&]() noexcept { info = debugInfo; }, debugMutex);
     if (!radians) {
         info.fusedPose.theta = lemlib::radToDeg(info.fusedPose.theta);
         info.mclPose.theta = lemlib::radToDeg(info.mclPose.theta);
@@ -1210,25 +1237,49 @@ DebugInfo getDebugInfo(bool radians) {
 LocalizationConfig getConfig() { return config; }
 
 void setTraceEnabled(bool enabled) {
-    traceMutex.take();
-    traceEnabled = enabled;
-    traceMutex.give();
+    lemlib::withKillSafeLock([&]() noexcept { traceEnabled = enabled; }, traceMutex);
 }
 
+namespace {
+// Zero-mutex region: only clearTrace touches retiredTraceSamples, always with the
+// scheduler suspended, so suspension alone serialises it.
+void drainRetiredTrace() {
+    bool drained = false;
+    while (!drained) {
+        lemlib::withKillSafeLock([&]() noexcept {
+            for (size_t i = 0; i < kTraceFreeChunk && !retiredTraceSamples.empty(); ++i) {
+                retiredTraceSamples.pop_front();
+            }
+            drained = retiredTraceSamples.empty();
+        });
+    }
+}
+} // namespace
+
 void clearTrace() {
-    traceMutex.take();
-    traceSamples.clear();
-    latestTraceSample = {};
-    traceMutex.give();
+    bool cleared = false;
+    while (!cleared) {
+        drainRetiredTrace(); // finishes a clear that a mode change cut short
+        lemlib::withKillSafeLock(
+            [&]() noexcept {
+                if (!retiredTraceSamples.empty()) return;
+                retiredTraceSamples.swap(traceSamples);
+                latestTraceSample = {};
+                cleared = true;
+            },
+            traceMutex);
+    }
+    drainRetiredTrace();
 }
 
 TraceSample getLatestTraceSample(bool radians) {
-    traceMutex.take();
-    TraceSample sample = latestTraceSample;
-    traceMutex.give();
+    TraceSample sample {};
+    lemlib::withKillSafeLock([&]() noexcept { sample = latestTraceSample; }, traceMutex);
     return convertTraceUnits(sample, radians);
 }
 
+// Copies the whole trace (allocating) under traceMutex: persistent tasks only, never
+// a competition task.
 std::vector<TraceSample> getTraceSamples(bool radians) {
     traceMutex.take();
     std::vector<TraceSample> samples(traceSamples.begin(), traceSamples.end());

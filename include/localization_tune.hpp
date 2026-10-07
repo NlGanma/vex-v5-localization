@@ -10,6 +10,7 @@ using autonomous_localization::DistanceSnapshot;
 using autonomous_localization::RelocalizationSummary;
 using autonomous_localization::SensorSnapshot;
 
+void startReportTask();
 void initializeRuntime();
 void setState(const char* status, const char* stepName, bool running);
 void clearExportFeedback();
